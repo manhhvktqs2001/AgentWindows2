@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 	"runtime"
 
 	"edr-agent-windows/internal/agent"
@@ -22,13 +21,13 @@ var (
 func main() {
 	// Parse command line flags
 	var (
-		install   = flag.Bool("install", false, "Install as Windows service")
-		uninstall = flag.Bool("uninstall", false, "Uninstall Windows service")
-		start     = flag.Bool("start", false, "Start Windows service")
-		stop      = flag.Bool("stop", false, "Stop Windows service")
-		status    = flag.Bool("status", false, "Check service status")
+		install    = flag.Bool("install", false, "Install as Windows service")
+		uninstall  = flag.Bool("uninstall", false, "Uninstall Windows service")
+		start      = flag.Bool("start", false, "Start Windows service")
+		stop       = flag.Bool("stop", false, "Stop Windows service")
+		status     = flag.Bool("status", false, "Check service status")
 		configPath = flag.String("config", "", "Path to configuration file")
-		version   = flag.Bool("version", false, "Show version information")
+		version    = flag.Bool("version", false, "Show version information")
 	)
 	flag.Parse()
 
@@ -83,24 +82,24 @@ func main() {
 		return
 	}
 
-	// Determine config path
-	if *configPath == "" {
-		exePath, err := os.Executable()
-		if err != nil {
-			log.Fatalf("Failed to get executable path: %v", err)
-		}
-		exeDir := filepath.Dir(exePath)
-		*configPath = filepath.Join(exeDir, "config.yaml")
-	}
-
 	// Load configuration
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		log.Fatalf("Failed to load configuration: %v", err)
+	var cfg *config.Config
+	var err error
+
+	if *configPath != "" {
+		// Use provided config file
+		cfg, err = config.Load(*configPath)
+		if err != nil {
+			log.Fatalf("Failed to load configuration: %v", err)
+		}
+	} else {
+		// Use built-in default config
+		cfg = getDefaultConfig()
+		fmt.Println("✅ Using built-in default configuration")
 	}
 
 	// Initialize logger
-	logger := utils.NewLogger(cfg.Log)
+	logger := utils.NewLogger(&cfg.Log)
 
 	// Create and start agent
 	agent, err := agent.NewAgent(cfg, logger)
@@ -126,4 +125,62 @@ func main() {
 		utils.WaitForInterrupt()
 		agent.Stop()
 	}
-} 
+}
+
+// getDefaultConfig returns built-in default configuration
+func getDefaultConfig() *config.Config {
+	return &config.Config{
+		Server: config.ServerConfig{
+			URL:        "http://192.168.20.85:5000",
+			APIKey:     "f93ac1d1d7b64f07bd32c81e6ab8423e4cb7631f2051c9d8a2d340c5be3a4a9e",
+			Timeout:    30,
+			RetryCount: 3,
+			TLSVerify:  false,
+		},
+		Agent: config.AgentDetails{
+			ID:                "",
+			Name:              "edr-agent-windows",
+			HeartbeatInterval: 60,
+			EventBatchSize:    100,
+			MaxQueueSize:      10000,
+		},
+		Monitor: config.MonitorConfig{
+			Files: config.FileMonitorConfig{
+				Enabled:     false,
+				Paths:       []string{},
+				Recursive:   false,
+				ScanOnWrite: false,
+				MaxFileSize: "100MB",
+				ExcludeExts: []string{},
+			},
+			Processes: config.ProcessMonitorConfig{
+				Enabled:        false,
+				ScanExecutable: false,
+				MonitorCmdLine: false,
+				ExcludeNames:   []string{},
+			},
+			Network: config.NetworkMonitorConfig{
+				Enabled:      false,
+				MonitorTCP:   false,
+				MonitorUDP:   false,
+				ExcludePorts: []int{},
+			},
+			Registry: config.RegistryMonitorConfig{
+				Enabled: false,
+				Keys:    []string{},
+			},
+		},
+		Scanner: config.ScannerConfig{
+			YaraEnabled:    false,
+			YaraRulesPath:  "",
+			MaxScanThreads: 1,
+			ScanTimeout:    30,
+		},
+		Log: config.LogConfig{
+			Level:    "info",
+			Format:   "text",
+			FilePath: "agent.log",
+			MaxSize:  10,
+		},
+	}
+}

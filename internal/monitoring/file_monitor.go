@@ -1,8 +1,6 @@
 package monitoring
 
 import (
-	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -55,7 +53,7 @@ func NewFileMonitor(config config.FileMonitorConfig, logger *utils.Logger, scann
 
 func (fm *FileMonitor) Start() error {
 	fm.logger.Info("Starting Windows file monitor...")
-	
+
 	for _, path := range fm.config.Paths {
 		err := fm.watchDirectory(path)
 		if err != nil {
@@ -64,14 +62,14 @@ func (fm *FileMonitor) Start() error {
 		}
 		fm.logger.Info("Watching directory: %s", path)
 	}
-	
+
 	return nil
 }
 
 func (fm *FileMonitor) Stop() {
 	fm.logger.Info("Stopping Windows file monitor...")
 	close(fm.stopChan)
-	
+
 	for _, watch := range fm.directories {
 		windows.CloseHandle(watch.handle)
 	}
@@ -83,7 +81,7 @@ func (fm *FileMonitor) watchDirectory(path string) error {
 	if err != nil {
 		return err
 	}
-	
+
 	// Open directory handle
 	handle, err := windows.CreateFile(
 		pathUTF16,
@@ -97,17 +95,17 @@ func (fm *FileMonitor) watchDirectory(path string) error {
 	if err != nil {
 		return err
 	}
-	
+
 	// Create directory watch
 	watch := &DirectoryWatch{
 		handle: handle,
 		buffer: make([]byte, 64*1024), // 64KB buffer
 		path:   path,
 	}
-	
+
 	fm.directories[path] = watch
 	go fm.monitorDirectory(watch)
-	
+
 	return nil
 }
 
@@ -124,20 +122,20 @@ func (fm *FileMonitor) monitorDirectory(watch *DirectoryWatch) {
 				uint32(len(watch.buffer)),
 				fm.config.Recursive,
 				windows.FILE_NOTIFY_CHANGE_FILE_NAME|
-				windows.FILE_NOTIFY_CHANGE_DIR_NAME|
-				windows.FILE_NOTIFY_CHANGE_SIZE|
-				windows.FILE_NOTIFY_CHANGE_LAST_WRITE,
+					windows.FILE_NOTIFY_CHANGE_DIR_NAME|
+					windows.FILE_NOTIFY_CHANGE_SIZE|
+					windows.FILE_NOTIFY_CHANGE_LAST_WRITE,
 				&bytesReturned,
 				watch.overlapped,
 				0,
 			)
-			
+
 			if err != nil {
 				fm.logger.Error("ReadDirectoryChanges failed: %v", err)
 				time.Sleep(1 * time.Second)
 				continue
 			}
-			
+
 			fm.parseNotifications(watch.buffer[:bytesReturned], watch.path)
 		}
 	}
@@ -145,19 +143,19 @@ func (fm *FileMonitor) monitorDirectory(watch *DirectoryWatch) {
 
 func (fm *FileMonitor) parseNotifications(buffer []byte, basePath string) {
 	offset := 0
-	
+
 	for offset < len(buffer) {
 		// Parse FILE_NOTIFY_INFORMATION structure
 		nextEntryOffset := *(*uint32)(unsafe.Pointer(&buffer[offset]))
 		action := *(*uint32)(unsafe.Pointer(&buffer[offset+4]))
 		fileNameLength := *(*uint32)(unsafe.Pointer(&buffer[offset+8]))
-		
+
 		// Extract filename (UTF-16)
 		filenameBytes := buffer[offset+12 : offset+12+int(fileNameLength)]
 		filename := windows.UTF16ToString((*(*[]uint16)(unsafe.Pointer(&filenameBytes)))[:fileNameLength/2])
-		
+
 		fullPath := filepath.Join(basePath, filename)
-		
+
 		// Create file event
 		event := &FileEvent{
 			AgentID:   "agent-id", // TODO: Get from config
@@ -168,25 +166,25 @@ func (fm *FileMonitor) parseNotifications(buffer []byte, basePath string) {
 			Action:    fm.actionToString(action),
 			Platform:  "windows",
 		}
-		
+
 		// Get file info
 		if stat, err := os.Stat(fullPath); err == nil {
 			event.FileSize = stat.Size()
 		}
-		
+
 		// Calculate hash if needed
 		if fm.shouldCalculateHash(event) {
 			event.Hash = fm.calculateFileHash(fullPath)
 		}
-		
+
 		// YARA scan if enabled
 		if fm.config.ScanOnWrite && event.Action == "created" {
 			go fm.scanFile(fullPath)
 		}
-		
+
 		// TODO: Send event to agent
 		fm.logger.Debug("File event: %s %s", event.Action, event.FilePath)
-		
+
 		if nextEntryOffset == 0 {
 			break
 		}
@@ -229,10 +227,10 @@ func (fm *FileMonitor) scanFile(filePath string) {
 			fm.logger.Error("YARA scan failed for %s: %v", filePath, err)
 			return
 		}
-		
+
 		if result.Matched {
 			fm.logger.Warn("YARA rule matched for %s: %s", filePath, result.RuleName)
 			// TODO: Create alert
 		}
 	}
-} 
+}

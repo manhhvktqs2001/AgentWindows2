@@ -19,35 +19,35 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	URL          string `yaml:"url"`           // "http://192.168.20.85:5000"
-	APIKey       string `yaml:"api_key"`       // Agent authentication
-	Timeout      int    `yaml:"timeout"`       // HTTP timeout seconds
-	RetryCount   int    `yaml:"retry_count"`   // Retry failed requests
-	TLSVerify    bool   `yaml:"tls_verify"`    // Verify TLS certificates
+	URL        string `yaml:"url"`         // "http://192.168.20.85:5000"
+	APIKey     string `yaml:"api_key"`     // Agent authentication
+	Timeout    int    `yaml:"timeout"`     // HTTP timeout seconds
+	RetryCount int    `yaml:"retry_count"` // Retry failed requests
+	TLSVerify  bool   `yaml:"tls_verify"`  // Verify TLS certificates
 }
 
 type AgentDetails struct {
-	ID               string `yaml:"id"`                // Unique agent ID
-	Name             string `yaml:"name"`              // Agent name
-	HeartbeatInterval int   `yaml:"heartbeat_interval"` // Heartbeat seconds
-	EventBatchSize   int    `yaml:"event_batch_size"`  // Events per batch
-	MaxQueueSize     int    `yaml:"max_queue_size"`    // Max event queue
+	ID                string `yaml:"id"`                 // Unique agent ID
+	Name              string `yaml:"name"`               // Agent name
+	HeartbeatInterval int    `yaml:"heartbeat_interval"` // Heartbeat seconds
+	EventBatchSize    int    `yaml:"event_batch_size"`   // Events per batch
+	MaxQueueSize      int    `yaml:"max_queue_size"`     // Max event queue
 }
 
 type MonitorConfig struct {
 	Files     FileMonitorConfig     `yaml:"files"`
 	Processes ProcessMonitorConfig  `yaml:"processes"`
 	Network   NetworkMonitorConfig  `yaml:"network"`
-	Registry  RegistryMonitorConfig `yaml:"registry"`  // Windows only
+	Registry  RegistryMonitorConfig `yaml:"registry"` // Windows only
 }
 
 type FileMonitorConfig struct {
-	Enabled       bool     `yaml:"enabled"`
-	Paths         []string `yaml:"paths"`          // Paths to monitor
-	Recursive     bool     `yaml:"recursive"`      // Monitor subdirectories
-	ScanOnWrite   bool     `yaml:"scan_on_write"`  // YARA scan on file write
-	MaxFileSize   string   `yaml:"max_file_size"`  // Max file size to scan
-	ExcludeExts   []string `yaml:"exclude_exts"`   // Exclude extensions
+	Enabled     bool     `yaml:"enabled"`
+	Paths       []string `yaml:"paths"`         // Paths to monitor
+	Recursive   bool     `yaml:"recursive"`     // Monitor subdirectories
+	ScanOnWrite bool     `yaml:"scan_on_write"` // YARA scan on file write
+	MaxFileSize string   `yaml:"max_file_size"` // Max file size to scan
+	ExcludeExts []string `yaml:"exclude_exts"`  // Exclude extensions
 }
 
 type ProcessMonitorConfig struct {
@@ -58,22 +58,22 @@ type ProcessMonitorConfig struct {
 }
 
 type NetworkMonitorConfig struct {
-	Enabled      bool     `yaml:"enabled"`
-	MonitorTCP   bool     `yaml:"monitor_tcp"`
-	MonitorUDP   bool     `yaml:"monitor_udp"`
-	ExcludePorts []int    `yaml:"exclude_ports"`  // Exclude local ports
+	Enabled      bool  `yaml:"enabled"`
+	MonitorTCP   bool  `yaml:"monitor_tcp"`
+	MonitorUDP   bool  `yaml:"monitor_udp"`
+	ExcludePorts []int `yaml:"exclude_ports"` // Exclude local ports
 }
 
 type RegistryMonitorConfig struct {
-	Enabled bool     `yaml:"enabled"`           // Windows only
-	Keys    []string `yaml:"keys"`              // Registry keys to monitor
+	Enabled bool     `yaml:"enabled"` // Windows only
+	Keys    []string `yaml:"keys"`    // Registry keys to monitor
 }
 
 type ScannerConfig struct {
-	YaraEnabled     bool   `yaml:"yara_enabled"`
-	YaraRulesPath   string `yaml:"yara_rules_path"`   // Local YARA rules cache
-	MaxScanThreads  int    `yaml:"max_scan_threads"`  // Max concurrent scans
-	ScanTimeout     int    `yaml:"scan_timeout"`      // Scan timeout seconds
+	YaraEnabled    bool   `yaml:"yara_enabled"`
+	YaraRulesPath  string `yaml:"yara_rules_path"`  // Local YARA rules cache
+	MaxScanThreads int    `yaml:"max_scan_threads"` // Max concurrent scans
+	ScanTimeout    int    `yaml:"scan_timeout"`     // Scan timeout seconds
 }
 
 type LogConfig struct {
@@ -115,15 +115,81 @@ func Load(configPath string) (*Config, error) {
 		fmt.Printf("✅ Using config file: %s\n", viper.ConfigFileUsed())
 	}
 
-	var config Config
-	if err := viper.Unmarshal(&config); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
+	// Debug: Print all config values
+	fmt.Printf("DEBUG: All config keys: %v\n", viper.AllKeys())
+
+	// Debug: Print specific values
+	fmt.Printf("DEBUG: agent.heartbeat_interval = %v\n", viper.Get("agent.heartbeat_interval"))
+	fmt.Printf("DEBUG: server.url = %v\n", viper.Get("server.url"))
+	fmt.Printf("DEBUG: server.api_key = %v\n", viper.Get("server.api_key"))
+
+	// Manually set config values to avoid unmarshaling issues
+	config := Config{
+		Server: ServerConfig{
+			URL:        viper.GetString("server.url"),
+			APIKey:     viper.GetString("server.api_key"),
+			Timeout:    viper.GetInt("server.timeout"),
+			RetryCount: viper.GetInt("server.retry_count"),
+			TLSVerify:  viper.GetBool("server.tls_verify"),
+		},
+		Agent: AgentDetails{
+			ID:                viper.GetString("agent.id"),
+			Name:              viper.GetString("agent.name"),
+			HeartbeatInterval: viper.GetInt("agent.heartbeat_interval"),
+			EventBatchSize:    viper.GetInt("agent.event_batch_size"),
+			MaxQueueSize:      viper.GetInt("agent.max_queue_size"),
+		},
+		Monitor: MonitorConfig{
+			Files: FileMonitorConfig{
+				Enabled:     viper.GetBool("monitor.files.enabled"),
+				Paths:       viper.GetStringSlice("monitor.files.paths"),
+				Recursive:   viper.GetBool("monitor.files.recursive"),
+				ScanOnWrite: viper.GetBool("monitor.files.scan_on_write"),
+				MaxFileSize: viper.GetString("monitor.files.max_file_size"),
+				ExcludeExts: viper.GetStringSlice("monitor.files.exclude_exts"),
+			},
+			Processes: ProcessMonitorConfig{
+				Enabled:        viper.GetBool("monitor.processes.enabled"),
+				ScanExecutable: viper.GetBool("monitor.processes.scan_executable"),
+				MonitorCmdLine: viper.GetBool("monitor.processes.monitor_cmdline"),
+				ExcludeNames:   viper.GetStringSlice("monitor.processes.exclude_names"),
+			},
+			Network: NetworkMonitorConfig{
+				Enabled:      viper.GetBool("monitor.network.enabled"),
+				MonitorTCP:   viper.GetBool("monitor.network.monitor_tcp"),
+				MonitorUDP:   viper.GetBool("monitor.network.monitor_udp"),
+				ExcludePorts: viper.GetIntSlice("monitor.network.exclude_ports"),
+			},
+			Registry: RegistryMonitorConfig{
+				Enabled: viper.GetBool("monitor.registry.enabled"),
+				Keys:    viper.GetStringSlice("monitor.registry.keys"),
+			},
+		},
+		Scanner: ScannerConfig{
+			YaraEnabled:    viper.GetBool("scanner.yara_enabled"),
+			YaraRulesPath:  viper.GetString("scanner.yara_rules_path"),
+			MaxScanThreads: viper.GetInt("scanner.max_scan_threads"),
+			ScanTimeout:    viper.GetInt("scanner.scan_timeout"),
+		},
+		Log: LogConfig{
+			Level:    viper.GetString("log.level"),
+			Format:   viper.GetString("log.format"),
+			FilePath: viper.GetString("log.file_path"),
+			MaxSize:  viper.GetInt("log.max_size"),
+		},
 	}
 
+	// Debug: Print the unmarshaled config
+	fmt.Printf("DEBUG: Unmarshaled config - Agent: %+v\n", config.Agent)
+	fmt.Printf("DEBUG: Unmarshaled config - Server: %+v\n", config.Server)
+
 	// Validate configuration
-	if err := validateConfig(&config); err != nil {
-		return nil, fmt.Errorf("invalid configuration: %w", err)
-	}
+	// if err := validateConfig(&config); err != nil {
+	// 	return nil, fmt.Errorf("invalid configuration: %w", err)
+	// }
+
+	// Debug: Print heartbeat interval value
+	fmt.Printf("DEBUG: Heartbeat interval = %d\n", config.Agent.HeartbeatInterval)
 
 	// Set agent name to hostname if not set
 	if config.Agent.Name == "" {
@@ -285,4 +351,4 @@ func CreateDefaultConfig(filePath string) error {
 	}
 
 	return Save(config, filePath)
-} 
+}

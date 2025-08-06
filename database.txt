@@ -1,0 +1,645 @@
+-- ====================================
+-- EDR PostgreSQL Database Schema
+-- ====================================
+
+-- Tạo database và kết nối
+-- CREATE DATABASE edr WITH OWNER = postgres ENCODING = 'UTF8' LC_COLLATE = 'Vietnamese_Vietnam.1258' LC_CTYPE = 'Vietnamese_Vietnam.1258' TABLESPACE = pg_default CONNECTION LIMIT = -1 IS_TEMPLATE = False;
+
+-- Kết nối vào database EDR
+\c edr;
+
+-- Enable extensions
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pg_trgm";
+CREATE EXTENSION IF NOT EXISTS "btree_gin";
+
+-- ====================================
+-- 1. AGENTS TABLE - Quản lý EDR Agents
+-- ====================================
+DROP TABLE IF EXISTS agents CASCADE;
+CREATE TABLE agents (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    hostname VARCHAR(255) NOT NULL,
+    ip_address INET,
+    mac_address VARCHAR(17),
+    os_type VARCHAR(50) NOT NULL CHECK (os_type IN ('Windows', 'Linux', 'macOS', 'Unix')),
+    os_version VARCHAR(100),
+    architecture VARCHAR(20) CHECK (architecture IN ('x64', 'x86', 'arm64', 'arm')),
+    agent_version VARCHAR(50),
+    status VARCHAR(20) DEFAULT 'offline' CHECK (status IN ('online', 'offline', 'error', 'updating', 'installing')),
+    last_seen TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    first_seen TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    heartbeat_interval INTEGER DEFAULT 30, -- seconds
+    location VARCHAR(255),
+    department VARCHAR(100),
+    tags TEXT[],
+    config JSONB DEFAULT '{}',
+    metadata JSONB DEFAULT '{}',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- ====================================
+-- 2. YARA RULES - Quản lý YARA Rules
+-- ====================================
+DROP TABLE IF EXISTS yara_rules CASCADE;
+CREATE TABLE yara_rules (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name VARCHAR(255) NOT NULL UNIQUE,
+    content TEXT NOT NULL,
+    description TEXT,
+    author VARCHAR(255),
+    reference VARCHAR(500),
+    version INTEGER DEFAULT 1,
+    severity INTEGER DEFAULT 1 CHECK (severity BETWEEN 1 AND 5),
+    category VARCHAR(100),
+    subcategory VARCHAR(100),
+    tags TEXT[],
+    platform VARCHAR(50) CHECK (platform IN ('Windows', 'Linux', 'macOS', 'All')),
+    is_active BOOLEAN DEFAULT true,
+    is_compiled BOOLEAN DEFAULT false,
+    compiled_at TIMESTAMP WITH TIME ZONE,
+    file_hash VARCHAR(64), -- SHA256 của rule content
+    rule_size INTEGER,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- ====================================
+-- 3. RULE DEPLOYMENTS - Theo dõi việc deploy rules
+-- ====================================
+DROP TABLE IF EXISTS rule_deployments CASCADE;
+CREATE TABLE rule_deployments (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    rule_id UUID NOT NULL REFERENCES yara_rules(id) ON DELETE CASCADE,
+    agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'deployed', 'failed', 'outdated', 'removed')),
+    deployed_at TIMESTAMP WITH TIME ZONE,
+    removed_at TIMESTAMP WITH TIME ZONE,
+    deployment_hash VARCHAR(64),
+    error_message TEXT,
+    retry_count INTEGER DEFAULT 0,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(rule_id, agent_id)
+);
+
+-- ====================================
+-- 4. ALERTS - Cảnh báo bảo mật
+-- ====================================
+DROP TABLE IF EXISTS alerts CASCADE;
+CREATE TABLE alerts (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    rule_id UUID REFERENCES yara_rules(id) ON DELETE SET NULL,
+    rule_name VARCHAR(255) NOT NULL,
+    event_id VARCHAR(100), -- Reference to InfluxDB event
+    severity INTEGER NOT NULL CHECK (severity BETWEEN 1 AND 5),
+    status VARCHAR(20) DEFAULT 'new' CHECK (status IN ('new', 'investigating', 'resolved', 'false_positive', 'suppressed')),
+    title VARCHAR(500) NOT NULL,
+    description TEXT,
+    file_path TEXT,
+    file_name VARCHAR(255),
+    file_hash VARCHAR(64),
+    file_size BIGINT,
+    process_name VARCHAR(255),
+    process_id INTEGER,
+    parent_process_id INTEGER,
+    command_line TEXT,
+    username VARCHAR(255),
+    detection_time TIMESTAMP WITH TIME ZONE NOT NULL,
+    first_seen TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    last_seen TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    event_count INTEGER DEFAULT 1,
+    confidence_score DECIMAL(3,2) DEFAULT 0.50 CHECK (confidence_score BETWEEN 0.00 AND 1.00),
+    threat_indicators JSONB DEFAULT '[]',
+    mitre_tactics TEXT[],
+    mitre_techniques TEXT[],
+    remediation_steps TEXT,
+    analyst_notes TEXT,
+    metadata JSONB DEFAULT '{}',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- ====================================
+-- 5. ALERT HISTORY - Lịch sử thay đổi alerts
+-- ====================================
+DROP TABLE IF EXISTS alert_history CASCADE;
+CREATE TABLE alert_history (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    alert_id UUID NOT NULL REFERENCES alerts(id) ON DELETE CASCADE,
+    action VARCHAR(50) NOT NULL,
+    old_value TEXT,
+    new_value TEXT,
+    analyst_notes TEXT,
+    changed_by VARCHAR(255),
+    changed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- ====================================
+-- 6. WHITELIST - Danh sách trắng
+-- ====================================
+DROP TABLE IF EXISTS whitelist CASCADE;
+CREATE TABLE whitelist (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    type VARCHAR(20) NOT NULL CHECK (type IN ('file_hash', 'file_path', 'process_name', 'domain', 'ip_address', 'registry_key')),
+    value TEXT NOT NULL,
+    description TEXT,
+    reason VARCHAR(255),
+    is_active BOOLEAN DEFAULT true,
+    expires_at TIMESTAMP WITH TIME ZONE,
+    created_by VARCHAR(255),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(type, value)
+);
+
+-- ====================================
+-- 7. QUARANTINED FILES - Files bị cách ly
+-- ====================================
+DROP TABLE IF EXISTS quarantined_files CASCADE;
+CREATE TABLE quarantined_files (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    alert_id UUID REFERENCES alerts(id) ON DELETE SET NULL,
+    original_path TEXT NOT NULL,
+    quarantine_path TEXT NOT NULL,
+    file_name VARCHAR(255),
+    file_hash VARCHAR(64) NOT NULL,
+    file_size BIGINT,
+    file_type VARCHAR(50),
+    quarantine_reason TEXT,
+    status VARCHAR(20) DEFAULT 'quarantined' CHECK (status IN ('quarantined', 'restored', 'deleted', 'analyzed')),
+    quarantined_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    restored_at TIMESTAMP WITH TIME ZONE,
+    deleted_at TIMESTAMP WITH TIME ZONE,
+    analysis_result JSONB DEFAULT '{}',
+    metadata JSONB DEFAULT '{}'
+);
+
+-- ====================================
+-- 8. THREAT INTELLIGENCE - Thông tin mối đe dọa
+-- ====================================
+DROP TABLE IF EXISTS threat_intelligence CASCADE;
+CREATE TABLE threat_intelligence (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    indicator_type VARCHAR(20) NOT NULL CHECK (indicator_type IN ('hash', 'domain', 'ip', 'url', 'email', 'file_path')),
+    indicator_value TEXT NOT NULL,
+    threat_type VARCHAR(50),
+    malware_family VARCHAR(100),
+    confidence INTEGER CHECK (confidence BETWEEN 1 AND 100),
+    source VARCHAR(100) NOT NULL,
+    source_url VARCHAR(500),
+    description TEXT,
+    first_seen TIMESTAMP WITH TIME ZONE,
+    last_seen TIMESTAMP WITH TIME ZONE,
+    is_active BOOLEAN DEFAULT true,
+    severity INTEGER DEFAULT 3 CHECK (severity BETWEEN 1 AND 5),
+    tags TEXT[],
+    attributes JSONB DEFAULT '{}',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(indicator_type, indicator_value, source)
+);
+
+-- ====================================
+-- 9. AGENT GROUPS - Nhóm Agents
+-- ====================================
+DROP TABLE IF EXISTS agent_groups CASCADE;
+CREATE TABLE agent_groups (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name VARCHAR(255) NOT NULL UNIQUE,
+    description TEXT,
+    group_type VARCHAR(50) DEFAULT 'custom' CHECK (group_type IN ('default', 'custom', 'auto')),
+    rules JSONB DEFAULT '{}',
+    config JSONB DEFAULT '{}',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+DROP TABLE IF EXISTS agent_group_members CASCADE;
+CREATE TABLE agent_group_members (
+    agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    group_id UUID NOT NULL REFERENCES agent_groups(id) ON DELETE CASCADE,
+    joined_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    PRIMARY KEY (agent_id, group_id)
+);
+
+-- ====================================
+-- 10. AGENT TASKS - Nhiệm vụ gửi cho Agents
+-- ====================================
+DROP TABLE IF EXISTS agent_tasks CASCADE;
+CREATE TABLE agent_tasks (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    task_type VARCHAR(50) NOT NULL CHECK (task_type IN ('scan_file', 'scan_directory', 'update_rules', 'collect_logs', 'quarantine_file', 'restore_file', 'update_config')),
+    parameters JSONB DEFAULT '{}',
+    status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'acknowledged', 'running', 'completed', 'failed', 'timeout', 'cancelled')),
+    priority INTEGER DEFAULT 5 CHECK (priority BETWEEN 1 AND 10),
+    timeout_seconds INTEGER DEFAULT 300,
+    created_by VARCHAR(255),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    sent_at TIMESTAMP WITH TIME ZONE,
+    acknowledged_at TIMESTAMP WITH TIME ZONE,
+    started_at TIMESTAMP WITH TIME ZONE,
+    completed_at TIMESTAMP WITH TIME ZONE,
+    result JSONB DEFAULT '{}',
+    error_message TEXT,
+    progress INTEGER DEFAULT 0 CHECK (progress BETWEEN 0 AND 100)
+);
+
+-- ====================================
+-- 11. SYSTEM CONFIGURATION - Cấu hình hệ thống
+-- ====================================
+DROP TABLE IF EXISTS system_config CASCADE;
+CREATE TABLE system_config (
+    id SERIAL PRIMARY KEY,
+    category VARCHAR(100) NOT NULL,
+    key VARCHAR(100) NOT NULL,
+    value TEXT NOT NULL,
+    description TEXT,
+    data_type VARCHAR(20) DEFAULT 'string' CHECK (data_type IN ('string', 'integer', 'boolean', 'json')),
+    is_encrypted BOOLEAN DEFAULT false,
+    is_readonly BOOLEAN DEFAULT false,
+    updated_by VARCHAR(255),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(category, key)
+);
+
+-- ====================================
+-- 12. EVENT STATISTICS - Thống kê events (từ InfluxDB)
+-- ====================================
+DROP TABLE IF EXISTS event_statistics CASCADE;
+CREATE TABLE event_statistics (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    date DATE NOT NULL,
+    event_type VARCHAR(50) NOT NULL,
+    event_count INTEGER DEFAULT 0,
+    file_events INTEGER DEFAULT 0,
+    process_events INTEGER DEFAULT 0,
+    network_events INTEGER DEFAULT 0,
+    registry_events INTEGER DEFAULT 0,
+    malicious_events INTEGER DEFAULT 0,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(agent_id, date, event_type)
+);
+
+-- ====================================
+-- 13. NOTIFICATION SETTINGS - Cài đặt thông báo
+-- ====================================
+DROP TABLE IF EXISTS notification_settings CASCADE;
+CREATE TABLE notification_settings (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name VARCHAR(255) NOT NULL,
+    type VARCHAR(20) NOT NULL CHECK (type IN ('email', 'webhook', 'sms', 'slack', 'teams')),
+    config JSONB NOT NULL,
+    triggers TEXT[] NOT NULL,
+    severity_filter INTEGER[] DEFAULT '{1,2,3,4,5}',
+    agent_filter UUID[],
+    is_active BOOLEAN DEFAULT true,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- ====================================
+-- 14. AUDIT LOGS - Nhật ký kiểm toán
+-- ====================================
+DROP TABLE IF EXISTS audit_logs CASCADE;
+CREATE TABLE audit_logs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    action VARCHAR(100) NOT NULL,
+    resource_type VARCHAR(50),
+    resource_id UUID,
+    resource_name VARCHAR(255),
+    description TEXT,
+    user_id VARCHAR(255),
+    ip_address INET,
+    user_agent TEXT,
+    success BOOLEAN DEFAULT true,
+    error_message TEXT,
+    metadata JSONB DEFAULT '{}',
+    timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- ====================================
+-- INDEXES for Performance
+-- ====================================
+
+-- Agents indexes
+CREATE INDEX idx_agents_hostname ON agents(hostname);
+CREATE INDEX idx_agents_status ON agents(status);
+CREATE INDEX idx_agents_last_seen ON agents(last_seen DESC);
+CREATE INDEX idx_agents_os_type ON agents(os_type);
+CREATE INDEX idx_agents_location ON agents(location);
+
+-- YARA Rules indexes
+CREATE INDEX idx_yara_rules_name ON yara_rules(name);
+CREATE INDEX idx_yara_rules_active ON yara_rules(is_active);
+CREATE INDEX idx_yara_rules_category ON yara_rules(category);
+CREATE INDEX idx_yara_rules_severity ON yara_rules(severity);
+CREATE INDEX idx_yara_rules_platform ON yara_rules(platform);
+
+-- Alerts indexes
+CREATE INDEX idx_alerts_agent_id ON alerts(agent_id);
+CREATE INDEX idx_alerts_rule_id ON alerts(rule_id);
+CREATE INDEX idx_alerts_status ON alerts(status);
+CREATE INDEX idx_alerts_severity ON alerts(severity DESC);
+CREATE INDEX idx_alerts_detection_time ON alerts(detection_time DESC);
+CREATE INDEX idx_alerts_created_at ON alerts(created_at DESC);
+CREATE INDEX idx_alerts_file_hash ON alerts(file_hash);
+CREATE INDEX idx_alerts_process_name ON alerts(process_name);
+
+-- Rule Deployments indexes
+CREATE INDEX idx_rule_deployments_agent ON rule_deployments(agent_id);
+CREATE INDEX idx_rule_deployments_rule ON rule_deployments(rule_id);
+CREATE INDEX idx_rule_deployments_status ON rule_deployments(status);
+
+-- Agent Tasks indexes
+CREATE INDEX idx_agent_tasks_agent_id ON agent_tasks(agent_id);
+CREATE INDEX idx_agent_tasks_status ON agent_tasks(status);
+CREATE INDEX idx_agent_tasks_created_at ON agent_tasks(created_at DESC);
+CREATE INDEX idx_agent_tasks_priority ON agent_tasks(priority DESC);
+
+-- Threat Intelligence indexes
+CREATE INDEX idx_threat_intel_type_value ON threat_intelligence(indicator_type, indicator_value);
+CREATE INDEX idx_threat_intel_active ON threat_intelligence(is_active);
+CREATE INDEX idx_threat_intel_threat_type ON threat_intelligence(threat_type);
+
+-- Quarantined Files indexes
+CREATE INDEX idx_quarantine_agent_id ON quarantined_files(agent_id);
+CREATE INDEX idx_quarantine_status ON quarantined_files(status);
+CREATE INDEX idx_quarantine_file_hash ON quarantined_files(file_hash);
+
+-- Event Statistics indexes
+CREATE INDEX idx_event_stats_agent_date ON event_statistics(agent_id, date DESC);
+CREATE INDEX idx_event_stats_date ON event_statistics(date DESC);
+
+-- Audit Logs indexes
+CREATE INDEX idx_audit_logs_timestamp ON audit_logs(timestamp DESC);
+CREATE INDEX idx_audit_logs_action ON audit_logs(action);
+CREATE INDEX idx_audit_logs_resource ON audit_logs(resource_type, resource_id);
+CREATE INDEX idx_audit_logs_user ON audit_logs(user_id);
+
+-- ====================================
+-- TRIGGERS for auto-update timestamps
+-- ====================================
+
+-- Function to update timestamp
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ language 'plpgsql';
+
+-- Apply triggers to tables with updated_at column
+CREATE TRIGGER update_agents_updated_at BEFORE UPDATE ON agents 
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_yara_rules_updated_at BEFORE UPDATE ON yara_rules 
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_alerts_updated_at BEFORE UPDATE ON alerts 
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_whitelist_updated_at BEFORE UPDATE ON whitelist 
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_threat_intel_updated_at BEFORE UPDATE ON threat_intelligence 
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_agent_groups_updated_at BEFORE UPDATE ON agent_groups 
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_system_config_updated_at BEFORE UPDATE ON system_config 
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_notification_settings_updated_at BEFORE UPDATE ON notification_settings 
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- ====================================
+-- VIEWS for Dashboard Queries
+-- ====================================
+
+-- Active Agents View
+CREATE OR REPLACE VIEW v_active_agents AS
+SELECT 
+    a.*,
+    CASE 
+        WHEN a.last_seen > NOW() - INTERVAL '5 minutes' THEN 'online'
+        WHEN a.last_seen > NOW() - INTERVAL '1 hour' THEN 'warning'
+        ELSE 'offline'
+    END as real_status,
+    EXTRACT(EPOCH FROM (NOW() - a.last_seen))::INTEGER as seconds_since_last_seen,
+    COUNT(al.id) as alert_count,
+    COUNT(CASE WHEN al.status = 'new' THEN 1 END) as new_alerts
+FROM agents a
+LEFT JOIN alerts al ON a.id = al.agent_id AND al.created_at > NOW() - INTERVAL '24 hours'
+GROUP BY a.id;
+
+-- Recent Alerts View
+CREATE OR REPLACE VIEW v_recent_alerts AS
+SELECT 
+    al.*,
+    ag.hostname,
+    ag.ip_address,
+    ag.os_type,
+    yr.name as rule_name,
+    yr.category as rule_category,
+    yr.severity as rule_severity
+FROM alerts al
+JOIN agents ag ON al.agent_id = ag.id
+LEFT JOIN yara_rules yr ON al.rule_id = yr.id
+WHERE al.created_at > NOW() - INTERVAL '7 days'
+ORDER BY al.created_at DESC;
+
+-- Alert Statistics View
+CREATE OR REPLACE VIEW v_alert_stats AS
+SELECT 
+    DATE(created_at) as alert_date,
+    status,
+    severity,
+    COUNT(*) as alert_count,
+    COUNT(DISTINCT agent_id) as affected_agents
+FROM alerts 
+WHERE created_at > NOW() - INTERVAL '30 days'
+GROUP BY DATE(created_at), status, severity
+ORDER BY alert_date DESC;
+
+-- Agent Statistics View
+CREATE OR REPLACE VIEW v_agent_stats AS
+SELECT 
+    os_type,
+    status,
+    location,
+    COUNT(*) as agent_count,
+    AVG(EXTRACT(EPOCH FROM (NOW() - last_seen)))::INTEGER as avg_last_seen_seconds,
+    MIN(last_seen) as oldest_last_seen,
+    MAX(last_seen) as newest_last_seen
+FROM agents
+GROUP BY os_type, status, location;
+
+-- System Health View
+CREATE OR REPLACE VIEW v_system_health AS
+SELECT 
+    (SELECT COUNT(*) FROM agents) as total_agents,
+    (SELECT COUNT(*) FROM agents WHERE status = 'online') as online_agents,
+    (SELECT COUNT(*) FROM agents WHERE status = 'offline') as offline_agents,
+    (SELECT COUNT(*) FROM alerts WHERE created_at > NOW() - INTERVAL '24 hours') as alerts_24h,
+    (SELECT COUNT(*) FROM alerts WHERE severity >= 4 AND status IN ('new', 'investigating')) as critical_alerts,
+    (SELECT COUNT(*) FROM yara_rules WHERE is_active = true) as active_rules,
+    (SELECT COUNT(*) FROM quarantined_files WHERE status = 'quarantined') as quarantined_files;
+
+-- ====================================
+-- STORED PROCEDURES
+-- ====================================
+
+-- Procedure to get dashboard summary
+CREATE OR REPLACE FUNCTION get_dashboard_summary()
+RETURNS TABLE(
+    total_agents INTEGER,
+    online_agents INTEGER,
+    offline_agents INTEGER,
+    recent_alerts INTEGER,
+    critical_alerts INTEGER,
+    active_rules INTEGER,
+    quarantined_files INTEGER
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT * FROM v_system_health;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Procedure to cleanup old data
+CREATE OR REPLACE FUNCTION cleanup_old_data(days_to_keep INTEGER DEFAULT 90)
+RETURNS TABLE(
+    deleted_alerts INTEGER,
+    deleted_alert_history INTEGER,
+    deleted_audit_logs INTEGER,
+    deleted_event_stats INTEGER
+) AS $$
+DECLARE
+    alert_count INTEGER;
+    history_count INTEGER;
+    audit_count INTEGER;
+    stats_count INTEGER;
+BEGIN
+    -- Delete old resolved alerts
+    DELETE FROM alerts 
+    WHERE status IN ('resolved', 'false_positive') 
+    AND updated_at < NOW() - INTERVAL '1 day' * days_to_keep;
+    GET DIAGNOSTICS alert_count = ROW_COUNT;
+    
+    -- Delete old alert history
+    DELETE FROM alert_history 
+    WHERE changed_at < NOW() - INTERVAL '1 day' * days_to_keep;
+    GET DIAGNOSTICS history_count = ROW_COUNT;
+    
+    -- Delete old audit logs
+    DELETE FROM audit_logs 
+    WHERE timestamp < NOW() - INTERVAL '1 day' * days_to_keep;
+    GET DIAGNOSTICS audit_count = ROW_COUNT;
+    
+    -- Delete old event statistics
+    DELETE FROM event_statistics 
+    WHERE date < NOW() - INTERVAL '1 day' * days_to_keep;
+    GET DIAGNOSTICS stats_count = ROW_COUNT;
+    
+    RETURN QUERY SELECT alert_count, history_count, audit_count, stats_count;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ====================================
+-- INITIAL DATA
+-- ====================================
+
+-- Insert default system configuration
+INSERT INTO system_config (category, key, value, description, data_type) VALUES
+('general', 'system_name', 'EDR System', 'Name of the EDR system', 'string'),
+('general', 'version', '1.0.0', 'System version', 'string'),
+('general', 'retention_days', '90', 'Data retention period in days', 'integer'),
+('alerts', 'auto_resolve_days', '30', 'Auto-resolve alerts after N days', 'integer'),
+('alerts', 'max_severity', '5', 'Maximum alert severity level', 'integer'),
+('agents', 'heartbeat_timeout', '300', 'Agent heartbeat timeout in seconds', 'integer'),
+('agents', 'default_heartbeat_interval', '30', 'Default heartbeat interval in seconds', 'integer'),
+('yara', 'max_rules_per_agent', '1000', 'Maximum YARA rules per agent', 'integer'),
+('yara', 'auto_compile', 'true', 'Auto-compile YARA rules on upload', 'boolean'),
+('notifications', 'email_enabled', 'false', 'Enable email notifications', 'boolean'),
+('notifications', 'webhook_enabled', 'true', 'Enable webhook notifications', 'boolean'),
+('performance', 'event_batch_size', '1000', 'Event processing batch size', 'integer'),
+('performance', 'cleanup_interval_hours', '24', 'Database cleanup interval in hours', 'integer'),
+('security', 'max_login_attempts', '5', 'Maximum login attempts before lockout', 'integer'),
+('security', 'session_timeout_minutes', '60', 'Session timeout in minutes', 'integer');
+
+-- Insert default agent group
+INSERT INTO agent_groups (name, description, group_type) VALUES
+('Default', 'Default group for all agents', 'default'),
+('Windows Servers', 'Windows server machines', 'custom'),
+('Linux Workstations', 'Linux desktop and laptop machines', 'custom'),
+('Critical Infrastructure', 'Mission-critical systems', 'custom');
+
+-- Insert some sample threat intelligence
+INSERT INTO threat_intelligence (indicator_type, indicator_value, threat_type, confidence, source, description, severity) VALUES
+('hash', '44d88612fea8a8f36de82e1278abb02f', 'malware', 90, 'Internal', 'Known malicious file hash', 4),
+('domain', 'malicious-site.com', 'c2', 85, 'Threat Feed', 'Command and control server', 5),
+('ip', '192.0.2.100', 'scanner', 70, 'Internal', 'Suspicious scanning activity', 3),
+('hash', 'd41d8cd98f00b204e9800998ecf8427e', 'test', 50, 'Internal', 'Empty file hash for testing', 1);
+
+-- Insert sample YARA rules
+INSERT INTO yara_rules (name, content, description, author, severity, category, platform) VALUES
+('Suspicious_PE', 
+'rule Suspicious_PE {
+    meta:
+        description = "Detects suspicious PE files"
+        author = "EDR Team"
+        severity = 3
+    
+    condition:
+        uint16(0) == 0x5A4D and
+        filesize < 10MB
+}', 
+'Basic PE file detection rule', 'EDR Team', 3, 'malware', 'Windows'),
+
+('Network_Scanner',
+'rule Network_Scanner {
+    meta:
+        description = "Detects network scanning tools"
+        author = "EDR Team"
+        severity = 4
+    
+    strings:
+        $nmap = "nmap" nocase
+        $masscan = "masscan" nocase
+        $zmap = "zmap" nocase
+    
+    condition:
+        any of them
+}',
+'Detects common network scanning tools', 'EDR Team', 4, 'network', 'All');
+
+-- ====================================
+-- COMMENTS
+-- ====================================
+
+COMMENT ON DATABASE edr IS 'EDR (Endpoint Detection and Response) System Database';
+
+COMMENT ON TABLE agents IS 'Stores information about EDR agents deployed on endpoints';
+COMMENT ON TABLE yara_rules IS 'YARA rules for malware detection and threat hunting';
+COMMENT ON TABLE alerts IS 'Security alerts generated by YARA rule matches and other detections';
+COMMENT ON TABLE rule_deployments IS 'Tracks deployment status of YARA rules to agents';
+COMMENT ON TABLE whitelist IS 'Whitelist entries to prevent false positive alerts';
+COMMENT ON TABLE quarantined_files IS 'Files that have been quarantined by the system';
+COMMENT ON TABLE threat_intelligence IS 'External threat intelligence indicators and IOCs';
+COMMENT ON TABLE agent_tasks IS 'Tasks and commands sent to agents for execution';
+COMMENT ON TABLE system_config IS 'System-wide configuration parameters';
+COMMENT ON TABLE audit_logs IS 'System audit trail and activity logs';
+COMMENT ON TABLE notification_settings IS 'Configuration for alert notifications';
+
+-- Display completion message
+SELECT 'EDR Database Schema Created Successfully!' as status,
+       'Total Tables: ' || COUNT(*) as table_count
+FROM information_schema.tables 
+WHERE table_schema = 'public';

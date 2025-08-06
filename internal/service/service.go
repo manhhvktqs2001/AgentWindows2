@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -87,7 +86,10 @@ func Uninstall() error {
 	defer windows.CloseServiceHandle(serviceHandle)
 
 	// Stop service first
-	windows.ControlService(serviceHandle, windows.SERVICE_CONTROL_STOP, nil)
+	err = windows.ControlService(serviceHandle, windows.SERVICE_CONTROL_STOP, nil)
+	if err != nil {
+		// Ignore error if service is already stopped
+	}
 
 	// Delete service
 	err = windows.DeleteService(serviceHandle)
@@ -134,7 +136,7 @@ func Stop() error {
 	}
 	defer windows.CloseServiceHandle(serviceHandle)
 
-	_, err = windows.ControlService(serviceHandle, windows.SERVICE_CONTROL_STOP, nil)
+	err = windows.ControlService(serviceHandle, windows.SERVICE_CONTROL_STOP, nil)
 	if err != nil {
 		return fmt.Errorf("failed to stop service: %v", err)
 	}

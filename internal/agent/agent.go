@@ -2,6 +2,9 @@ package agent
 
 import (
 	"fmt"
+	"net"
+	"os"
+	"runtime"
 	"sync"
 	"time"
 
@@ -170,13 +173,39 @@ func (a *Agent) RegisterEvent(event Event) {
 
 // Register with server
 func (a *Agent) registerWithServer() error {
+	hostname, err := os.Hostname()
+	if err != nil {
+		return fmt.Errorf("failed to get hostname: %w", err)
+	}
+
+	ip, err := a.getIPAddress()
+	if err != nil {
+		return fmt.Errorf("failed to get IP address: %w", err)
+	}
+
+	macAddress, err := a.getMACAddress()
+	if err != nil {
+		a.logger.Warn("Failed to get MAC address: %v", err)
+		macAddress = ""
+	}
+
+	osVersion, err := a.getOSVersion()
+	if err != nil {
+		return fmt.Errorf("failed to get OS version: %w", err)
+	}
+
+	// Get additional system information
+	systemInfo := a.getSystemInfo()
+
 	registration := communication.AgentRegistration{
-		Hostname:     a.config.Agent.Name,
-		IPAddress:    "192.168.20.85", // TODO: Get actual IP
-		OSType:       "Windows",
-		OSVersion:    "10.0.19044", // TODO: Get actual version
-		Architecture: "x64",
+		Hostname:     hostname,
+		IPAddress:    ip,
+		MACAddress:   macAddress,
+		OSType:       runtime.GOOS,
+		OSVersion:    osVersion,
+		Architecture: runtime.GOARCH,
 		AgentVersion: "1.0.0",
+		SystemInfo:   systemInfo,
 	}
 
 	agentID, err := a.serverClient.Register(registration)
@@ -185,7 +214,15 @@ func (a *Agent) registerWithServer() error {
 	}
 
 	a.config.Agent.ID = agentID
+
+	// Update API key if server provided a new one
+	if a.serverClient.GetAPIKey() != a.config.Server.APIKey {
+		a.config.Server.APIKey = a.serverClient.GetAPIKey()
+		a.logger.Info("Updated API key from server")
+	}
+
 	a.logger.Info("Registered with server, Agent ID: %s", agentID)
+	a.logger.Info("System Info - Hostname: %s, IP: %s, OS: %s %s", hostname, ip, runtime.GOOS, osVersion)
 
 	return nil
 }
@@ -239,7 +276,12 @@ func (a *Agent) eventWorker() {
 		case <-a.stopChan:
 			// Send remaining events
 			if len(events) > 0 {
-				a.serverClient.SendEvents(events)
+				// Convert []Event to []interface{}
+				interfaceEvents := make([]interface{}, len(events))
+				for i, event := range events {
+					interfaceEvents[i] = event
+				}
+				a.serverClient.SendEvents(interfaceEvents)
 			}
 			return
 
@@ -248,14 +290,24 @@ func (a *Agent) eventWorker() {
 
 			// Send batch when full
 			if len(events) >= a.config.Agent.EventBatchSize {
-				a.serverClient.SendEvents(events)
+				// Convert []Event to []interface{}
+				interfaceEvents := make([]interface{}, len(events))
+				for i, event := range events {
+					interfaceEvents[i] = event
+				}
+				a.serverClient.SendEvents(interfaceEvents)
 				events = events[:0] // Reset slice
 			}
 
 		case <-ticker.C:
 			// Send batch on timer
 			if len(events) > 0 {
-				a.serverClient.SendEvents(events)
+				// Convert []Event to []interface{}
+				interfaceEvents := make([]interface{}, len(events))
+				for i, event := range events {
+					interfaceEvents[i] = event
+				}
+				a.serverClient.SendEvents(interfaceEvents)
 				events = events[:0] // Reset slice
 			}
 		}
@@ -273,5 +325,95 @@ func (a *Agent) taskWorker() {
 				a.logger.Error("Task execution failed: %v", err)
 			}
 		}
+	}
+}
+
+func (a *Agent) getIPAddress() (string, error) {
+	// Get all network interfaces
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return "", fmt.Errorf("failed to get network interfaces: %w", err)
+	}
+
+	// Look for the primary network interface (usually the first non-loopback interface)
+	for _, iface := range interfaces {
+		// Skip loopback and down interfaces
+		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok {
+				// Get IPv4 address
+				if ip := ipnet.IP.To4(); ip != nil {
+					return ip.String(), nil
+				}
+			}
+		}
+	}
+
+	// Fallback: try to get any non-loopback IPv4 address
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return "", fmt.Errorf("failed to get interface addresses: %w", err)
+	}
+
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			if ip := ipnet.IP.To4(); ip != nil {
+				return ip.String(), nil
+			}
+		}
+	}
+
+	return "127.0.0.1", nil // Fallback to localhost
+}
+
+func (a *Agent) getMACAddress() (string, error) {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return "", fmt.Errorf("failed to get network interfaces: %w", err)
+	}
+
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp != 0 && iface.HardwareAddr != nil {
+			return iface.HardwareAddr.String(), nil
+		}
+	}
+
+	return "", fmt.Errorf("no MAC address found")
+}
+
+func (a *Agent) getSystemInfo() map[string]interface{} {
+	return map[string]interface{}{
+		"cpu_cores":  runtime.NumCPU(),
+		"go_version": runtime.Version(),
+		"go_os":      runtime.GOOS,
+		"go_arch":    runtime.GOARCH,
+		"hostname":   a.getHostname(),
+	}
+}
+
+func (a *Agent) getHostname() string {
+	hostname, err := os.Hostname()
+	if err != nil {
+		return "unknown"
+	}
+	return hostname
+}
+
+func (a *Agent) getOSVersion() (string, error) {
+	// Try to get Windows version from registry or system info
+	// For now, return a basic version based on runtime
+	switch runtime.GOOS {
+	case "windows":
+		return "Windows 10", nil
+	default:
+		return runtime.GOOS, nil
 	}
 }
