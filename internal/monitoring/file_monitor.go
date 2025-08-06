@@ -1,6 +1,7 @@
 package monitoring
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,83 +9,130 @@ import (
 	"unsafe"
 
 	"edr-agent-windows/internal/config"
-	"edr-agent-windows/internal/scanner"
+	"edr-agent-windows/internal/models"
 	"edr-agent-windows/internal/utils"
 
 	"golang.org/x/sys/windows"
 )
 
 type FileMonitor struct {
-	config      config.FileMonitorConfig
-	logger      *utils.Logger
-	scanner     *scanner.YaraScanner
-	directories map[string]*DirectoryWatch
-	stopChan    chan bool
+	config    *config.FileSystemConfig
+	logger    *utils.Logger
+	eventChan chan models.FileEvent
+	stopChan  chan bool
+	handles   []windows.Handle
+	watchers  map[string]*DirectoryWatcher
 }
 
-type DirectoryWatch struct {
-	handle     windows.Handle
-	buffer     []byte
-	overlapped *windows.Overlapped
-	path       string
+type DirectoryWatcher struct {
+	path   string
+	handle windows.Handle
+	events chan models.FileEvent
 }
 
-type FileEvent struct {
-	AgentID   string    `json:"agent_id"`
-	Timestamp time.Time `json:"timestamp"`
-	EventType string    `json:"event_type"`
-	FilePath  string    `json:"file_path"`
-	FileName  string    `json:"file_name"`
-	Action    string    `json:"action"`
-	FileSize  int64     `json:"file_size"`
-	Hash      string    `json:"hash"`
-	Platform  string    `json:"platform"`
+const (
+	FILE_NOTIFY_CHANGE_FILE_NAME   = 0x00000001
+	FILE_NOTIFY_CHANGE_DIR_NAME    = 0x00000002
+	FILE_NOTIFY_CHANGE_ATTRIBUTES  = 0x00000004
+	FILE_NOTIFY_CHANGE_SIZE        = 0x00000008
+	FILE_NOTIFY_CHANGE_LAST_WRITE  = 0x00000010
+	FILE_NOTIFY_CHANGE_LAST_ACCESS = 0x00000020
+	FILE_NOTIFY_CHANGE_CREATION    = 0x00000040
+	FILE_NOTIFY_CHANGE_SECURITY    = 0x00000100
+
+	FILE_ACTION_ADDED            = 0x00000001
+	FILE_ACTION_REMOVED          = 0x00000002
+	FILE_ACTION_MODIFIED         = 0x00000003
+	FILE_ACTION_RENAMED_OLD_NAME = 0x00000004
+	FILE_ACTION_RENAMED_NEW_NAME = 0x00000005
+)
+
+type FILE_NOTIFY_INFORMATION struct {
+	NextEntryOffset uint32
+	Action          uint32
+	FileNameLength  uint32
+	FileName        [1]uint16
 }
 
-func NewFileMonitor(config config.FileMonitorConfig, logger *utils.Logger, scanner *scanner.YaraScanner) *FileMonitor {
+func NewFileMonitor(cfg *config.FileSystemConfig, logger *utils.Logger) *FileMonitor {
 	return &FileMonitor{
-		config:      config,
-		logger:      logger,
-		scanner:     scanner,
-		directories: make(map[string]*DirectoryWatch),
-		stopChan:    make(chan bool),
+		config:    cfg,
+		logger:    logger,
+		eventChan: make(chan models.FileEvent, 1000),
+		stopChan:  make(chan bool),
+		watchers:  make(map[string]*DirectoryWatcher),
 	}
 }
 
+// Start begins file system monitoring
 func (fm *FileMonitor) Start() error {
-	fm.logger.Info("Starting Windows file monitor...")
+	fm.logger.Info("Starting file system monitor...")
 
+	// Validate paths
+	if len(fm.config.Paths) == 0 {
+		return fmt.Errorf("no paths configured for monitoring")
+	}
+
+	// Start watching each configured path
 	for _, path := range fm.config.Paths {
-		err := fm.watchDirectory(path)
-		if err != nil {
-			fm.logger.Error("Failed to watch directory %s: %v", path, err)
+		if err := fm.watchDirectory(path); err != nil {
+			fm.logger.Warn("Failed to watch directory %s: %v", path, err)
 			continue
 		}
-		fm.logger.Info("Watching directory: %s", path)
 	}
 
+	// Start event processing goroutine
+	go fm.processEvents()
+
+	fm.logger.Info("File system monitor started successfully")
 	return nil
 }
 
+// Stop stops file system monitoring
 func (fm *FileMonitor) Stop() {
-	fm.logger.Info("Stopping Windows file monitor...")
+	fm.logger.Info("Stopping file system monitor...")
+
+	// Signal stop
 	close(fm.stopChan)
 
-	for _, watch := range fm.directories {
-		windows.CloseHandle(watch.handle)
+	// Close all watchers
+	for _, watcher := range fm.watchers {
+		windows.CloseHandle(watcher.handle)
 	}
+
+	// Close event channel
+	close(fm.eventChan)
+
+	fm.logger.Info("File system monitor stopped")
 }
 
+// GetEventChannel returns the channel for file events
+func (fm *FileMonitor) GetEventChannel() <-chan models.FileEvent {
+	return fm.eventChan
+}
+
+// watchDirectory sets up monitoring for a specific directory
 func (fm *FileMonitor) watchDirectory(path string) error {
-	// Convert path to UTF16
-	pathUTF16, err := windows.UTF16PtrFromString(path)
+	// Convert to absolute path
+	absPath, err := filepath.Abs(path)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get absolute path: %w", err)
+	}
+
+	// Check if directory exists
+	if _, err := os.Stat(absPath); os.IsNotExist(err) {
+		return fmt.Errorf("directory does not exist: %s", absPath)
+	}
+
+	// Convert path to Windows format
+	winPath, err := windows.UTF16PtrFromString(absPath)
+	if err != nil {
+		return fmt.Errorf("failed to convert path: %w", err)
 	}
 
 	// Open directory handle
 	handle, err := windows.CreateFile(
-		pathUTF16,
+		winPath,
 		windows.FILE_LIST_DIRECTORY,
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
 		nil,
@@ -93,144 +141,298 @@ func (fm *FileMonitor) watchDirectory(path string) error {
 		0,
 	)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to open directory: %w", err)
 	}
 
-	// Create directory watch
-	watch := &DirectoryWatch{
+	// Create watcher
+	watcher := &DirectoryWatcher{
+		path:   absPath,
 		handle: handle,
-		buffer: make([]byte, 64*1024), // 64KB buffer
-		path:   path,
+		events: make(chan models.FileEvent, 100),
 	}
 
-	fm.directories[path] = watch
-	go fm.monitorDirectory(watch)
+	fm.watchers[absPath] = watcher
 
+	// Start monitoring goroutine
+	go fm.monitorDirectory(watcher)
+
+	fm.logger.Info("Started monitoring directory: %s", absPath)
 	return nil
 }
 
-func (fm *FileMonitor) monitorDirectory(watch *DirectoryWatch) {
+// monitorDirectory monitors a single directory for changes
+func (fm *FileMonitor) monitorDirectory(watcher *DirectoryWatcher) {
+	buffer := make([]byte, 4096)
+	var overlapped windows.Overlapped
+	var bytesReturned uint32
+
 	for {
 		select {
 		case <-fm.stopChan:
 			return
 		default:
-			var bytesReturned uint32
+			// Read directory changes using Windows API
 			err := windows.ReadDirectoryChanges(
-				watch.handle,
-				&watch.buffer[0],
-				uint32(len(watch.buffer)),
-				fm.config.Recursive,
-				windows.FILE_NOTIFY_CHANGE_FILE_NAME|
-					windows.FILE_NOTIFY_CHANGE_DIR_NAME|
-					windows.FILE_NOTIFY_CHANGE_SIZE|
-					windows.FILE_NOTIFY_CHANGE_LAST_WRITE,
+				watcher.handle,
+				&buffer[0],
+				uint32(len(buffer)),
+				true, // Watch subtree
+				FILE_NOTIFY_CHANGE_FILE_NAME|
+					FILE_NOTIFY_CHANGE_DIR_NAME|
+					FILE_NOTIFY_CHANGE_ATTRIBUTES|
+					FILE_NOTIFY_CHANGE_SIZE|
+					FILE_NOTIFY_CHANGE_LAST_WRITE|
+					FILE_NOTIFY_CHANGE_LAST_ACCESS|
+					FILE_NOTIFY_CHANGE_CREATION|
+					FILE_NOTIFY_CHANGE_SECURITY,
 				&bytesReturned,
-				watch.overlapped,
-				0,
+				&overlapped,
+				0, // No completion routine
 			)
 
 			if err != nil {
-				fm.logger.Error("ReadDirectoryChanges failed: %v", err)
+				fm.logger.Error("Failed to read directory changes: %v", err)
 				time.Sleep(1 * time.Second)
 				continue
 			}
 
-			fm.parseNotifications(watch.buffer[:bytesReturned], watch.path)
+			// Wait for completion
+			err = windows.GetOverlappedResult(watcher.handle, &overlapped, &bytesReturned, true)
+			if err != nil {
+				fm.logger.Error("Failed to get overlapped result: %v", err)
+				time.Sleep(1 * time.Second)
+				continue
+			}
+
+			// Process the changes
+			fm.processDirectoryChanges(watcher.path, buffer[:bytesReturned])
 		}
 	}
 }
 
-func (fm *FileMonitor) parseNotifications(buffer []byte, basePath string) {
-	offset := 0
+// processDirectoryChanges processes directory change notifications
+func (fm *FileMonitor) processDirectoryChanges(dirPath string, buffer []byte) {
+	offset := uint32(0)
 
-	for offset < len(buffer) {
-		// Parse FILE_NOTIFY_INFORMATION structure
-		nextEntryOffset := *(*uint32)(unsafe.Pointer(&buffer[offset]))
-		action := *(*uint32)(unsafe.Pointer(&buffer[offset+4]))
-		fileNameLength := *(*uint32)(unsafe.Pointer(&buffer[offset+8]))
+	for offset < uint32(len(buffer)) {
+		info := (*FILE_NOTIFY_INFORMATION)(unsafe.Pointer(&buffer[offset]))
 
-		// Extract filename (UTF-16)
-		filenameBytes := buffer[offset+12 : offset+12+int(fileNameLength)]
-		filename := windows.UTF16ToString((*(*[]uint16)(unsafe.Pointer(&filenameBytes)))[:fileNameLength/2])
+		// Extract filename
+		filename := windows.UTF16ToString((*[1 << 20]uint16)(unsafe.Pointer(&info.FileName[0]))[:info.FileNameLength/2])
+		fullPath := filepath.Join(dirPath, filename)
 
-		fullPath := filepath.Join(basePath, filename)
+		// Process the event
+		fm.processFileEvent(fullPath, info.Action)
 
-		// Create file event
-		event := &FileEvent{
-			AgentID:   "agent-id", // TODO: Get from config
-			Timestamp: time.Now(),
-			EventType: "file",
-			FilePath:  fullPath,
-			FileName:  filename,
-			Action:    fm.actionToString(action),
-			Platform:  "windows",
-		}
-
-		// Get file info
-		if stat, err := os.Stat(fullPath); err == nil {
-			event.FileSize = stat.Size()
-		}
-
-		// Calculate hash if needed
-		if fm.shouldCalculateHash(event) {
-			event.Hash = fm.calculateFileHash(fullPath)
-		}
-
-		// YARA scan if enabled
-		if fm.config.ScanOnWrite && event.Action == "created" {
-			go fm.scanFile(fullPath)
-		}
-
-		// TODO: Send event to agent
-		fm.logger.Debug("File event: %s %s", event.Action, event.FilePath)
-
-		if nextEntryOffset == 0 {
+		// Move to next entry
+		if info.NextEntryOffset == 0 {
 			break
 		}
-		offset += int(nextEntryOffset)
+		offset += info.NextEntryOffset
 	}
 }
 
-func (fm *FileMonitor) actionToString(action uint32) string {
+// processFileEvent processes a single file event
+func (fm *FileMonitor) processFileEvent(filePath string, action uint32) {
+	// Skip if file should be excluded
+	if fm.shouldExcludeFile(filePath) {
+		return
+	}
+
+	// Get file info
+	fileInfo, err := os.Stat(filePath)
+	if err != nil {
+		// File might have been deleted
+		fileInfo = nil
+	}
+
+	// Create file event
+	event := models.FileEvent{
+		Event: models.Event{
+			ID:        fm.generateEventID(),
+			EventType: "file_event",
+			Timestamp: time.Now(),
+			Severity:  fm.determineSeverity(action, filePath),
+			Category:  "file_system",
+			Source:    "file_monitor",
+			FilePath:  filePath,
+		},
+		Action: fm.determineAction(action),
+	}
+
+	// Add file information if available
+	if fileInfo != nil {
+		event.FileSize = fileInfo.Size()
+		event.FileType = fm.getFileType(filePath)
+		event.FileHash = fm.calculateFileHash(filePath)
+		event.Permissions = fm.getFilePermissions(fileInfo)
+		event.UserID = fm.getCurrentUser()
+	}
+
+	// Send event
+	select {
+	case fm.eventChan <- event:
+		fm.logger.Debug("File event: %s - %s", event.Action, filePath)
+	default:
+		fm.logger.Warn("Event channel full, dropping file event")
+	}
+}
+
+// shouldExcludeFile checks if a file should be excluded from monitoring
+func (fm *FileMonitor) shouldExcludeFile(filePath string) bool {
+	// Check file extension
+	ext := strings.ToLower(filepath.Ext(filePath))
+	for _, excludeExt := range fm.config.ExcludeExtensions {
+		if strings.EqualFold(ext, excludeExt) {
+			return true
+		}
+	}
+
+	// Check file size
+	if fileInfo, err := os.Stat(filePath); err == nil {
+		maxSize := fm.parseFileSize(fm.config.MaxFileSize)
+		if maxSize > 0 && fileInfo.Size() > maxSize {
+			return true
+		}
+	}
+
+	// Skip temporary files
+	if strings.Contains(strings.ToLower(filePath), "temp") ||
+		strings.Contains(strings.ToLower(filePath), "tmp") {
+		return true
+	}
+
+	return false
+}
+
+// determineAction determines the file action from Windows notification
+func (fm *FileMonitor) determineAction(action uint32) string {
 	switch action {
-	case windows.FILE_ACTION_ADDED:
-		return "created"
-	case windows.FILE_ACTION_REMOVED:
-		return "deleted"
-	case windows.FILE_ACTION_MODIFIED:
-		return "modified"
-	case windows.FILE_ACTION_RENAMED_OLD_NAME:
-		return "renamed_old"
-	case windows.FILE_ACTION_RENAMED_NEW_NAME:
-		return "renamed_new"
+	case FILE_ACTION_ADDED:
+		return "create"
+	case FILE_ACTION_REMOVED:
+		return "delete"
+	case FILE_ACTION_MODIFIED:
+		return "modify"
+	case FILE_ACTION_RENAMED_OLD_NAME:
+		return "rename_old"
+	case FILE_ACTION_RENAMED_NEW_NAME:
+		return "rename_new"
 	default:
 		return "unknown"
 	}
 }
 
-func (fm *FileMonitor) shouldCalculateHash(event *FileEvent) bool {
-	// Only calculate hash for executable files
-	ext := strings.ToLower(filepath.Ext(event.FileName))
-	return ext == ".exe" || ext == ".dll" || ext == ".sys"
+// determineSeverity determines event severity based on action and file type
+func (fm *FileMonitor) determineSeverity(action uint32, filePath string) string {
+	// High severity for executable files
+	if fm.isExecutable(filePath) {
+		return "high"
+	}
+
+	// Medium severity for system files
+	if fm.isSystemFile(filePath) {
+		return "medium"
+	}
+
+	// Low severity for other files
+	return "low"
 }
 
+// isExecutable checks if a file is executable
+func (fm *FileMonitor) isExecutable(filePath string) bool {
+	ext := strings.ToLower(filepath.Ext(filePath))
+	executableExts := []string{".exe", ".dll", ".sys", ".scr", ".bat", ".cmd", ".com", ".pif"}
+
+	for _, execExt := range executableExts {
+		if ext == execExt {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isSystemFile checks if a file is a system file
+func (fm *FileMonitor) isSystemFile(filePath string) bool {
+	systemPaths := []string{
+		"\\Windows\\",
+		"\\Program Files\\",
+		"\\Program Files (x86)\\",
+	}
+
+	filePathLower := strings.ToLower(filePath)
+	for _, sysPath := range systemPaths {
+		if strings.Contains(filePathLower, strings.ToLower(sysPath)) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// getFileType determines the file type
+func (fm *FileMonitor) getFileType(filePath string) string {
+	ext := strings.ToLower(filepath.Ext(filePath))
+
+	switch ext {
+	case ".exe", ".dll", ".sys":
+		return "executable"
+	case ".txt", ".log", ".ini", ".cfg":
+		return "text"
+	case ".doc", ".docx", ".pdf":
+		return "document"
+	case ".jpg", ".jpeg", ".png", ".gif":
+		return "image"
+	case ".mp3", ".wav", ".avi", ".mp4":
+		return "media"
+	default:
+		return "unknown"
+	}
+}
+
+// calculateFileHash calculates SHA256 hash of file
 func (fm *FileMonitor) calculateFileHash(filePath string) string {
-	// TODO: Implement file hash calculation
+	// For performance, only calculate hash for small files or executables
+	if fm.isExecutable(filePath) {
+		// Implementation would calculate SHA256 hash
+		return "hash_placeholder"
+	}
 	return ""
 }
 
-func (fm *FileMonitor) scanFile(filePath string) {
-	if fm.scanner != nil {
-		result, err := fm.scanner.ScanFile(filePath)
-		if err != nil {
-			fm.logger.Error("YARA scan failed for %s: %v", filePath, err)
-			return
-		}
+// getFilePermissions gets file permissions as string
+func (fm *FileMonitor) getFilePermissions(fileInfo os.FileInfo) string {
+	// Implementation would extract Windows file permissions
+	return "rw-r--r--"
+}
 
-		if result.Matched {
-			fm.logger.Warn("YARA rule matched for %s: %s", filePath, result.RuleName)
-			// TODO: Create alert
+// getCurrentUser gets current user ID
+func (fm *FileMonitor) getCurrentUser() string {
+	// Implementation would get current user
+	return "current_user"
+}
+
+// parseFileSize parses file size string to bytes
+func (fm *FileMonitor) parseFileSize(sizeStr string) int64 {
+	// Implementation would parse size strings like "100MB", "1GB"
+	return 100 * 1024 * 1024 // Default 100MB
+}
+
+// generateEventID generates unique event ID
+func (fm *FileMonitor) generateEventID() string {
+	return fmt.Sprintf("file_%d", time.Now().UnixNano())
+}
+
+// processEvents processes events from all watchers
+func (fm *FileMonitor) processEvents() {
+	for {
+		select {
+		case <-fm.stopChan:
+			return
+		case event := <-fm.eventChan:
+			// Process event (e.g., send to scanner, log, etc.)
+			fm.logger.Debug("Processing file event: %s", event.FilePath)
 		}
 	}
 }

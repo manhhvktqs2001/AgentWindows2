@@ -1,44 +1,80 @@
 server:
-    url: http://192.168.20.85:5000
-    api_key: ""
-    auth_token: edr_system_auth_2025
-    timeout: 30
-    retry_count: 3
-    tls_verify: false
+  url: "http://192.168.20.85:5000"
+  api_key: ""  # Sẽ được điền sau khi đăng ký thành công
+  auth_token: "edr_system_auth_2025"  # Pre-shared token để đăng ký
+  websocket_enabled: true
+  timeout: 30
+  retry_count: 3
+  tls_verify: false
+
 agent:
-    id: ""
-    name: test-agent
-    heartbeat_interval: 60
-    event_batch_size: 100
-    max_queue_size: 10000
-monitor:
-    files:
-        enabled: false
-        paths: []
-        recursive: false
-        scan_on_write: false
-        max_file_size: 100MB
-        exclude_exts: []
-    processes:
-        enabled: false
-        scan_executable: false
-        monitor_cmdline: false
-        exclude_names: []
-    network:
-        enabled: false
-        monitor_tcp: false
-        monitor_udp: false
-        exclude_ports: []
-    registry:
-        enabled: false
-        keys: []
-scanner:
-    yara_enabled: false
-    yara_rules_path: ""
-    max_scan_threads: 1
-    scan_timeout: 30
-log:
-    level: info
-    format: text
-    file_path: agent.log
-    max_size: 10
+  id: ""  # Sẽ được điền sau khi đăng ký
+  name: "test-agent"
+  heartbeat_interval: 30
+  event_batch_size: 100
+  max_queue_size: 10000
+  max_memory_usage: "512MB"
+
+monitoring:
+  file_system:
+    enabled: true
+    paths: [
+      "C:\\Program Files\\",
+      "C:\\Windows\\System32\\",
+      "C:\\Users\\",
+      "C:\\Temp\\"
+    ]
+    exclude_extensions: [".tmp", ".log", ".bak"]
+    real_time_scan: true
+    recursive: true
+    max_file_size: "100MB"
+    
+  processes:
+    enabled: true
+    scan_executables: true
+    monitor_injections: true
+    track_network_connections: true
+    monitor_cmdline: true
+    exclude_names: ["explorer.exe", "dwm.exe", "winlogon.exe"]
+    
+  network:
+    enabled: true
+    monitor_dns: true
+    block_malicious_ips: true
+    capture_packets: false
+    monitor_tcp: true
+    monitor_udp: false
+    exclude_ports: [135, 445, 5985]
+    
+  registry:
+    enabled: true
+    monitor_autostart: true
+    track_security_settings: true
+    keys: [
+      "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+      "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+      "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"
+    ]
+
+yara:
+  enabled: true
+  auto_update: true
+  update_interval: "24h"
+  rules_source: "https://github.com/Yara-Rules/rules"
+  categories: ["malware", "apt", "webshells"]
+  max_scan_threads: 4
+  scan_timeout: 30
+  rules_path: "yara-rules"
+
+response:
+  auto_quarantine: true
+  auto_remediation: false
+  network_isolation: false
+  
+logging:
+  level: "info"
+  format: "text"
+  file_path: "logs/agent.log"
+  max_size: "100MB"
+  compress: true
+  max_size_mb: 100

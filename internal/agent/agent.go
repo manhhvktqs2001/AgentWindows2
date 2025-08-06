@@ -56,13 +56,13 @@ func NewAgent(cfg *config.Config, logger *utils.Logger) (*Agent, error) {
 	serverClient := communication.NewServerClient(cfg.Server, logger)
 
 	// Initialize YARA scanner
-	yaraScanner := scanner.NewYaraScanner(cfg.Scanner, logger)
+	yaraScanner := scanner.NewYaraScanner(&cfg.Yara, logger)
 
 	// Initialize monitors
-	fileMonitor := monitoring.NewFileMonitor(cfg.Monitor.Files, logger, yaraScanner)
-	processMonitor := monitoring.NewProcessMonitor(cfg.Monitor.Processes, logger, yaraScanner)
-	networkMonitor := monitoring.NewNetworkMonitor(cfg.Monitor.Network, logger)
-	registryMonitor := monitoring.NewRegistryMonitor(cfg.Monitor.Registry, logger)
+	fileMonitor := monitoring.NewFileMonitor(&cfg.Monitoring.FileSystem, logger)
+	processMonitor := monitoring.NewProcessMonitor(&cfg.Monitoring.Processes, logger)
+	networkMonitor := monitoring.NewNetworkMonitor(&cfg.Monitoring.Network, logger)
+	registryMonitor := monitoring.NewRegistryMonitor(&cfg.Monitoring.Registry, logger)
 
 	agent := &Agent{
 		config:          cfg,
@@ -179,32 +179,56 @@ func (a *Agent) Start() error {
 	}
 
 	// Start monitors
-	if a.config.Monitor.Files.Enabled {
+	if a.config.Monitoring.FileSystem.Enabled {
 		err = a.fileMonitor.Start()
 		if err != nil {
 			a.logger.Error("Failed to start file monitor: %v", err)
 		}
+		// Forward file events to agent eventChan
+		go func() {
+			for event := range a.fileMonitor.GetEventChannel() {
+				a.RegisterEvent(&event)
+			}
+		}()
 	}
 
-	if a.config.Monitor.Processes.Enabled {
+	if a.config.Monitoring.Processes.Enabled {
 		err = a.processMonitor.Start()
 		if err != nil {
 			a.logger.Error("Failed to start process monitor: %v", err)
 		}
+		// Forward process events to agent eventChan
+		go func() {
+			for event := range a.processMonitor.GetEventChannel() {
+				a.RegisterEvent(&event)
+			}
+		}()
 	}
 
-	if a.config.Monitor.Network.Enabled {
+	if a.config.Monitoring.Network.Enabled {
 		err = a.networkMonitor.Start()
 		if err != nil {
 			a.logger.Error("Failed to start network monitor: %v", err)
 		}
+		// Forward network events to agent eventChan
+		go func() {
+			for event := range a.networkMonitor.GetEventChannel() {
+				a.RegisterEvent(&event)
+			}
+		}()
 	}
 
-	if a.config.Monitor.Registry.Enabled {
+	if a.config.Monitoring.Registry.Enabled {
 		err = a.registryMonitor.Start()
 		if err != nil {
 			a.logger.Error("Failed to start registry monitor: %v", err)
 		}
+		// Forward registry events to agent eventChan
+		go func() {
+			for event := range a.registryMonitor.GetEventChannel() {
+				a.RegisterEvent(&event)
+			}
+		}()
 	}
 
 	// Start background workers

@@ -11,20 +11,22 @@ import (
 )
 
 type Config struct {
-	Server  ServerConfig  `yaml:"server"`
-	Agent   AgentDetails  `yaml:"agent"`
-	Monitor MonitorConfig `yaml:"monitor"`
-	Scanner ScannerConfig `yaml:"scanner"`
-	Log     LogConfig     `yaml:"log"`
+	Server     ServerConfig     `yaml:"server"`
+	Agent      AgentDetails     `yaml:"agent"`
+	Monitoring MonitoringConfig `yaml:"monitoring"`
+	Yara       YaraConfig       `yaml:"yara"`
+	Response   ResponseConfig   `yaml:"response"`
+	Log        LogConfig        `yaml:"logging"`
 }
 
 type ServerConfig struct {
-	URL        string `yaml:"url"`         // "http://192.168.20.85:5000"
-	APIKey     string `yaml:"api_key"`     // Agent authentication
-	AuthToken  string `yaml:"auth_token"`  // Pre-shared registration token
-	Timeout    int    `yaml:"timeout"`     // HTTP timeout seconds
-	RetryCount int    `yaml:"retry_count"` // Retry failed requests
-	TLSVerify  bool   `yaml:"tls_verify"`  // Verify TLS certificates
+	URL              string `yaml:"url"`               // "http://192.168.20.85:5000"
+	APIKey           string `yaml:"api_key"`           // Agent authentication
+	AuthToken        string `yaml:"auth_token"`        // Pre-shared registration token
+	WebSocketEnabled bool   `yaml:"websocket_enabled"` // Enable WebSocket connection
+	Timeout          int    `yaml:"timeout"`           // HTTP timeout seconds
+	RetryCount       int    `yaml:"retry_count"`       // Retry failed requests
+	TLSVerify        bool   `yaml:"tls_verify"`        // Verify TLS certificates
 }
 
 type AgentDetails struct {
@@ -33,55 +35,75 @@ type AgentDetails struct {
 	HeartbeatInterval int    `yaml:"heartbeat_interval"` // Heartbeat seconds
 	EventBatchSize    int    `yaml:"event_batch_size"`   // Events per batch
 	MaxQueueSize      int    `yaml:"max_queue_size"`     // Max event queue
+	MaxMemoryUsage    string `yaml:"max_memory_usage"`   // Max memory usage
 }
 
-type MonitorConfig struct {
-	Files     FileMonitorConfig     `yaml:"files"`
-	Processes ProcessMonitorConfig  `yaml:"processes"`
-	Network   NetworkMonitorConfig  `yaml:"network"`
-	Registry  RegistryMonitorConfig `yaml:"registry"` // Windows only
+type MonitoringConfig struct {
+	FileSystem FileSystemConfig `yaml:"file_system"`
+	Processes  ProcessConfig    `yaml:"processes"`
+	Network    NetworkConfig    `yaml:"network"`
+	Registry   RegistryConfig   `yaml:"registry"`
 }
 
-type FileMonitorConfig struct {
-	Enabled     bool     `yaml:"enabled"`
-	Paths       []string `yaml:"paths"`         // Paths to monitor
-	Recursive   bool     `yaml:"recursive"`     // Monitor subdirectories
-	ScanOnWrite bool     `yaml:"scan_on_write"` // YARA scan on file write
-	MaxFileSize string   `yaml:"max_file_size"` // Max file size to scan
-	ExcludeExts []string `yaml:"exclude_exts"`  // Exclude extensions
+type FileSystemConfig struct {
+	Enabled           bool     `yaml:"enabled"`
+	Paths             []string `yaml:"paths"`              // Paths to monitor
+	ExcludeExtensions []string `yaml:"exclude_extensions"` // Exclude extensions
+	RealTimeScan      bool     `yaml:"real_time_scan"`     // Real-time scanning
+	Recursive         bool     `yaml:"recursive"`          // Monitor subdirectories
+	MaxFileSize       string   `yaml:"max_file_size"`      // Max file size to scan
 }
 
-type ProcessMonitorConfig struct {
+type ProcessConfig struct {
+	Enabled                 bool     `yaml:"enabled"`
+	ScanExecutables         bool     `yaml:"scan_executables"`          // YARA scan new processes
+	MonitorInjections       bool     `yaml:"monitor_injections"`        // Monitor code injections
+	TrackNetworkConnections bool     `yaml:"track_network_connections"` // Track network connections
+	MonitorCmdLine          bool     `yaml:"monitor_cmdline"`           // Monitor command lines
+	ExcludeNames            []string `yaml:"exclude_names"`             // Exclude process names
+}
+
+type NetworkConfig struct {
+	Enabled           bool  `yaml:"enabled"`
+	MonitorDNS        bool  `yaml:"monitor_dns"`         // Monitor DNS queries
+	BlockMaliciousIPs bool  `yaml:"block_malicious_ips"` // Block malicious IPs
+	CapturePackets    bool  `yaml:"capture_packets"`     // Capture network packets
+	MonitorTCP        bool  `yaml:"monitor_tcp"`         // Monitor TCP connections
+	MonitorUDP        bool  `yaml:"monitor_udp"`         // Monitor UDP connections
+	ExcludePorts      []int `yaml:"exclude_ports"`       // Exclude local ports
+}
+
+type RegistryConfig struct {
+	Enabled               bool     `yaml:"enabled"`                 // Windows only
+	MonitorAutostart      bool     `yaml:"monitor_autostart"`       // Monitor autostart entries
+	TrackSecuritySettings bool     `yaml:"track_security_settings"` // Track security settings
+	Keys                  []string `yaml:"keys"`                    // Registry keys to monitor
+}
+
+type YaraConfig struct {
 	Enabled        bool     `yaml:"enabled"`
-	ScanExecutable bool     `yaml:"scan_executable"` // YARA scan new processes
-	MonitorCmdLine bool     `yaml:"monitor_cmdline"` // Monitor command lines
-	ExcludeNames   []string `yaml:"exclude_names"`   // Exclude process names
+	AutoUpdate     bool     `yaml:"auto_update"`
+	UpdateInterval string   `yaml:"update_interval"`
+	RulesSource    string   `yaml:"rules_source"`
+	Categories     []string `yaml:"categories"`
+	MaxScanThreads int      `yaml:"max_scan_threads"`
+	ScanTimeout    int      `yaml:"scan_timeout"`
+	RulesPath      string   `yaml:"rules_path"`
 }
 
-type NetworkMonitorConfig struct {
-	Enabled      bool  `yaml:"enabled"`
-	MonitorTCP   bool  `yaml:"monitor_tcp"`
-	MonitorUDP   bool  `yaml:"monitor_udp"`
-	ExcludePorts []int `yaml:"exclude_ports"` // Exclude local ports
-}
-
-type RegistryMonitorConfig struct {
-	Enabled bool     `yaml:"enabled"` // Windows only
-	Keys    []string `yaml:"keys"`    // Registry keys to monitor
-}
-
-type ScannerConfig struct {
-	YaraEnabled    bool   `yaml:"yara_enabled"`
-	YaraRulesPath  string `yaml:"yara_rules_path"`  // Local YARA rules cache
-	MaxScanThreads int    `yaml:"max_scan_threads"` // Max concurrent scans
-	ScanTimeout    int    `yaml:"scan_timeout"`     // Scan timeout seconds
+type ResponseConfig struct {
+	AutoQuarantine   bool `yaml:"auto_quarantine"`
+	AutoRemediation  bool `yaml:"auto_remediation"`
+	NetworkIsolation bool `yaml:"network_isolation"`
 }
 
 type LogConfig struct {
-	Level    string `yaml:"level"`     // debug, info, warn, error
-	Format   string `yaml:"format"`    // json, text
-	FilePath string `yaml:"file_path"` // Log file path
-	MaxSize  int    `yaml:"max_size"`  // Max log file size MB
+	Level     string `yaml:"level"`       // debug, info, warn, error
+	Format    string `yaml:"format"`      // json, text
+	FilePath  string `yaml:"file_path"`   // Log file path
+	MaxSize   string `yaml:"max_size"`    // Max log file size
+	Compress  bool   `yaml:"compress"`    // Compress log files
+	MaxSizeMB int    `yaml:"max_size_mb"` // Max size in MB
 }
 
 // Load configuration from file
@@ -141,43 +163,59 @@ func Load(configPath string) (*Config, error) {
 			EventBatchSize:    viper.GetInt("agent.event_batch_size"),
 			MaxQueueSize:      viper.GetInt("agent.max_queue_size"),
 		},
-		Monitor: MonitorConfig{
-			Files: FileMonitorConfig{
-				Enabled:     viper.GetBool("monitor.files.enabled"),
-				Paths:       viper.GetStringSlice("monitor.files.paths"),
-				Recursive:   viper.GetBool("monitor.files.recursive"),
-				ScanOnWrite: viper.GetBool("monitor.files.scan_on_write"),
-				MaxFileSize: viper.GetString("monitor.files.max_file_size"),
-				ExcludeExts: viper.GetStringSlice("monitor.files.exclude_exts"),
+		Monitoring: MonitoringConfig{
+			FileSystem: FileSystemConfig{
+				Enabled:           viper.GetBool("monitoring.file_system.enabled"),
+				Paths:             viper.GetStringSlice("monitoring.file_system.paths"),
+				ExcludeExtensions: viper.GetStringSlice("monitoring.file_system.exclude_extensions"),
+				RealTimeScan:      viper.GetBool("monitoring.file_system.real_time_scan"),
+				Recursive:         viper.GetBool("monitoring.file_system.recursive"),
+				MaxFileSize:       viper.GetString("monitoring.file_system.max_file_size"),
 			},
-			Processes: ProcessMonitorConfig{
-				Enabled:        viper.GetBool("monitor.processes.enabled"),
-				ScanExecutable: viper.GetBool("monitor.processes.scan_executable"),
-				MonitorCmdLine: viper.GetBool("monitor.processes.monitor_cmdline"),
-				ExcludeNames:   viper.GetStringSlice("monitor.processes.exclude_names"),
+			Processes: ProcessConfig{
+				Enabled:                 viper.GetBool("monitoring.processes.enabled"),
+				ScanExecutables:         viper.GetBool("monitoring.processes.scan_executables"),
+				MonitorInjections:       viper.GetBool("monitoring.processes.monitor_injections"),
+				TrackNetworkConnections: viper.GetBool("monitoring.processes.track_network_connections"),
+				MonitorCmdLine:          viper.GetBool("monitoring.processes.monitor_cmdline"),
+				ExcludeNames:            viper.GetStringSlice("monitoring.processes.exclude_names"),
 			},
-			Network: NetworkMonitorConfig{
-				Enabled:      viper.GetBool("monitor.network.enabled"),
-				MonitorTCP:   viper.GetBool("monitor.network.monitor_tcp"),
-				MonitorUDP:   viper.GetBool("monitor.network.monitor_udp"),
-				ExcludePorts: viper.GetIntSlice("monitor.network.exclude_ports"),
+			Network: NetworkConfig{
+				Enabled:           viper.GetBool("monitoring.network.enabled"),
+				MonitorDNS:        viper.GetBool("monitoring.network.monitor_dns"),
+				BlockMaliciousIPs: viper.GetBool("monitoring.network.block_malicious_ips"),
+				CapturePackets:    viper.GetBool("monitoring.network.capture_packets"),
+				MonitorTCP:        viper.GetBool("monitoring.network.monitor_tcp"),
+				MonitorUDP:        viper.GetBool("monitoring.network.monitor_udp"),
+				ExcludePorts:      viper.GetIntSlice("monitoring.network.exclude_ports"),
 			},
-			Registry: RegistryMonitorConfig{
-				Enabled: viper.GetBool("monitor.registry.enabled"),
-				Keys:    viper.GetStringSlice("monitor.registry.keys"),
+			Registry: RegistryConfig{
+				Enabled:               viper.GetBool("monitoring.registry.enabled"),
+				MonitorAutostart:      viper.GetBool("monitoring.registry.monitor_autostart"),
+				TrackSecuritySettings: viper.GetBool("monitoring.registry.track_security_settings"),
+				Keys:                  viper.GetStringSlice("monitoring.registry.keys"),
 			},
 		},
-		Scanner: ScannerConfig{
-			YaraEnabled:    viper.GetBool("scanner.yara_enabled"),
-			YaraRulesPath:  viper.GetString("scanner.yara_rules_path"),
-			MaxScanThreads: viper.GetInt("scanner.max_scan_threads"),
-			ScanTimeout:    viper.GetInt("scanner.scan_timeout"),
+		Yara: YaraConfig{
+			Enabled:        viper.GetBool("yara.enabled"),
+			AutoUpdate:     viper.GetBool("yara.auto_update"),
+			UpdateInterval: viper.GetString("yara.update_interval"),
+			RulesSource:    viper.GetString("yara.rules_source"),
+			Categories:     viper.GetStringSlice("yara.categories"),
+			MaxScanThreads: viper.GetInt("yara.max_scan_threads"),
+			ScanTimeout:    viper.GetInt("yara.scan_timeout"),
+			RulesPath:      viper.GetString("yara.rules_path"),
+		},
+		Response: ResponseConfig{
+			AutoQuarantine:   viper.GetBool("response.auto_quarantine"),
+			AutoRemediation:  viper.GetBool("response.auto_remediation"),
+			NetworkIsolation: viper.GetBool("response.network_isolation"),
 		},
 		Log: LogConfig{
-			Level:    viper.GetString("log.level"),
-			Format:   viper.GetString("log.format"),
-			FilePath: viper.GetString("log.file_path"),
-			MaxSize:  viper.GetInt("log.max_size"),
+			Level:    viper.GetString("logging.level"),
+			Format:   viper.GetString("logging.format"),
+			FilePath: viper.GetString("logging.file_path"),
+			MaxSize:  viper.GetString("logging.max_size"),
 		},
 	}
 
@@ -217,40 +255,57 @@ func setDefaults() {
 	viper.SetDefault("agent.event_batch_size", 100)
 	viper.SetDefault("agent.max_queue_size", 10000)
 
-	// Monitor defaults
-	viper.SetDefault("monitor.files.enabled", true)
-	viper.SetDefault("monitor.files.recursive", true)
-	viper.SetDefault("monitor.files.scan_on_write", true)
-	viper.SetDefault("monitor.files.max_file_size", "100MB")
-	viper.SetDefault("monitor.files.exclude_exts", []string{".tmp", ".log", ".bak"})
+	// Monitoring defaults
+	viper.SetDefault("monitoring.file_system.enabled", true)
+	viper.SetDefault("monitoring.file_system.recursive", true)
+	viper.SetDefault("monitoring.file_system.real_time_scan", true)
+	viper.SetDefault("monitoring.file_system.max_file_size", "100MB")
+	viper.SetDefault("monitoring.file_system.exclude_extensions", []string{".tmp", ".log", ".bak"})
 
-	viper.SetDefault("monitor.processes.enabled", true)
-	viper.SetDefault("monitor.processes.scan_executable", true)
-	viper.SetDefault("monitor.processes.monitor_cmdline", true)
-	viper.SetDefault("monitor.processes.exclude_names", []string{"explorer.exe", "dwm.exe", "winlogon.exe"})
+	viper.SetDefault("monitoring.processes.enabled", true)
+	viper.SetDefault("monitoring.processes.scan_executables", true)
+	viper.SetDefault("monitoring.processes.monitor_injections", true)
+	viper.SetDefault("monitoring.processes.track_network_connections", true)
+	viper.SetDefault("monitoring.processes.monitor_cmdline", true)
+	viper.SetDefault("monitoring.processes.exclude_names", []string{"explorer.exe", "dwm.exe", "winlogon.exe"})
 
-	viper.SetDefault("monitor.network.enabled", true)
-	viper.SetDefault("monitor.network.monitor_tcp", true)
-	viper.SetDefault("monitor.network.monitor_udp", false)
-	viper.SetDefault("monitor.network.exclude_ports", []int{135, 445, 5985})
+	viper.SetDefault("monitoring.network.enabled", true)
+	viper.SetDefault("monitoring.network.monitor_dns", true)
+	viper.SetDefault("monitoring.network.block_malicious_ips", false)
+	viper.SetDefault("monitoring.network.capture_packets", false)
+	viper.SetDefault("monitoring.network.monitor_tcp", true)
+	viper.SetDefault("monitoring.network.monitor_udp", false)
+	viper.SetDefault("monitoring.network.exclude_ports", []int{135, 445, 5985})
 
-	viper.SetDefault("monitor.registry.enabled", true)
-	viper.SetDefault("monitor.registry.keys", []string{
+	viper.SetDefault("monitoring.registry.enabled", true)
+	viper.SetDefault("monitoring.registry.monitor_autostart", true)
+	viper.SetDefault("monitoring.registry.track_security_settings", true)
+	viper.SetDefault("monitoring.registry.keys", []string{
 		"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
 		"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
 		"HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
 	})
 
-	// Scanner defaults
-	viper.SetDefault("scanner.yara_enabled", true)
-	viper.SetDefault("scanner.max_scan_threads", 4)
-	viper.SetDefault("scanner.scan_timeout", 30)
+	// Yara defaults
+	viper.SetDefault("yara.enabled", true)
+	viper.SetDefault("yara.auto_update", true)
+	viper.SetDefault("yara.update_interval", "24h")
+	viper.SetDefault("yara.rules_source", "local")
+	viper.SetDefault("yara.categories", []string{"malware", "backdoor", "trojan", "ransomware"})
+	viper.SetDefault("yara.max_scan_threads", 4)
+	viper.SetDefault("yara.scan_timeout", 30)
+	viper.SetDefault("yara.rules_path", "yara-rules")
+
+	// Response defaults
+	viper.SetDefault("response.auto_quarantine", false)
+	viper.SetDefault("response.auto_remediation", false)
+	viper.SetDefault("response.network_isolation", false)
 
 	// Log defaults
-	viper.SetDefault("log.level", "info")
-	viper.SetDefault("log.format", "json")
-	viper.SetDefault("log.file_path", "C:\\Program Files\\EDR-Agent\\logs\\agent.log")
-	viper.SetDefault("log.max_size", 100)
+	viper.SetDefault("logging.level", "info")
+	viper.SetDefault("logging.format", "json")
+	viper.SetDefault("logging.file_path", "C:\\Program Files\\EDR-Agent\\logs\\agent.log")
+	viper.SetDefault("logging.max_size", "100MB")
 }
 
 // Validate configuration
@@ -308,29 +363,36 @@ func CreateDefaultConfig(filePath string) error {
 			EventBatchSize:    100,
 			MaxQueueSize:      10000,
 		},
-		Monitor: MonitorConfig{
-			Files: FileMonitorConfig{
-				Enabled:     true,
-				Paths:       []string{"C:\\Program Files", "C:\\Program Files (x86)", "C:\\Windows\\System32", "C:\\Users"},
-				Recursive:   true,
-				ScanOnWrite: true,
-				MaxFileSize: "100MB",
-				ExcludeExts: []string{".tmp", ".log", ".bak"},
+		Monitoring: MonitoringConfig{
+			FileSystem: FileSystemConfig{
+				Enabled:           true,
+				Paths:             []string{"C:\\Program Files", "C:\\Program Files (x86)", "C:\\Windows\\System32", "C:\\Users"},
+				Recursive:         true,
+				RealTimeScan:      true,
+				MaxFileSize:       "100MB",
+				ExcludeExtensions: []string{".tmp", ".log", ".bak"},
 			},
-			Processes: ProcessMonitorConfig{
-				Enabled:        true,
-				ScanExecutable: true,
-				MonitorCmdLine: true,
-				ExcludeNames:   []string{"explorer.exe", "dwm.exe", "winlogon.exe"},
+			Processes: ProcessConfig{
+				Enabled:                 true,
+				ScanExecutables:         true,
+				MonitorInjections:       true,
+				TrackNetworkConnections: true,
+				MonitorCmdLine:          true,
+				ExcludeNames:            []string{"explorer.exe", "dwm.exe", "winlogon.exe"},
 			},
-			Network: NetworkMonitorConfig{
-				Enabled:      true,
-				MonitorTCP:   true,
-				MonitorUDP:   false,
-				ExcludePorts: []int{135, 445, 5985},
+			Network: NetworkConfig{
+				Enabled:           true,
+				MonitorDNS:        true,
+				BlockMaliciousIPs: false,
+				CapturePackets:    false,
+				MonitorTCP:        true,
+				MonitorUDP:        false,
+				ExcludePorts:      []int{135, 445, 5985},
 			},
-			Registry: RegistryMonitorConfig{
-				Enabled: true,
+			Registry: RegistryConfig{
+				Enabled:               true,
+				MonitorAutostart:      true,
+				TrackSecuritySettings: true,
 				Keys: []string{
 					"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
 					"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
@@ -338,17 +400,26 @@ func CreateDefaultConfig(filePath string) error {
 				},
 			},
 		},
-		Scanner: ScannerConfig{
-			YaraEnabled:    true,
-			YaraRulesPath:  "yara-rules",
+		Yara: YaraConfig{
+			Enabled:        true,
+			AutoUpdate:     true,
+			UpdateInterval: "24h",
+			RulesSource:    "local",
+			Categories:     []string{"malware", "backdoor", "trojan", "ransomware"},
 			MaxScanThreads: 4,
 			ScanTimeout:    30,
+			RulesPath:      "yara-rules",
+		},
+		Response: ResponseConfig{
+			AutoQuarantine:   false,
+			AutoRemediation:  false,
+			NetworkIsolation: false,
 		},
 		Log: LogConfig{
 			Level:    "info",
 			Format:   "json",
 			FilePath: "C:\\Program Files\\EDR-Agent\\logs\\agent.log",
-			MaxSize:  100,
+			MaxSize:  "100MB",
 		},
 	}
 
@@ -398,43 +469,59 @@ func createDefaultConfig() *Config {
 			EventBatchSize:    100,
 			MaxQueueSize:      10000,
 		},
-		Monitor: MonitorConfig{
-			Files: FileMonitorConfig{
-				Enabled:     false,
-				Paths:       []string{},
-				Recursive:   false,
-				ScanOnWrite: false,
-				MaxFileSize: "100MB",
-				ExcludeExts: []string{},
+		Monitoring: MonitoringConfig{
+			FileSystem: FileSystemConfig{
+				Enabled:           false,
+				Paths:             []string{},
+				Recursive:         false,
+				RealTimeScan:      false,
+				MaxFileSize:       "100MB",
+				ExcludeExtensions: []string{},
 			},
-			Processes: ProcessMonitorConfig{
-				Enabled:        false,
-				ScanExecutable: false,
-				MonitorCmdLine: false,
-				ExcludeNames:   []string{},
+			Processes: ProcessConfig{
+				Enabled:                 false,
+				ScanExecutables:         false,
+				MonitorInjections:       false,
+				TrackNetworkConnections: false,
+				MonitorCmdLine:          false,
+				ExcludeNames:            []string{},
 			},
-			Network: NetworkMonitorConfig{
-				Enabled:      false,
-				MonitorTCP:   false,
-				MonitorUDP:   false,
-				ExcludePorts: []int{},
+			Network: NetworkConfig{
+				Enabled:           false,
+				MonitorDNS:        false,
+				BlockMaliciousIPs: false,
+				CapturePackets:    false,
+				MonitorTCP:        false,
+				MonitorUDP:        false,
+				ExcludePorts:      []int{},
 			},
-			Registry: RegistryMonitorConfig{
-				Enabled: false,
-				Keys:    []string{},
+			Registry: RegistryConfig{
+				Enabled:               false,
+				MonitorAutostart:      false,
+				TrackSecuritySettings: false,
+				Keys:                  []string{},
 			},
 		},
-		Scanner: ScannerConfig{
-			YaraEnabled:    false,
-			YaraRulesPath:  "",
+		Yara: YaraConfig{
+			Enabled:        false,
+			AutoUpdate:     false,
+			UpdateInterval: "1h",
+			RulesSource:    "local",
+			Categories:     []string{},
 			MaxScanThreads: 1,
 			ScanTimeout:    30,
+			RulesPath:      "",
+		},
+		Response: ResponseConfig{
+			AutoQuarantine:   false,
+			AutoRemediation:  false,
+			NetworkIsolation: false,
 		},
 		Log: LogConfig{
 			Level:    "info",
 			Format:   "text",
 			FilePath: "agent.log",
-			MaxSize:  10,
+			MaxSize:  "10MB",
 		},
 	}
 }
