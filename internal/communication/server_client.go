@@ -162,3 +162,51 @@ func (sc *ServerClient) post(url string, data []byte) (*http.Response, error) {
 func (sc *ServerClient) GetAPIKey() string {
 	return sc.config.APIKey
 }
+
+// UpdateAPIKey updates the API key in the server client
+func (sc *ServerClient) UpdateAPIKey(newAPIKey string) {
+	sc.config.APIKey = newAPIKey
+	sc.logger.Info("Updated API key in server client: %s", newAPIKey)
+}
+
+// CheckAgentExistsByMAC checks if an agent exists by MAC address
+func (sc *ServerClient) CheckAgentExistsByMAC(macAddress string) (bool, string, string, error) {
+	url := fmt.Sprintf("%s/api/v1/agents/check-by-mac?mac=%s", sc.config.URL, macAddress)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return false, "", "", err
+	}
+
+	// Don't require API key for checking agent existence
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := sc.httpClient.Do(req)
+	if err != nil {
+		return false, "", "", err
+	}
+	defer resp.Body.Close()
+
+	// Parse response
+	var result struct {
+		Exists  bool   `json:"exists"`
+		AgentID string `json:"agent_id,omitempty"`
+		APIKey  string `json:"api_key,omitempty"`
+	}
+
+	if resp.StatusCode == http.StatusOK {
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return false, "", "", err
+		}
+		sc.logger.Info("MAC check response - Exists: %v, AgentID: %s, APIKey: %s", result.Exists, result.AgentID, result.APIKey)
+		return result.Exists, result.AgentID, result.APIKey, nil
+	}
+
+	// If status is 404, agent doesn't exist
+	if resp.StatusCode == http.StatusNotFound {
+		return false, "", "", nil
+	}
+
+	// Other status codes indicate an error
+	return false, "", "", fmt.Errorf("server returned status: %d", resp.StatusCode)
+}

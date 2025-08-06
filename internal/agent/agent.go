@@ -173,6 +173,61 @@ func (a *Agent) RegisterEvent(event Event) {
 
 // Register with server
 func (a *Agent) registerWithServer() error {
+	// Get MAC address first
+	macAddress, err := a.getMACAddress()
+	if err != nil {
+		a.logger.Warn("Failed to get MAC address: %v", err)
+		macAddress = ""
+	}
+
+	// Check if agent already exists by MAC address
+	if macAddress != "" {
+		a.logger.Info("Checking if agent exists by MAC: %s", macAddress)
+
+		exists, existingAgentID, existingAPIKey, err := a.serverClient.CheckAgentExistsByMAC(macAddress)
+		if err != nil {
+			a.logger.Warn("Failed to check agent existence by MAC: %v", err)
+		} else if exists {
+			a.logger.Info("Agent already exists with MAC %s, Agent ID: %s", macAddress, existingAgentID)
+			a.logger.Info("Received API key from server: %s", existingAPIKey)
+
+			// Update local config with existing agent ID and API key
+			a.config.Agent.ID = existingAgentID
+			if existingAPIKey != "" {
+				oldAPIKey := a.config.Server.APIKey
+				a.config.Server.APIKey = existingAPIKey
+				a.logger.Info("Updated API key from existing agent: %s -> %s", oldAPIKey, existingAPIKey)
+
+				// Update server client with new API key
+				a.serverClient.UpdateAPIKey(existingAPIKey)
+				a.logger.Info("Updated server client with new API key")
+
+				// Save updated config to file
+				err := config.Save(a.config, "config.yaml")
+				if err != nil {
+					a.logger.Warn("Failed to save updated config: %v", err)
+				} else {
+					a.logger.Info("Saved updated config with new API key")
+				}
+			} else {
+				a.logger.Warn("No API key received from server")
+			}
+
+			// Try to send a heartbeat to verify the registration is still valid
+			err := a.sendHeartbeat()
+			if err == nil {
+				a.logger.Info("Existing registration is valid, skipping registration")
+				return nil
+			} else {
+				a.logger.Warn("Heartbeat failed, but agent exists on server: %v", err)
+				a.logger.Info("Continuing with existing registration")
+				return nil
+			}
+		} else {
+			a.logger.Info("No existing agent found with MAC %s, proceeding with registration", macAddress)
+		}
+	}
+
 	hostname, err := os.Hostname()
 	if err != nil {
 		return fmt.Errorf("failed to get hostname: %w", err)
@@ -181,12 +236,6 @@ func (a *Agent) registerWithServer() error {
 	ip, err := a.getIPAddress()
 	if err != nil {
 		return fmt.Errorf("failed to get IP address: %w", err)
-	}
-
-	macAddress, err := a.getMACAddress()
-	if err != nil {
-		a.logger.Warn("Failed to get MAC address: %v", err)
-		macAddress = ""
 	}
 
 	osVersion, err := a.getOSVersion()
@@ -222,9 +271,25 @@ func (a *Agent) registerWithServer() error {
 	}
 
 	a.logger.Info("Registered with server, Agent ID: %s", agentID)
-	a.logger.Info("System Info - Hostname: %s, IP: %s, OS: %s %s", hostname, ip, runtime.GOOS, osVersion)
+	a.logger.Info("System Info - Hostname: %s, IP: %s, MAC: %s, OS: %s %s", hostname, ip, macAddress, runtime.GOOS, osVersion)
+
+	// Save agent ID to config file
+	err = a.saveAgentID(agentID)
+	if err != nil {
+		a.logger.Warn("Failed to save agent ID to config: %v", err)
+	}
 
 	return nil
+}
+
+// saveAgentID saves the agent ID and API key to the config file
+func (a *Agent) saveAgentID(agentID string) error {
+	// Update the config with the new agent ID and API key
+	a.config.Agent.ID = agentID
+	a.config.Server.APIKey = a.serverClient.GetAPIKey()
+
+	// Save to config file
+	return config.Save(a.config, "config.yaml")
 }
 
 // Send heartbeat
@@ -380,6 +445,36 @@ func (a *Agent) getMACAddress() (string, error) {
 		return "", fmt.Errorf("failed to get network interfaces: %w", err)
 	}
 
+	// Look for the primary network interface (usually the first non-loopback interface with IPv4)
+	for _, iface := range interfaces {
+		// Skip loopback and down interfaces
+		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+
+		// Check if interface has IPv4 address
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		hasIPv4 := false
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok {
+				if ip := ipnet.IP.To4(); ip != nil {
+					hasIPv4 = true
+					break
+				}
+			}
+		}
+
+		// If interface has IPv4 and MAC address, use it
+		if hasIPv4 && iface.HardwareAddr != nil {
+			return iface.HardwareAddr.String(), nil
+		}
+	}
+
+	// Fallback: get any MAC address
 	for _, iface := range interfaces {
 		if iface.Flags&net.FlagUp != 0 && iface.HardwareAddr != nil {
 			return iface.HardwareAddr.String(), nil
