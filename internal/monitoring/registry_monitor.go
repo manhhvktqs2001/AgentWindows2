@@ -11,6 +11,7 @@ type RegistryMonitor struct {
 	logger    *utils.Logger
 	eventChan chan models.RegistryEvent
 	stopChan  chan bool
+	agentID   string // Add agent ID field
 }
 
 func NewRegistryMonitor(cfg *config.RegistryConfig, logger *utils.Logger) *RegistryMonitor {
@@ -19,15 +20,16 @@ func NewRegistryMonitor(cfg *config.RegistryConfig, logger *utils.Logger) *Regis
 		logger:    logger,
 		eventChan: make(chan models.RegistryEvent, 1000),
 		stopChan:  make(chan bool),
+		agentID:   "", // Will be set later
 	}
 }
 
 func (rm *RegistryMonitor) Start() error {
 	rm.logger.Info("Starting registry monitor...")
-	
+
 	// TODO: Implement registry monitoring
 	// This would use Windows registry APIs to monitor changes
-	
+
 	rm.logger.Info("Registry monitor started successfully")
 	return nil
 }
@@ -41,4 +43,9 @@ func (rm *RegistryMonitor) Stop() {
 
 func (rm *RegistryMonitor) GetEventChannel() <-chan models.RegistryEvent {
 	return rm.eventChan
-} 
+}
+
+// SetAgentID sets the agent ID for events
+func (rm *RegistryMonitor) SetAgentID(agentID string) {
+	rm.agentID = agentID
+}

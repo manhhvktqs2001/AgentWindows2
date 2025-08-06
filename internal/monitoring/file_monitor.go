@@ -22,6 +22,7 @@ type FileMonitor struct {
 	stopChan  chan bool
 	handles   []windows.Handle
 	watchers  map[string]*DirectoryWatcher
+	agentID   string // Add agent ID field
 }
 
 type DirectoryWatcher struct {
@@ -61,6 +62,7 @@ func NewFileMonitor(cfg *config.FileSystemConfig, logger *utils.Logger) *FileMon
 		eventChan: make(chan models.FileEvent, 1000),
 		stopChan:  make(chan bool),
 		watchers:  make(map[string]*DirectoryWatcher),
+		agentID:   "", // Will be set later
 	}
 }
 
@@ -109,6 +111,11 @@ func (fm *FileMonitor) Stop() {
 // GetEventChannel returns the channel for file events
 func (fm *FileMonitor) GetEventChannel() <-chan models.FileEvent {
 	return fm.eventChan
+}
+
+// SetAgentID sets the agent ID for events
+func (fm *FileMonitor) SetAgentID(agentID string) {
+	fm.agentID = agentID
 }
 
 // watchDirectory sets up monitoring for a specific directory
@@ -250,6 +257,7 @@ func (fm *FileMonitor) processFileEvent(filePath string, action uint32) {
 	event := models.FileEvent{
 		Event: models.Event{
 			ID:        fm.generateEventID(),
+			AgentID:   fm.agentID, // Set agent ID
 			EventType: "file_event",
 			Timestamp: time.Now(),
 			Severity:  fm.determineSeverity(action, filePath),

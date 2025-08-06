@@ -7,32 +7,32 @@ import (
 
 // Event represents a security event detected by the agent
 type Event struct {
-	ID          string                 `json:"id"`
-	AgentID     string                 `json:"agent_id"`
-	EventType   string                 `json:"event_type"`
-	Timestamp   time.Time              `json:"timestamp"`
-	Severity    string                 `json:"severity"`
-	Category    string                 `json:"category"`
-	Source      string                 `json:"source"`
-	Data        map[string]interface{} `json:"data"`
-	Hash        string                 `json:"hash,omitempty"`
-	FilePath    string                 `json:"file_path,omitempty"`
-	ProcessID   int                    `json:"process_id,omitempty"`
-	ProcessName string                 `json:"process_name,omitempty"`
-	NetworkInfo *NetworkInfo           `json:"network_info,omitempty"`
-	RegistryInfo *RegistryInfo         `json:"registry_info,omitempty"`
-	ThreatInfo  *ThreatInfo           `json:"threat_info,omitempty"`
+	ID           string                 `json:"id"`
+	AgentID      string                 `json:"agent_id"`
+	EventType    string                 `json:"event_type"`
+	Timestamp    time.Time              `json:"timestamp"`
+	Severity     string                 `json:"severity"`
+	Category     string                 `json:"category"`
+	Source       string                 `json:"source"`
+	Data         map[string]interface{} `json:"data"`
+	Hash         string                 `json:"hash,omitempty"`
+	FilePath     string                 `json:"file_path,omitempty"`
+	ProcessID    int                    `json:"process_id,omitempty"`
+	ProcessName  string                 `json:"process_name,omitempty"`
+	NetworkInfo  *NetworkInfo           `json:"network_info,omitempty"`
+	RegistryInfo *RegistryInfo          `json:"registry_info,omitempty"`
+	ThreatInfo   *ThreatInfo            `json:"threat_info,omitempty"`
 }
 
 // NetworkInfo contains network-related event data
 type NetworkInfo struct {
-	LocalIP   string `json:"local_ip"`
-	LocalPort int    `json:"local_port"`
-	RemoteIP  string `json:"remote_ip"`
-	RemotePort int   `json:"remote_port"`
-	Protocol  string `json:"protocol"`
-	Direction string `json:"direction"` // inbound, outbound
-	Domain    string `json:"domain,omitempty"`
+	LocalIP    string `json:"local_ip"`
+	LocalPort  int    `json:"local_port"`
+	RemoteIP   string `json:"remote_ip"`
+	RemotePort int    `json:"remote_port"`
+	Protocol   string `json:"protocol"`
+	Direction  string `json:"direction"` // inbound, outbound
+	Domain     string `json:"domain,omitempty"`
 }
 
 // RegistryInfo contains registry-related event data
@@ -47,12 +47,12 @@ type RegistryInfo struct {
 
 // ThreatInfo contains threat detection information
 type ThreatInfo struct {
-	ThreatType    string   `json:"threat_type"`
-	ThreatName    string   `json:"threat_name"`
-	Confidence    float64  `json:"confidence"`
-	YaraRules     []string `json:"yara_rules,omitempty"`
-	MITRETechnique string  `json:"mitre_technique,omitempty"`
-	Description   string   `json:"description"`
+	ThreatType     string   `json:"threat_type"`
+	ThreatName     string   `json:"threat_name"`
+	Confidence     float64  `json:"confidence"`
+	YaraRules      []string `json:"yara_rules,omitempty"`
+	MITRETechnique string   `json:"mitre_technique,omitempty"`
+	Description    string   `json:"description"`
 }
 
 // FileEvent represents a file system event
@@ -90,9 +90,9 @@ type ProcessEvent struct {
 	ParentProcessName string `json:"parent_process_name"`
 	CommandLine       string `json:"command_line"`
 	WorkingDirectory  string `json:"working_directory"`
-	UserID           string `json:"user_id"`
-	SessionID        int    `json:"session_id"`
-	IntegrityLevel   string `json:"integrity_level"`
+	UserID            string `json:"user_id"`
+	SessionID         int    `json:"session_id"`
+	IntegrityLevel    string `json:"integrity_level"`
 }
 
 func (pe *ProcessEvent) GetAgentID() string {
@@ -115,11 +115,11 @@ func (pe *ProcessEvent) ToJSON() []byte {
 // NetworkEvent represents a network activity event
 type NetworkEvent struct {
 	Event
-	ConnectionID string `json:"connection_id"`
-	BytesSent    int64  `json:"bytes_sent"`
-	BytesReceived int64 `json:"bytes_received"`
-	Duration     int    `json:"duration"`
-	Status       string `json:"status"`
+	ConnectionID  string `json:"connection_id"`
+	BytesSent     int64  `json:"bytes_sent"`
+	BytesReceived int64  `json:"bytes_received"`
+	Duration      int    `json:"duration"`
+	Status        string `json:"status"`
 }
 
 func (ne *NetworkEvent) GetAgentID() string {
@@ -142,13 +142,13 @@ func (ne *NetworkEvent) ToJSON() []byte {
 // RegistryEvent represents a registry modification event
 type RegistryEvent struct {
 	Event
-	Hive         string `json:"hive"`
-	KeyPath      string `json:"key_path"`
-	ValueName    string `json:"value_name"`
-	ValueType    string `json:"value_type"`
-	ValueData    string `json:"value_data"`
-	UserID       string `json:"user_id"`
-	ProcessID    int    `json:"process_id"`
+	Hive      string `json:"hive"`
+	KeyPath   string `json:"key_path"`
+	ValueName string `json:"value_name"`
+	ValueType string `json:"value_type"`
+	ValueData string `json:"value_data"`
+	UserID    string `json:"user_id"`
+	ProcessID int    `json:"process_id"`
 }
 
 func (re *RegistryEvent) GetAgentID() string {
@@ -171,4 +171,10 @@ func (re *RegistryEvent) ToJSON() []byte {
 // MemoryEvent represents a memory-related event
 type MemoryEvent struct {
 	Event
-	ProcessID    int    `
+	ProcessID    int    `json:"process_id"`
+	ProcessName  string `json:"process_name"`
+	MemoryRegion string `json:"memory_region"`
+	Action       string `json:"action"` // allocation, protection, execution
+	Size         int64  `json:"size"`
+	Protection   string `json:"protection"`
+}

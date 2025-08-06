@@ -174,19 +174,34 @@ func (sc *ServerClient) SendEvents(events []interface{}) error {
 
 	jsonData, err := json.Marshal(events)
 	if err != nil {
+		sc.logger.Error("Failed to marshal events: %v", err)
 		return err
 	}
 
-	resp, err := sc.post(url, jsonData)
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
+		sc.logger.Error("Failed to create request: %v", err)
+		return err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", sc.config.APIKey)
+	req.Header.Set("X-Agent-ID", sc.agentID)
+
+	resp, err := sc.httpClient.Do(req)
+	if err != nil {
+		sc.logger.Error("Failed to send events: %v", err)
 		return err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		sc.logger.Error("Send events failed: %d, response: %s", resp.StatusCode, string(body))
 		return fmt.Errorf("send events failed: %d", resp.StatusCode)
 	}
 
+	sc.logger.Info("Sent %d events to server", len(events))
 	return nil
 }
 
@@ -243,6 +258,17 @@ func (sc *ServerClient) GetAPIKey() string {
 func (sc *ServerClient) UpdateAPIKey(newAPIKey string) {
 	sc.config.APIKey = newAPIKey
 	sc.logger.Info("Updated API key in server client: %s", newAPIKey)
+}
+
+// SetAgentID sets the agent ID
+func (sc *ServerClient) SetAgentID(agentID string) {
+	sc.agentID = agentID
+	sc.logger.Info("Set agent ID: %s", agentID)
+}
+
+// GetAgentID returns the current agent ID
+func (sc *ServerClient) GetAgentID() string {
+	return sc.agentID
 }
 
 // CheckAgentExistsByMAC với auth token

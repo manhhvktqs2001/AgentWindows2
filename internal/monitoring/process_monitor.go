@@ -19,6 +19,7 @@ type ProcessMonitor struct {
 	eventChan chan models.ProcessEvent
 	stopChan  chan bool
 	processes map[uint32]*ProcessInfo
+	agentID   string // Add agent ID field
 }
 
 type ProcessInfo struct {
@@ -81,6 +82,7 @@ func NewProcessMonitor(cfg *config.ProcessConfig, logger *utils.Logger) *Process
 		eventChan: make(chan models.ProcessEvent, 1000),
 		stopChan:  make(chan bool),
 		processes: make(map[uint32]*ProcessInfo),
+		agentID:   "", // Will be set later
 	}
 }
 
@@ -114,6 +116,11 @@ func (pm *ProcessMonitor) Stop() {
 // GetEventChannel returns the channel for process events
 func (pm *ProcessMonitor) GetEventChannel() <-chan models.ProcessEvent {
 	return pm.eventChan
+}
+
+// SetAgentID sets the agent ID for events
+func (pm *ProcessMonitor) SetAgentID(agentID string) {
+	pm.agentID = agentID
 }
 
 // enumerateProcesses gets the current list of running processes
@@ -226,6 +233,7 @@ func (pm *ProcessMonitor) handleNewProcess(processID, parentProcessID uint32, pr
 	event := models.ProcessEvent{
 		Event: models.Event{
 			ID:          pm.generateEventID(),
+			AgentID:     pm.agentID, // Set agent ID
 			EventType:   "process_event",
 			Timestamp:   time.Now(),
 			Severity:    pm.determineProcessSeverity(processName, processInfo),

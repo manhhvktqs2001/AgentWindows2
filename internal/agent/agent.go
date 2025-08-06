@@ -55,6 +55,11 @@ func NewAgent(cfg *config.Config, logger *utils.Logger) (*Agent, error) {
 	// Initialize server client
 	serverClient := communication.NewServerClient(cfg.Server, logger)
 
+	// Set agent ID if available in config
+	if cfg.Agent.ID != "" {
+		serverClient.SetAgentID(cfg.Agent.ID)
+	}
+
 	// Initialize YARA scanner
 	yaraScanner := scanner.NewYaraScanner(&cfg.Yara, logger)
 
@@ -180,6 +185,8 @@ func (a *Agent) Start() error {
 
 	// Start monitors
 	if a.config.Monitoring.FileSystem.Enabled {
+		// Set agent ID for file monitor
+		a.fileMonitor.SetAgentID(a.config.Agent.ID)
 		err = a.fileMonitor.Start()
 		if err != nil {
 			a.logger.Error("Failed to start file monitor: %v", err)
@@ -193,6 +200,8 @@ func (a *Agent) Start() error {
 	}
 
 	if a.config.Monitoring.Processes.Enabled {
+		// Set agent ID for process monitor
+		a.processMonitor.SetAgentID(a.config.Agent.ID)
 		err = a.processMonitor.Start()
 		if err != nil {
 			a.logger.Error("Failed to start process monitor: %v", err)
@@ -206,6 +215,8 @@ func (a *Agent) Start() error {
 	}
 
 	if a.config.Monitoring.Network.Enabled {
+		// Set agent ID for network monitor
+		a.networkMonitor.SetAgentID(a.config.Agent.ID)
 		err = a.networkMonitor.Start()
 		if err != nil {
 			a.logger.Error("Failed to start network monitor: %v", err)
@@ -219,6 +230,8 @@ func (a *Agent) Start() error {
 	}
 
 	if a.config.Monitoring.Registry.Enabled {
+		// Set agent ID for registry monitor
+		a.registryMonitor.SetAgentID(a.config.Agent.ID)
 		err = a.registryMonitor.Start()
 		if err != nil {
 			a.logger.Error("Failed to start registry monitor: %v", err)
@@ -330,6 +343,9 @@ func (a *Agent) saveAgentID(agentID string) error {
 	// Update the config with the new agent ID and API key
 	a.config.Agent.ID = agentID
 	a.config.Server.APIKey = a.serverClient.GetAPIKey()
+
+	// Update server client agent ID
+	a.serverClient.SetAgentID(agentID)
 
 	// Save to config file
 	return config.Save(a.config, "config.yaml")
