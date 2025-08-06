@@ -1,0 +1,51 @@
+server:
+  url: "http://192.168.20.85:5000"
+  api_key: ""  # Sẽ được điền sau khi đăng ký thành công
+  auth_token: "edr_system_auth_2025"  # Pre-shared token để đăng ký
+  timeout: 30
+  retry_count: 3
+  tls_verify: false
+
+agent:
+  id: ""  # Sẽ được điền sau khi đăng ký
+  name: "test-agent"
+  heartbeat_interval: 60
+  event_batch_size: 100
+  max_queue_size: 10000
+
+monitor:
+  files:
+    enabled: false
+    paths: []
+    recursive: false
+    scan_on_write: false
+    max_file_size: "100MB"
+    exclude_exts: []
+
+  processes:
+    enabled: false
+    scan_executable: false
+    monitor_cmdline: false
+    exclude_names: []
+
+  network:
+    enabled: false
+    monitor_tcp: false
+    monitor_udp: false
+    exclude_ports: []
+
+  registry:
+    enabled: false
+    keys: []
+
+scanner:
+  yara_enabled: false
+  yara_rules_path: ""
+  max_scan_threads: 1
+  scan_timeout: 30
+
+log:
+  level: "info"
+  format: "text"
+  file_path: "agent.log"
+  max_size: 10 

@@ -26,8 +26,9 @@ func main() {
 		start      = flag.Bool("start", false, "Start Windows service")
 		stop       = flag.Bool("stop", false, "Stop Windows service")
 		status     = flag.Bool("status", false, "Check service status")
-		configPath = flag.String("config", "", "Path to configuration file")
+		configPath = flag.String("config", "config.yaml", "Path to configuration file")
 		version    = flag.Bool("version", false, "Show version information")
+		reset      = flag.Bool("reset", false, "Reset agent registration (force new registration)")
 	)
 	flag.Parse()
 
@@ -45,7 +46,7 @@ func main() {
 		if err := service.Install(); err != nil {
 			log.Fatalf("Failed to install service: %v", err)
 		}
-		fmt.Println("EDR Agent service installed successfully")
+		fmt.Println("✅ EDR Agent service installed successfully")
 		return
 	}
 
@@ -53,7 +54,7 @@ func main() {
 		if err := service.Uninstall(); err != nil {
 			log.Fatalf("Failed to uninstall service: %v", err)
 		}
-		fmt.Println("EDR Agent service uninstalled successfully")
+		fmt.Println("✅ EDR Agent service uninstalled successfully")
 		return
 	}
 
@@ -61,7 +62,7 @@ func main() {
 		if err := service.Start(); err != nil {
 			log.Fatalf("Failed to start service: %v", err)
 		}
-		fmt.Println("EDR Agent service started successfully")
+		fmt.Println("✅ EDR Agent service started successfully")
 		return
 	}
 
@@ -69,7 +70,7 @@ func main() {
 		if err := service.Stop(); err != nil {
 			log.Fatalf("Failed to stop service: %v", err)
 		}
-		fmt.Println("EDR Agent service stopped successfully")
+		fmt.Println("✅ EDR Agent service stopped successfully")
 		return
 	}
 
@@ -82,105 +83,92 @@ func main() {
 		return
 	}
 
-	// Load configuration
-	var cfg *config.Config
-	var err error
-
-	if *configPath != "" {
-		// Use provided config file
-		cfg, err = config.Load(*configPath)
-		if err != nil {
-			log.Fatalf("Failed to load configuration: %v", err)
+	// Reset agent registration
+	if *reset {
+		if err := resetAgentRegistration(*configPath); err != nil {
+			log.Fatalf("Failed to reset agent registration: %v", err)
 		}
-	} else {
-		// Use built-in default config
-		cfg = getDefaultConfig()
-		fmt.Println("✅ Using built-in default configuration")
+		fmt.Println("✅ Agent registration reset successfully")
+		return
 	}
+
+	// Load configuration
+	fmt.Printf("📋 Loading configuration from: %s\n", *configPath)
+	cfg, err := config.LoadOrCreate(*configPath)
+	if err != nil {
+		log.Fatalf("Failed to load configuration: %v", err)
+	}
+
+	// Validate and fix configuration
+	config.ValidateAndFix(cfg)
 
 	// Initialize logger
 	logger := utils.NewLogger(&cfg.Log)
 
-	// Create and start agent
-	agent, err := agent.NewAgent(cfg, logger)
+	// Log startup information
+	logger.Info("=== EDR Agent Starting ===")
+	logger.Info("Version: %s", Version)
+	logger.Info("Build Time: %s", BuildTime)
+	logger.Info("Config Path: %s", *configPath)
+	logger.Info("Agent Name: %s", cfg.Agent.Name)
+	logger.Info("Server URL: %s", cfg.Server.URL)
+
+	// Create agent
+	agentInstance, err := agent.NewAgent(cfg, logger)
 	if err != nil {
+		logger.Error("Failed to create agent: %v", err)
 		log.Fatalf("Failed to create agent: %v", err)
 	}
 
 	// Check if running as service
 	if service.IsRunningAsService() {
-		logger.Info("Running as Windows service")
-		if err := service.Run(agent); err != nil {
+		logger.Info("🔧 Running as Windows service")
+		if err := service.Run(agentInstance); err != nil {
 			logger.Error("Service failed: %v", err)
 			os.Exit(1)
 		}
 	} else {
-		logger.Info("Running as console application")
-		if err := agent.Start(); err != nil {
+		logger.Info("💻 Running as console application")
+		
+		// Start agent
+		if err := agentInstance.Start(); err != nil {
 			logger.Error("Failed to start agent: %v", err)
 			os.Exit(1)
 		}
 
+		fmt.Println("✅ EDR Agent started successfully")
+		fmt.Println("📡 Agent is running and connected to server")
+		fmt.Println("🔄 Heartbeat interval:", cfg.Agent.HeartbeatInterval, "seconds")
+		fmt.Println("Press Ctrl+C to stop...")
+
 		// Wait for interrupt signal
 		utils.WaitForInterrupt()
-		agent.Stop()
+		
+		fmt.Println("\n🛑 Shutting down agent...")
+		agentInstance.Stop()
+		logger.Info("EDR Agent stopped")
 	}
 }
 
-// getDefaultConfig returns built-in default configuration
-func getDefaultConfig() *config.Config {
-	return &config.Config{
-		Server: config.ServerConfig{
-			URL:        "http://192.168.20.85:5000",
-			APIKey:     "f93ac1d1d7b64f07bd32c81e6ab8423e4cb7631f2051c9d8a2d340c5be3a4a9e",
-			Timeout:    30,
-			RetryCount: 3,
-			TLSVerify:  false,
-		},
-		Agent: config.AgentDetails{
-			ID:                "",
-			Name:              "edr-agent-windows",
-			HeartbeatInterval: 60,
-			EventBatchSize:    100,
-			MaxQueueSize:      10000,
-		},
-		Monitor: config.MonitorConfig{
-			Files: config.FileMonitorConfig{
-				Enabled:     false,
-				Paths:       []string{},
-				Recursive:   false,
-				ScanOnWrite: false,
-				MaxFileSize: "100MB",
-				ExcludeExts: []string{},
-			},
-			Processes: config.ProcessMonitorConfig{
-				Enabled:        false,
-				ScanExecutable: false,
-				MonitorCmdLine: false,
-				ExcludeNames:   []string{},
-			},
-			Network: config.NetworkMonitorConfig{
-				Enabled:      false,
-				MonitorTCP:   false,
-				MonitorUDP:   false,
-				ExcludePorts: []int{},
-			},
-			Registry: config.RegistryMonitorConfig{
-				Enabled: false,
-				Keys:    []string{},
-			},
-		},
-		Scanner: config.ScannerConfig{
-			YaraEnabled:    false,
-			YaraRulesPath:  "",
-			MaxScanThreads: 1,
-			ScanTimeout:    30,
-		},
-		Log: config.LogConfig{
-			Level:    "info",
-			Format:   "text",
-			FilePath: "agent.log",
-			MaxSize:  10,
-		},
+// resetAgentRegistration xóa thông tin đăng ký agent để force đăng ký lại
+func resetAgentRegistration(configPath string) error {
+	// Load config
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return fmt.Errorf("failed to load config: %w", err)
 	}
+
+	// Clear agent ID to force re-registration
+	cfg.Agent.ID = ""
+	
+	// Save updated config
+	err = config.SaveWithBackup(cfg, configPath)
+	if err != nil {
+		return fmt.Errorf("failed to save config: %w", err)
+	}
+
+	fmt.Println("🔄 Agent ID cleared from config")
+	fmt.Println("🆕 Agent will register as new on next start")
+	
+	return nil
 }

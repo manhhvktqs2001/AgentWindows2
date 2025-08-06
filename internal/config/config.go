@@ -21,6 +21,7 @@ type Config struct {
 type ServerConfig struct {
 	URL        string `yaml:"url"`         // "http://192.168.20.85:5000"
 	APIKey     string `yaml:"api_key"`     // Agent authentication
+	AuthToken  string `yaml:"auth_token"`  // Pre-shared registration token
 	Timeout    int    `yaml:"timeout"`     // HTTP timeout seconds
 	RetryCount int    `yaml:"retry_count"` // Retry failed requests
 	TLSVerify  bool   `yaml:"tls_verify"`  // Verify TLS certificates
@@ -128,6 +129,7 @@ func Load(configPath string) (*Config, error) {
 		Server: ServerConfig{
 			URL:        viper.GetString("server.url"),
 			APIKey:     viper.GetString("server.api_key"),
+			AuthToken:  viper.GetString("server.auth_token"),
 			Timeout:    viper.GetInt("server.timeout"),
 			RetryCount: viper.GetInt("server.retry_count"),
 			TLSVerify:  viper.GetBool("server.tls_verify"),
@@ -351,4 +353,161 @@ func CreateDefaultConfig(filePath string) error {
 	}
 
 	return Save(config, filePath)
+}
+
+// LoadOrCreate tải cấu hình từ file hoặc tạo file mặc định nếu không tồn tại
+func LoadOrCreate(configPath string) (*Config, error) {
+	// Thử load file cấu hình hiện có
+	if configPath != "" {
+		if _, err := os.Stat(configPath); err == nil {
+			return Load(configPath)
+		}
+	}
+
+	// File không tồn tại, tạo cấu hình mặc định
+	config := createDefaultConfig()
+
+	// Lưu cấu hình mặc định
+	if configPath != "" {
+		if err := Save(config, configPath); err != nil {
+			// Log warning nhưng vẫn tiếp tục với cấu hình in-memory
+			fmt.Printf("⚠️  Failed to save default config to %s: %v\n", configPath, err)
+		} else {
+			fmt.Printf("✅ Created default config file: %s\n", configPath)
+		}
+	}
+
+	return config, nil
+}
+
+// createDefaultConfig tạo cấu hình mặc định
+func createDefaultConfig() *Config {
+	return &Config{
+		Server: ServerConfig{
+			URL:        "http://192.168.20.85:5000",
+			APIKey:     "f93ac1d1d7b64f07bd32c81e6ab8423e4cb7631f2051c9d8a2d340c5be3a4a9e",
+			AuthToken:  "edr_system_auth_2025", // Pre-shared registration token
+			Timeout:    30,
+			RetryCount: 3,
+			TLSVerify:  false,
+		},
+		Agent: AgentDetails{
+			ID:                "", // Sẽ được điền sau khi đăng ký
+			Name:              getDefaultAgentName(),
+			HeartbeatInterval: 60,
+			EventBatchSize:    100,
+			MaxQueueSize:      10000,
+		},
+		Monitor: MonitorConfig{
+			Files: FileMonitorConfig{
+				Enabled:     false,
+				Paths:       []string{},
+				Recursive:   false,
+				ScanOnWrite: false,
+				MaxFileSize: "100MB",
+				ExcludeExts: []string{},
+			},
+			Processes: ProcessMonitorConfig{
+				Enabled:        false,
+				ScanExecutable: false,
+				MonitorCmdLine: false,
+				ExcludeNames:   []string{},
+			},
+			Network: NetworkMonitorConfig{
+				Enabled:      false,
+				MonitorTCP:   false,
+				MonitorUDP:   false,
+				ExcludePorts: []int{},
+			},
+			Registry: RegistryMonitorConfig{
+				Enabled: false,
+				Keys:    []string{},
+			},
+		},
+		Scanner: ScannerConfig{
+			YaraEnabled:    false,
+			YaraRulesPath:  "",
+			MaxScanThreads: 1,
+			ScanTimeout:    30,
+		},
+		Log: LogConfig{
+			Level:    "info",
+			Format:   "text",
+			FilePath: "agent.log",
+			MaxSize:  10,
+		},
+	}
+}
+
+// getDefaultAgentName tạo tên agent mặc định dựa trên hostname
+func getDefaultAgentName() string {
+	hostname, err := os.Hostname()
+	if err != nil {
+		return "edr-agent-windows"
+	}
+	return fmt.Sprintf("edr-agent-%s", hostname)
+}
+
+// SaveWithBackup lưu cấu hình và tạo backup
+func SaveWithBackup(config *Config, filePath string) error {
+	// Tạo backup nếu file hiện có
+	if _, err := os.Stat(filePath); err == nil {
+		backupPath := filePath + ".backup"
+		if err := copyFile(filePath, backupPath); err != nil {
+			fmt.Printf("⚠️  Failed to create backup: %v\n", err)
+		}
+	}
+
+	return Save(config, filePath)
+}
+
+// copyFile sao chép file
+func copyFile(src, dst string) error {
+	sourceFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer sourceFile.Close()
+
+	destFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer destFile.Close()
+
+	_, err = destFile.ReadFrom(sourceFile)
+	return err
+}
+
+// ValidateAndFix kiểm tra và sửa các giá trị cấu hình không hợp lệ
+func ValidateAndFix(config *Config) {
+	// Sửa heartbeat interval
+	if config.Agent.HeartbeatInterval < 10 {
+		config.Agent.HeartbeatInterval = 30
+		fmt.Println("⚠️  Fixed heartbeat interval to 30 seconds")
+	}
+
+	// Sửa event batch size
+	if config.Agent.EventBatchSize < 1 {
+		config.Agent.EventBatchSize = 100
+		fmt.Println("⚠️  Fixed event batch size to 100")
+	}
+
+	// Sửa max queue size
+	if config.Agent.MaxQueueSize < 100 {
+		config.Agent.MaxQueueSize = 10000
+		fmt.Println("⚠️  Fixed max queue size to 10000")
+	}
+
+	// Sửa server URL
+	if config.Server.URL == "" {
+		config.Server.URL = "http://192.168.20.85:5000"
+		fmt.Println("⚠️  Fixed server URL to default")
+	}
+
+	// Sửa agent name
+	if config.Agent.Name == "" {
+		config.Agent.Name = getDefaultAgentName()
+		fmt.Printf("⚠️  Fixed agent name to %s\n", config.Agent.Name)
+	}
 }

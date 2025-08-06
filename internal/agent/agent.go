@@ -81,6 +81,86 @@ func NewAgent(cfg *config.Config, logger *utils.Logger) (*Agent, error) {
 	return agent, nil
 }
 
+// Thực hiện đăng ký agent mới
+func (a *Agent) performNewRegistration(macAddress string) error {
+	// Lấy thông tin hệ thống
+	hostname, err := os.Hostname()
+	if err != nil {
+		return fmt.Errorf("failed to get hostname: %w", err)
+	}
+
+	ip, err := a.getIPAddress()
+	if err != nil {
+		return fmt.Errorf("failed to get IP address: %w", err)
+	}
+
+	osVersion, err := a.getOSVersion()
+	if err != nil {
+		return fmt.Errorf("failed to get OS version: %w", err)
+	}
+
+	systemInfo := a.getSystemInfo()
+
+	// Tạo request đăng ký với authentication
+	registration := communication.AgentRegistrationRequest{
+		AuthToken:    a.config.Server.AuthToken, // Pre-shared auth token
+		Hostname:     hostname,
+		IPAddress:    ip,
+		MACAddress:   macAddress,
+		OSType:       runtime.GOOS,
+		OSVersion:    osVersion,
+		Architecture: runtime.GOARCH,
+		AgentVersion: "1.0.0",
+		SystemInfo:   systemInfo,
+	}
+
+	// Gửi request đăng ký
+	result, err := a.serverClient.Register(registration)
+	if err != nil {
+		return fmt.Errorf("failed to register with server: %w", err)
+	}
+
+	// Cập nhật cấu hình với thông tin mới
+	a.config.Agent.ID = result.AgentID
+	if result.APIKey != "" {
+		a.config.Server.APIKey = result.APIKey
+		a.logger.Info("Updated API key from server")
+	}
+
+	// Lưu cấu hình
+	if err := a.saveConfigToFile(); err != nil {
+		a.logger.Warn("Failed to save agent config: %v", err)
+	}
+
+	a.logger.Info("Successfully registered new agent - ID: %s", result.AgentID)
+	a.logger.Info("System Info - Hostname: %s, IP: %s, MAC: %s, OS: %s %s", hostname, ip, macAddress, runtime.GOOS, osVersion)
+	return nil
+}
+
+// Lưu cấu hình agent vào file
+func (a *Agent) saveConfigToFile() error {
+	// Tìm đường dẫn config file
+	configFile := "config.yaml"
+
+	// Kiểm tra các vị trí có thể có của config file
+	possiblePaths := []string{
+		"config.yaml",
+		"./config/config.yaml",
+		"C:\\Program Files\\EDR-Agent\\config.yaml",
+	}
+
+	// Sử dụng file đầu tiên tồn tại hoặc tạo mới tại vị trí mặc định
+	for _, path := range possiblePaths {
+		if _, err := os.Stat(path); err == nil {
+			configFile = path
+			break
+		}
+	}
+
+	// Sử dụng SaveWithBackup để tạo backup trước khi lưu
+	return config.SaveWithBackup(a.config, configFile)
+}
+
 // Start agent
 func (a *Agent) Start() error {
 	a.mu.Lock()
@@ -134,7 +214,6 @@ func (a *Agent) Start() error {
 
 	a.isRunning = true
 	a.logger.Info("EDR Agent started successfully")
-
 	return nil
 }
 
@@ -173,113 +252,53 @@ func (a *Agent) RegisterEvent(event Event) {
 
 // Register with server
 func (a *Agent) registerWithServer() error {
-	// Get MAC address first
+	// Bước 1: Lấy MAC address trước tiên
 	macAddress, err := a.getMACAddress()
 	if err != nil {
 		a.logger.Warn("Failed to get MAC address: %v", err)
-		macAddress = ""
+		return fmt.Errorf("cannot register without MAC address: %w", err)
 	}
 
-	// Check if agent already exists by MAC address
-	if macAddress != "" {
-		a.logger.Info("Checking if agent exists by MAC: %s", macAddress)
+	a.logger.Info("Agent MAC Address: %s", macAddress)
 
-		exists, existingAgentID, existingAPIKey, err := a.serverClient.CheckAgentExistsByMAC(macAddress)
-		if err != nil {
-			a.logger.Warn("Failed to check agent existence by MAC: %v", err)
-		} else if exists {
-			a.logger.Info("Agent already exists with MAC %s, Agent ID: %s", macAddress, existingAgentID)
-			a.logger.Info("Received API key from server: %s", existingAPIKey)
+	// Bước 2: Kiểm tra xem agent đã tồn tại chưa bằng MAC address
+	exists, existingAgentID, existingAPIKey, err := a.serverClient.CheckAgentExistsByMAC(macAddress)
+	if err != nil {
+		a.logger.Error("Failed to check agent existence by MAC: %v", err)
+		// Nếu không check được, vẫn tiếp tục đăng ký mới để tránh treo
+	} else if exists {
+		// Agent đã tồn tại, sử dụng thông tin hiện có
+		a.logger.Info("Agent already exists with MAC %s, Agent ID: %s", macAddress, existingAgentID)
 
-			// Update local config with existing agent ID and API key
-			a.config.Agent.ID = existingAgentID
-			if existingAPIKey != "" {
-				oldAPIKey := a.config.Server.APIKey
-				a.config.Server.APIKey = existingAPIKey
-				a.logger.Info("Updated API key from existing agent: %s -> %s", oldAPIKey, existingAPIKey)
+		// Cập nhật thông tin agent từ server
+		a.config.Agent.ID = existingAgentID
 
-				// Update server client with new API key
-				a.serverClient.UpdateAPIKey(existingAPIKey)
-				a.logger.Info("Updated server client with new API key")
-
-				// Save updated config to file
-				err := config.Save(a.config, "config.yaml")
-				if err != nil {
-					a.logger.Warn("Failed to save updated config: %v", err)
-				} else {
-					a.logger.Info("Saved updated config with new API key")
-				}
-			} else {
-				a.logger.Warn("No API key received from server")
-			}
-
-			// Try to send a heartbeat to verify the registration is still valid
-			err := a.sendHeartbeat()
-			if err == nil {
-				a.logger.Info("Existing registration is valid, skipping registration")
-				return nil
-			} else {
-				a.logger.Warn("Heartbeat failed, but agent exists on server: %v", err)
-				a.logger.Info("Continuing with existing registration")
-				return nil
-			}
-		} else {
-			a.logger.Info("No existing agent found with MAC %s, proceeding with registration", macAddress)
+		if existingAPIKey != "" {
+			oldAPIKey := a.config.Server.APIKey
+			a.config.Server.APIKey = existingAPIKey
+			a.serverClient.UpdateAPIKey(existingAPIKey)
+			a.logger.Info("Updated API key: %s -> %s", oldAPIKey, existingAPIKey)
 		}
+
+		// Lưu cấu hình đã cập nhật
+		if err := a.saveConfigToFile(); err != nil {
+			a.logger.Warn("Failed to save updated config: %v", err)
+		}
+
+		// Kiểm tra kết nối bằng heartbeat
+		if err := a.sendHeartbeat(); err != nil {
+			a.logger.Warn("Heartbeat failed with existing registration: %v", err)
+			// Có thể server đã reset, thử đăng ký lại
+			return a.performNewRegistration(macAddress)
+		}
+
+		a.logger.Info("Successfully connected with existing agent registration")
+		return nil
 	}
 
-	hostname, err := os.Hostname()
-	if err != nil {
-		return fmt.Errorf("failed to get hostname: %w", err)
-	}
-
-	ip, err := a.getIPAddress()
-	if err != nil {
-		return fmt.Errorf("failed to get IP address: %w", err)
-	}
-
-	osVersion, err := a.getOSVersion()
-	if err != nil {
-		return fmt.Errorf("failed to get OS version: %w", err)
-	}
-
-	// Get additional system information
-	systemInfo := a.getSystemInfo()
-
-	registration := communication.AgentRegistration{
-		Hostname:     hostname,
-		IPAddress:    ip,
-		MACAddress:   macAddress,
-		OSType:       runtime.GOOS,
-		OSVersion:    osVersion,
-		Architecture: runtime.GOARCH,
-		AgentVersion: "1.0.0",
-		SystemInfo:   systemInfo,
-	}
-
-	agentID, err := a.serverClient.Register(registration)
-	if err != nil {
-		return err
-	}
-
-	a.config.Agent.ID = agentID
-
-	// Update API key if server provided a new one
-	if a.serverClient.GetAPIKey() != a.config.Server.APIKey {
-		a.config.Server.APIKey = a.serverClient.GetAPIKey()
-		a.logger.Info("Updated API key from server")
-	}
-
-	a.logger.Info("Registered with server, Agent ID: %s", agentID)
-	a.logger.Info("System Info - Hostname: %s, IP: %s, MAC: %s, OS: %s %s", hostname, ip, macAddress, runtime.GOOS, osVersion)
-
-	// Save agent ID to config file
-	err = a.saveAgentID(agentID)
-	if err != nil {
-		a.logger.Warn("Failed to save agent ID to config: %v", err)
-	}
-
-	return nil
+	// Bước 3: Agent chưa tồn tại, thực hiện đăng ký mới
+	a.logger.Info("Agent not found with MAC %s, performing new registration", macAddress)
+	return a.performNewRegistration(macAddress)
 }
 
 // saveAgentID saves the agent ID and API key to the config file
@@ -445,14 +464,19 @@ func (a *Agent) getMACAddress() (string, error) {
 		return "", fmt.Errorf("failed to get network interfaces: %w", err)
 	}
 
-	// Look for the primary network interface (usually the first non-loopback interface with IPv4)
+	// Ưu tiên 1: Interface có IP và đang hoạt động
 	for _, iface := range interfaces {
-		// Skip loopback and down interfaces
+		// Bỏ qua loopback và interface không hoạt động
 		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
 			continue
 		}
 
-		// Check if interface has IPv4 address
+		// Kiểm tra có MAC address không
+		if iface.HardwareAddr == nil {
+			continue
+		}
+
+		// Kiểm tra interface có IPv4 address không
 		addrs, err := iface.Addrs()
 		if err != nil {
 			continue
@@ -461,27 +485,30 @@ func (a *Agent) getMACAddress() (string, error) {
 		hasIPv4 := false
 		for _, addr := range addrs {
 			if ipnet, ok := addr.(*net.IPNet); ok {
-				if ip := ipnet.IP.To4(); ip != nil {
+				if ip := ipnet.IP.To4(); ip != nil && !ip.IsLoopback() {
 					hasIPv4 = true
 					break
 				}
 			}
 		}
 
-		// If interface has IPv4 and MAC address, use it
-		if hasIPv4 && iface.HardwareAddr != nil {
-			return iface.HardwareAddr.String(), nil
+		if hasIPv4 {
+			macAddr := iface.HardwareAddr.String()
+			a.logger.Debug("Selected primary interface: %s, MAC: %s", iface.Name, macAddr)
+			return macAddr, nil
 		}
 	}
 
-	// Fallback: get any MAC address
+	// Ưu tiên 2: Bất kỳ interface nào có MAC address và đang hoạt động
 	for _, iface := range interfaces {
 		if iface.Flags&net.FlagUp != 0 && iface.HardwareAddr != nil {
-			return iface.HardwareAddr.String(), nil
+			macAddr := iface.HardwareAddr.String()
+			a.logger.Debug("Selected fallback interface: %s, MAC: %s", iface.Name, macAddr)
+			return macAddr, nil
 		}
 	}
 
-	return "", fmt.Errorf("no MAC address found")
+	return "", fmt.Errorf("no suitable MAC address found")
 }
 
 func (a *Agent) getSystemInfo() map[string]interface{} {
