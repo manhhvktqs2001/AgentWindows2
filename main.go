@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -15,6 +16,8 @@ import (
 	"edr-agent-windows/internal/config"
 	"edr-agent-windows/internal/service"
 	"edr-agent-windows/internal/utils"
+
+	"golang.org/x/sys/windows"
 )
 
 var (
@@ -22,19 +25,63 @@ var (
 	BuildTime = "2025-08-06"
 )
 
+// checkAdminPrivileges checks if the process is running with administrator privileges
+func checkAdminPrivileges() bool {
+	_, err := os.Open("\\\\.\\PHYSICALDRIVE0")
+	return err == nil
+}
+
+// requestAdminPrivileges restarts the process with administrator privileges
+func requestAdminPrivileges() error {
+	verb := "runas"
+	exe, _ := os.Executable()
+	cwd, _ := os.Getwd()
+	args := os.Args[1:]
+
+	verbPtr, _ := windows.UTF16PtrFromString(verb)
+	exePtr, _ := windows.UTF16PtrFromString(exe)
+	cwdPtr, _ := windows.UTF16PtrFromString(cwd)
+	argPtr, _ := windows.UTF16PtrFromString(fmt.Sprintf("%s %s", exe, strings.Join(args, " ")))
+
+	var showCmd int32 = 1 //SW_NORMAL
+
+	err := windows.ShellExecute(0, verbPtr, exePtr, argPtr, cwdPtr, showCmd)
+	if err != nil {
+		return fmt.Errorf("failed to restart with admin privileges: %w", err)
+	}
+	return nil
+}
+
 func main() {
+	// Check if running with administrator privileges
+	if !checkAdminPrivileges() {
+		fmt.Println("⚠️  EDR Agent requires administrator privileges to monitor system activities")
+		fmt.Println("🔄 Restarting with administrator privileges...")
+
+		if err := requestAdminPrivileges(); err != nil {
+			fmt.Printf("❌ Failed to restart with admin privileges: %v\n", err)
+			fmt.Println("💡 Please run this application as Administrator")
+			os.Exit(1)
+		}
+
+		// Exit current process
+		os.Exit(0)
+	}
+
+	fmt.Println("✅ Running with administrator privileges")
+
 	// Parse command line flags
 	var (
-		install    = flag.Bool("install", false, "Install as Windows service")
-		uninstall  = flag.Bool("uninstall", false, "Uninstall Windows service")
-		start      = flag.Bool("start", false, "Start Windows service")
-		stop       = flag.Bool("stop", false, "Stop Windows service")
-		status     = flag.Bool("status", false, "Check service status")
-		configPath = flag.String("config", "config.yaml", "Path to configuration file")
-		version    = flag.Bool("version", false, "Show version information")
-		reset      = flag.Bool("reset", false, "Reset agent registration (force new registration)")
+		install     = flag.Bool("install", false, "Install as Windows service")
+		uninstall   = flag.Bool("uninstall", false, "Uninstall Windows service")
+		start       = flag.Bool("start", false, "Start Windows service")
+		stop        = flag.Bool("stop", false, "Stop Windows service")
+		status      = flag.Bool("status", false, "Check service status")
+		configPath  = flag.String("config", "config.yaml", "Path to configuration file")
+		version     = flag.Bool("version", false, "Show version information")
+		reset       = flag.Bool("reset", false, "Reset agent registration (force new registration)")
 		updateRules = flag.Bool("update-rules", false, "Update YARA rules")
-		report     = flag.Bool("report", false, "Generate system report")
+		report      = flag.Bool("report", false, "Generate system report")
 	)
 	flag.Parse()
 
@@ -159,7 +206,7 @@ func main() {
 		}
 	} else {
 		logger.Info("💻 Running as console application")
-		
+
 		// Create context for graceful shutdown
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -240,12 +287,12 @@ func updateYaraRules(configPath string) error {
 	// Create YARA rules manager
 	// This would be implemented in the yara package
 	logger.Info("Updating YARA rules...")
-	
+
 	// TODO: Implement YARA rules update
 	fmt.Println("🔄 YARA rules update initiated")
 	fmt.Println("📥 Downloading rules from GitHub...")
 	fmt.Println("✅ Rules updated successfully")
-	
+
 	return nil
 }
 
@@ -261,7 +308,7 @@ func generateSystemReport(configPath string) error {
 	logger := utils.NewLogger(&cfg.Log)
 
 	logger.Info("Generating system report...")
-	
+
 	// TODO: Implement system report generation
 	fmt.Println("📊 Generating system report...")
 	fmt.Println("📋 Agent Configuration:")
@@ -279,6 +326,6 @@ func generateSystemReport(configPath string) error {
 	fmt.Printf("   - Update Interval: %s\n", cfg.Yara.UpdateInterval)
 	fmt.Printf("   - Rules Path: %s\n", cfg.Yara.RulesPath)
 	fmt.Println("✅ System report generated successfully")
-	
+
 	return nil
 }

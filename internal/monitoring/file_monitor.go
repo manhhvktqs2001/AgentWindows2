@@ -10,6 +10,7 @@ import (
 
 	"edr-agent-windows/internal/config"
 	"edr-agent-windows/internal/models"
+	"edr-agent-windows/internal/scanner"
 	"edr-agent-windows/internal/utils"
 
 	"golang.org/x/sys/windows"
@@ -22,7 +23,8 @@ type FileMonitor struct {
 	stopChan  chan bool
 	handles   []windows.Handle
 	watchers  map[string]*DirectoryWatcher
-	agentID   string // Add agent ID field
+	agentID   string               // Add agent ID field
+	scanner   *scanner.YaraScanner // Add YARA scanner
 }
 
 type DirectoryWatcher struct {
@@ -62,7 +64,8 @@ func NewFileMonitor(cfg *config.FileSystemConfig, logger *utils.Logger) *FileMon
 		eventChan: make(chan models.FileEvent, 1000),
 		stopChan:  make(chan bool),
 		watchers:  make(map[string]*DirectoryWatcher),
-		agentID:   "", // Will be set later
+		agentID:   "",  // Will be set later
+		scanner:   nil, // Will be set later
 	}
 }
 
@@ -116,6 +119,11 @@ func (fm *FileMonitor) GetEventChannel() <-chan models.FileEvent {
 // SetAgentID sets the agent ID for events
 func (fm *FileMonitor) SetAgentID(agentID string) {
 	fm.agentID = agentID
+}
+
+// SetScanner sets the YARA scanner
+func (fm *FileMonitor) SetScanner(scanner *scanner.YaraScanner) {
+	fm.scanner = scanner
 }
 
 // watchDirectory sets up monitoring for a specific directory
@@ -283,6 +291,22 @@ func (fm *FileMonitor) processFileEvent(filePath string, action uint32) {
 		fm.logger.Debug("File event: %s - %s", event.Action, filePath)
 	default:
 		fm.logger.Warn("Event channel full, dropping file event")
+	}
+
+	// Scan file with YARA if scanner is available and file is created/modified
+	if fm.scanner != nil && (action == FILE_ACTION_ADDED || action == FILE_ACTION_MODIFIED) {
+		if fileInfo != nil {
+			go func() {
+				result, err := fm.scanner.ScanFile(filePath)
+				if err != nil {
+					fm.logger.Error("YARA scan failed for %s: %v", filePath, err)
+					return
+				}
+				if result != nil && result.Matched {
+					fm.logger.Warn("YARA threat detected: %s -> %s", filePath, result.RuleName)
+				}
+			}()
+		}
 	}
 }
 

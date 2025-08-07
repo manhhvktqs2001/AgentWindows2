@@ -39,10 +39,19 @@ func (ys *YaraScanner) SetResponseManager(responseManager interface{}) {
 	ys.logger.Debug("Response manager set (stub)")
 }
 
-func (ys *YaraScanner) ScanFile(filePath string) (*models.ThreatInfo, error) {
+type ScanResult struct {
+	Matched  bool   `json:"matched"`
+	RuleName string `json:"rule_name"`
+	RuleTags string `json:"rule_tags"`
+	Severity int    `json:"severity"`
+	FileHash string `json:"file_hash"`
+	ScanTime int64  `json:"scan_time_ms"`
+}
+
+func (ys *YaraScanner) ScanFile(filePath string) (*ScanResult, error) {
 	// TODO: Implement YARA scanning
 	ys.logger.Debug("YARA scan requested for: %s", filePath)
-	return nil, nil
+	return &ScanResult{Matched: false}, nil
 }
 
 func (ys *YaraScanner) ScanMemory(processID int) (*models.ThreatInfo, error) {

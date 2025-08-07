@@ -82,6 +82,8 @@ type MonitoringConfig struct {
 	Processes  ProcessConfig    `yaml:"processes"`
 	Network    NetworkConfig    `yaml:"network"`
 	Registry   RegistryConfig   `yaml:"registry"`
+	Memory     MemoryConfig     `yaml:"memory"`
+	Behavior   BehaviorConfig   `yaml:"behavior"`
 }
 
 type FileSystemConfig struct {
@@ -109,14 +111,43 @@ type NetworkConfig struct {
 	CapturePackets    bool  `yaml:"capture_packets"`     // Capture network packets
 	MonitorTCP        bool  `yaml:"monitor_tcp"`         // Monitor TCP connections
 	MonitorUDP        bool  `yaml:"monitor_udp"`         // Monitor UDP connections
+	ScanInterval      int   `yaml:"scan_interval"`       // Scan interval in seconds
 	ExcludePorts      []int `yaml:"exclude_ports"`       // Exclude local ports
+	SuspiciousPorts   []int `yaml:"suspicious_ports"`    // Suspicious ports to monitor
 }
 
 type RegistryConfig struct {
 	Enabled               bool     `yaml:"enabled"`                 // Windows only
 	MonitorAutostart      bool     `yaml:"monitor_autostart"`       // Monitor autostart entries
 	TrackSecuritySettings bool     `yaml:"track_security_settings"` // Track security settings
-	Keys                  []string `yaml:"keys"`                    // Registry keys to monitor
+	ScanInterval          int      `yaml:"scan_interval"`           // Scan interval in seconds
+	Paths                 []string `yaml:"paths"`                   // Registry paths to monitor
+}
+
+type MemoryConfig struct {
+	Enabled         bool    `yaml:"enabled"`          // Enable memory scanning
+	ScanInterval    int     `yaml:"scan_interval"`    // Scan interval in seconds
+	ThreatThreshold float64 `yaml:"threat_threshold"` // Minimum threat score to report
+	MaxProcesses    int     `yaml:"max_processes"`    // Maximum processes to scan
+	ScanPrivate     bool    `yaml:"scan_private"`     // Scan private memory regions
+	ScanExecutable  bool    `yaml:"scan_executable"`  // Scan executable memory
+	ScanWritable    bool    `yaml:"scan_writable"`    // Scan writable memory
+}
+
+type BehaviorConfig struct {
+	Enabled               bool    `yaml:"enabled"`                 // Enable behavior analysis
+	AnalysisInterval      int     `yaml:"analysis_interval"`       // Analysis interval in seconds
+	ThreatThreshold       float64 `yaml:"threat_threshold"`        // Minimum threat score to report
+	DataRetention         int     `yaml:"data_retention"`          // Data retention in hours
+	MaxChildProcesses     int     `yaml:"max_child_processes"`     // Max child processes per parent
+	MaxFileOperations     int     `yaml:"max_file_operations"`     // Max file operations per process
+	MaxNetworkConnections int     `yaml:"max_network_connections"` // Max network connections per process
+	MaxRegistryAccess     int     `yaml:"max_registry_access"`     // Max registry access per process
+	MaxMemoryOperations   int     `yaml:"max_memory_operations"`   // Max memory operations per process
+	MaxFileAccess         int     `yaml:"max_file_access"`         // Max file access per file
+	MaxFileModifications  int     `yaml:"max_file_modifications"`  // Max file modifications per file
+	MaxBytesSent          int64   `yaml:"max_bytes_sent"`          // Max bytes sent per connection
+	MaxBytesReceived      int64   `yaml:"max_bytes_received"`      // Max bytes received per connection
 }
 
 type YaraConfig struct {
@@ -220,13 +251,40 @@ func Load(configPath string) (*Config, error) {
 				CapturePackets:    viper.GetBool("monitoring.network.capture_packets"),
 				MonitorTCP:        viper.GetBool("monitoring.network.monitor_tcp"),
 				MonitorUDP:        viper.GetBool("monitoring.network.monitor_udp"),
+				ScanInterval:      viper.GetInt("monitoring.network.scan_interval"),
 				ExcludePorts:      viper.GetIntSlice("monitoring.network.exclude_ports"),
+				SuspiciousPorts:   viper.GetIntSlice("monitoring.network.suspicious_ports"),
 			},
 			Registry: RegistryConfig{
 				Enabled:               viper.GetBool("monitoring.registry.enabled"),
 				MonitorAutostart:      viper.GetBool("monitoring.registry.monitor_autostart"),
 				TrackSecuritySettings: viper.GetBool("monitoring.registry.track_security_settings"),
-				Keys:                  viper.GetStringSlice("monitoring.registry.keys"),
+				ScanInterval:          viper.GetInt("monitoring.registry.scan_interval"),
+				Paths:                 viper.GetStringSlice("monitoring.registry.paths"),
+			},
+			Memory: MemoryConfig{
+				Enabled:         viper.GetBool("monitoring.memory.enabled"),
+				ScanInterval:    viper.GetInt("monitoring.memory.scan_interval"),
+				ThreatThreshold: viper.GetFloat64("monitoring.memory.threat_threshold"),
+				MaxProcesses:    viper.GetInt("monitoring.memory.max_processes"),
+				ScanPrivate:     viper.GetBool("monitoring.memory.scan_private"),
+				ScanExecutable:  viper.GetBool("monitoring.memory.scan_executable"),
+				ScanWritable:    viper.GetBool("monitoring.memory.scan_writable"),
+			},
+			Behavior: BehaviorConfig{
+				Enabled:               viper.GetBool("monitoring.behavior.enabled"),
+				AnalysisInterval:      viper.GetInt("monitoring.behavior.analysis_interval"),
+				ThreatThreshold:       viper.GetFloat64("monitoring.behavior.threat_threshold"),
+				DataRetention:         viper.GetInt("monitoring.behavior.data_retention"),
+				MaxChildProcesses:     viper.GetInt("monitoring.behavior.max_child_processes"),
+				MaxFileOperations:     viper.GetInt("monitoring.behavior.max_file_operations"),
+				MaxNetworkConnections: viper.GetInt("monitoring.behavior.max_network_connections"),
+				MaxRegistryAccess:     viper.GetInt("monitoring.behavior.max_registry_access"),
+				MaxMemoryOperations:   viper.GetInt("monitoring.behavior.max_memory_operations"),
+				MaxFileAccess:         viper.GetInt("monitoring.behavior.max_file_access"),
+				MaxFileModifications:  viper.GetInt("monitoring.behavior.max_file_modifications"),
+				MaxBytesSent:          viper.GetInt64("monitoring.behavior.max_bytes_sent"),
+				MaxBytesReceived:      viper.GetInt64("monitoring.behavior.max_bytes_received"),
 			},
 		},
 		Yara: YaraConfig{
@@ -327,16 +385,41 @@ func setDefaults() {
 	viper.SetDefault("monitoring.network.capture_packets", false)
 	viper.SetDefault("monitoring.network.monitor_tcp", true)
 	viper.SetDefault("monitoring.network.monitor_udp", false)
+	viper.SetDefault("monitoring.network.scan_interval", 30)
 	viper.SetDefault("monitoring.network.exclude_ports", []int{135, 445, 5985})
+	viper.SetDefault("monitoring.network.suspicious_ports", []int{22, 23, 3389, 5900, 8080, 4444, 1337})
 
 	viper.SetDefault("monitoring.registry.enabled", true)
 	viper.SetDefault("monitoring.registry.monitor_autostart", true)
 	viper.SetDefault("monitoring.registry.track_security_settings", true)
-	viper.SetDefault("monitoring.registry.keys", []string{
+	viper.SetDefault("monitoring.registry.scan_interval", 30)
+	viper.SetDefault("monitoring.registry.paths", []string{
 		"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
 		"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
 		"HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
 	})
+
+	viper.SetDefault("monitoring.memory.enabled", true)
+	viper.SetDefault("monitoring.memory.scan_interval", 300)
+	viper.SetDefault("monitoring.memory.threat_threshold", 0.5)
+	viper.SetDefault("monitoring.memory.max_processes", 50)
+	viper.SetDefault("monitoring.memory.scan_private", true)
+	viper.SetDefault("monitoring.memory.scan_executable", true)
+	viper.SetDefault("monitoring.memory.scan_writable", true)
+
+	viper.SetDefault("monitoring.behavior.enabled", true)
+	viper.SetDefault("monitoring.behavior.analysis_interval", 60)
+	viper.SetDefault("monitoring.behavior.threat_threshold", 0.6)
+	viper.SetDefault("monitoring.behavior.data_retention", 24)
+	viper.SetDefault("monitoring.behavior.max_child_processes", 10)
+	viper.SetDefault("monitoring.behavior.max_file_operations", 50)
+	viper.SetDefault("monitoring.behavior.max_network_connections", 20)
+	viper.SetDefault("monitoring.behavior.max_registry_access", 30)
+	viper.SetDefault("monitoring.behavior.max_memory_operations", 15)
+	viper.SetDefault("monitoring.behavior.max_file_access", 100)
+	viper.SetDefault("monitoring.behavior.max_file_modifications", 20)
+	viper.SetDefault("monitoring.behavior.max_bytes_sent", 10485760)
+	viper.SetDefault("monitoring.behavior.max_bytes_received", 10485760)
 
 	// Yara defaults
 	viper.SetDefault("yara.enabled", true)
@@ -456,7 +539,8 @@ func CreateDefaultConfig(filePath string) error {
 				Enabled:               true,
 				MonitorAutostart:      true,
 				TrackSecuritySettings: true,
-				Keys: []string{
+				ScanInterval:          30,
+				Paths: []string{
 					"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
 					"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
 					"HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
@@ -581,7 +665,8 @@ func createDefaultConfig() *Config {
 				Enabled:               false,
 				MonitorAutostart:      false,
 				TrackSecuritySettings: false,
-				Keys:                  []string{},
+				ScanInterval:          30,
+				Paths:                 []string{},
 			},
 		},
 		Yara: YaraConfig{

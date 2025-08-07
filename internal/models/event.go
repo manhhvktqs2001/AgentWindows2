@@ -183,3 +183,47 @@ type MemoryEvent struct {
 	Size         int64  `json:"size"`
 	Protection   string `json:"protection"`
 }
+
+func (me *MemoryEvent) GetAgentID() string {
+	return me.AgentID
+}
+
+func (me *MemoryEvent) GetTimestamp() time.Time {
+	return me.Timestamp
+}
+
+func (me *MemoryEvent) GetType() string {
+	return me.EventType
+}
+
+func (me *MemoryEvent) ToJSON() []byte {
+	b, _ := json.Marshal(me)
+	return b
+}
+
+// BehaviorEvent represents a behavior analysis event
+type BehaviorEvent struct {
+	Event
+	ProcessID    uint32  `json:"process_id"`
+	ProcessName  string  `json:"process_name"`
+	BehaviorType string  `json:"behavior_type"`
+	ThreatScore  float64 `json:"threat_score"`
+	Description  string  `json:"description"`
+}
+
+func (be *BehaviorEvent) GetAgentID() string {
+	return be.AgentID
+}
+
+func (be *BehaviorEvent) GetTimestamp() time.Time {
+	return be.Timestamp
+}
+
+func (be *BehaviorEvent) GetType() string {
+	return be.EventType
+}
+
+func (be *BehaviorEvent) ToJSON() []byte {
+	b, _ := json.Marshal(be)
+	return b
+}

@@ -23,10 +23,12 @@ type Agent struct {
 	scanner      *scanner.YaraScanner
 
 	// Monitors
-	fileMonitor     *monitoring.FileMonitor
-	processMonitor  *monitoring.ProcessMonitor
-	networkMonitor  *monitoring.NetworkMonitor
-	registryMonitor *monitoring.RegistryMonitor
+	fileMonitor      *monitoring.FileMonitor
+	processMonitor   *monitoring.ProcessMonitor
+	networkMonitor   *monitoring.NetworkMonitor
+	registryMonitor  *monitoring.RegistryMonitor
+	memoryScanner    *monitoring.MemoryScanner
+	behaviorAnalyzer *monitoring.BehaviorAnalyzer
 
 	// Response System
 	responseManager *response.ResponseManager
@@ -72,23 +74,27 @@ func NewAgent(cfg *config.Config, logger *utils.Logger) (*Agent, error) {
 	processMonitor := monitoring.NewProcessMonitor(&cfg.Monitoring.Processes, logger)
 	networkMonitor := monitoring.NewNetworkMonitor(&cfg.Monitoring.Network, logger)
 	registryMonitor := monitoring.NewRegistryMonitor(&cfg.Monitoring.Registry, logger)
+	memoryScanner := monitoring.NewMemoryScanner(&cfg.Monitoring.Memory, logger)
+	behaviorAnalyzer := monitoring.NewBehaviorAnalyzer(&cfg.Monitoring.Behavior, logger)
 
 	// Initialize Response Manager
 	responseManager := response.NewResponseManager(&cfg.Response, logger, serverClient)
 
 	agent := &Agent{
-		config:          cfg,
-		logger:          logger,
-		serverClient:    serverClient,
-		scanner:         yaraScanner,
-		fileMonitor:     fileMonitor,
-		processMonitor:  processMonitor,
-		networkMonitor:  networkMonitor,
-		registryMonitor: registryMonitor,
-		responseManager: responseManager,
-		stopChan:        make(chan bool),
-		eventChan:       make(chan Event, cfg.Agent.MaxQueueSize),
-		taskChan:        make(chan Task, 100),
+		config:           cfg,
+		logger:           logger,
+		serverClient:     serverClient,
+		scanner:          yaraScanner,
+		fileMonitor:      fileMonitor,
+		processMonitor:   processMonitor,
+		networkMonitor:   networkMonitor,
+		registryMonitor:  registryMonitor,
+		memoryScanner:    memoryScanner,
+		behaviorAnalyzer: behaviorAnalyzer,
+		responseManager:  responseManager,
+		stopChan:         make(chan bool),
+		eventChan:        make(chan Event, cfg.Agent.MaxQueueSize),
+		taskChan:         make(chan Task, 100),
 	}
 
 	// Kết nối YARA scanner với server client để gửi alert
@@ -207,6 +213,8 @@ func (a *Agent) Start() error {
 	if a.config.Monitoring.FileSystem.Enabled {
 		// Set agent ID for file monitor
 		a.fileMonitor.SetAgentID(a.config.Agent.ID)
+		// Set YARA scanner for file monitor
+		a.fileMonitor.SetScanner(a.scanner)
 		err = a.fileMonitor.Start()
 		if err != nil {
 			a.logger.Error("Failed to start file monitor: %v", err)
@@ -264,6 +272,36 @@ func (a *Agent) Start() error {
 		}()
 	}
 
+	if a.config.Monitoring.Memory.Enabled {
+		// Set agent ID for memory scanner
+		a.memoryScanner.SetAgentID(a.config.Agent.ID)
+		err = a.memoryScanner.Start()
+		if err != nil {
+			a.logger.Error("Failed to start memory scanner: %v", err)
+		}
+		// Forward memory events to agent eventChan
+		go func() {
+			for event := range a.memoryScanner.GetEventChannel() {
+				a.RegisterEvent(&event)
+			}
+		}()
+	}
+
+	if a.config.Monitoring.Behavior.Enabled {
+		// Set agent ID for behavior analyzer
+		a.behaviorAnalyzer.SetAgentID(a.config.Agent.ID)
+		err = a.behaviorAnalyzer.Start()
+		if err != nil {
+			a.logger.Error("Failed to start behavior analyzer: %v", err)
+		}
+		// Forward behavior events to agent eventChan
+		go func() {
+			for event := range a.behaviorAnalyzer.GetEventChannel() {
+				a.RegisterEvent(&event)
+			}
+		}()
+	}
+
 	// Start background workers
 	go a.heartbeatWorker()
 	go a.eventWorker()
@@ -296,6 +334,8 @@ func (a *Agent) Stop() {
 	a.processMonitor.Stop()
 	a.networkMonitor.Stop()
 	a.registryMonitor.Stop()
+	a.memoryScanner.Stop()
+	a.behaviorAnalyzer.Stop()
 
 	a.isRunning = false
 	a.logger.Info("EDR Agent stopped")
