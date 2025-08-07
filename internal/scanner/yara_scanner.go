@@ -51,9 +51,17 @@ func NewYaraScanner(cfg *config.YaraConfig, logger *utils.Logger) *YaraScanner {
 
 	// Load YARA rules nếu enabled
 	if cfg.Enabled {
-		err := scanner.LoadRules()
+		// First try to load static rules
+		err := scanner.LoadStaticRules()
 		if err != nil {
-			logger.Error("Failed to load YARA rules: %v", err)
+			logger.Warn("Failed to load static rules: %v", err)
+			// Fallback to file-based rules
+			err = scanner.LoadRules()
+			if err != nil {
+				logger.Error("Failed to load YARA rules: %v", err)
+			}
+		} else {
+			logger.Info("Static YARA rules loaded successfully")
 		}
 	}
 
@@ -532,7 +540,8 @@ func (ys *YaraScanner) getRuleSeverity(ruleName string) int {
 	if strings.Contains(ruleNameLower, "ransomware") ||
 		strings.Contains(ruleNameLower, "backdoor") ||
 		strings.Contains(ruleNameLower, "rootkit") ||
-		strings.Contains(ruleNameLower, "eicar") {
+		strings.Contains(ruleNameLower, "eicar") ||
+		strings.Contains(ruleNameLower, "exploit") {
 		return 5
 	}
 
@@ -541,7 +550,9 @@ func (ys *YaraScanner) getRuleSeverity(ruleName string) int {
 		strings.Contains(ruleNameLower, "keylogger") ||
 		strings.Contains(ruleNameLower, "spyware") ||
 		strings.Contains(ruleNameLower, "worm") ||
-		strings.Contains(ruleNameLower, "rat") {
+		strings.Contains(ruleNameLower, "rat") ||
+		strings.Contains(ruleNameLower, "webshell") ||
+		strings.Contains(ruleNameLower, "wshell") {
 		return 4
 	}
 
@@ -549,13 +560,16 @@ func (ys *YaraScanner) getRuleSeverity(ruleName string) int {
 	if strings.Contains(ruleNameLower, "adware") ||
 		strings.Contains(ruleNameLower, "pup") ||
 		strings.Contains(ruleNameLower, "suspicious") ||
-		strings.Contains(ruleNameLower, "malware") {
+		strings.Contains(ruleNameLower, "malware") ||
+		strings.Contains(ruleNameLower, "malw") {
 		return 3
 	}
 
 	// Low severity (2) - Minor threats
 	if strings.Contains(ruleNameLower, "toolkit") ||
-		strings.Contains(ruleNameLower, "packer") {
+		strings.Contains(ruleNameLower, "packer") ||
+		strings.Contains(ruleNameLower, "crypto") ||
+		strings.Contains(ruleNameLower, "capabilities") {
 		return 2
 	}
 
@@ -568,9 +582,9 @@ func (ys *YaraScanner) getThreatType(tags []string) string {
 	for _, tag := range tags {
 		tagLower := strings.ToLower(tag)
 		switch tagLower {
-		case "malware", "virus", "trojan":
+		case "malware", "virus", "trojan", "malw":
 			return "malware"
-		case "ransomware":
+		case "ransomware", "ransom":
 			return "ransomware"
 		case "backdoor":
 			return "backdoor"
@@ -580,6 +594,20 @@ func (ys *YaraScanner) getThreatType(tags []string) string {
 			return "adware"
 		case "rootkit":
 			return "rootkit"
+		case "webshell", "wshell":
+			return "webshell"
+		case "rat":
+			return "rat"
+		case "exploit":
+			return "exploit"
+		case "crypto":
+			return "cryptominer"
+		case "packer":
+			return "packer"
+		case "toolkit":
+			return "toolkit"
+		case "capabilities":
+			return "capability"
 		}
 	}
 	return "malware" // Default
@@ -609,4 +637,138 @@ func (ys *YaraScanner) GetRulesInfo() map[string]interface{} {
 	}
 
 	return info
+}
+
+// LoadStaticRules load rules tĩnh trực tiếp vào code
+func (ys *YaraScanner) LoadStaticRules() error {
+	ys.logger.Info("Loading static YARA rules...")
+
+	// Compile rules from static content
+	compiler, err := yara.NewCompiler()
+	if err != nil {
+		return fmt.Errorf("failed to create YARA compiler: %w", err)
+	}
+	defer compiler.Destroy()
+
+	// Add static rules
+	staticRules := []string{
+		// Critical threats
+		`rule EICAR_Static {
+			meta:
+				description = "EICAR Standard Anti-Virus Test File - Static"
+				author = "EDR System"
+				severity = 5
+				threat_type = "test"
+				tags = "test eicar static"
+			
+			strings:
+				$eicar_string = "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*" fullword ascii
+			
+			condition:
+				$eicar_string
+		}`,
+
+		// Ransomware patterns
+		`rule Ransomware_Static {
+			meta:
+				description = "Ransomware detection patterns - Static"
+				author = "EDR System"
+				severity = 5
+				threat_type = "ransomware"
+				tags = "ransomware static"
+			
+			strings:
+				$encrypt_string = "encrypt" nocase
+				$ransom_string = "ransom" nocase
+				$bitcoin_string = "bitcoin" nocase
+				$payment_string = "payment" nocase
+				$decrypt_string = "decrypt" nocase
+			
+			condition:
+				2 of them
+		}`,
+
+		// Malware patterns
+		`rule Malware_Static {
+			meta:
+				description = "Malware detection patterns - Static"
+				author = "EDR System"
+				severity = 3
+				threat_type = "malware"
+				tags = "malware static"
+			
+			strings:
+				$malware_string = "This is a test malware file for EDR testing" nocase
+				$virus_string = "virus" nocase
+				$trojan_string = "trojan" nocase
+			
+			condition:
+				1 of them
+		}`,
+
+		// WebShell patterns
+		`rule WebShell_Static {
+			meta:
+				description = "WebShell detection patterns - Static"
+				author = "EDR System"
+				severity = 4
+				threat_type = "webshell"
+				tags = "webshell static"
+			
+			strings:
+				$eval_string = "eval(" nocase
+				$exec_string = "exec(" nocase
+				$system_string = "system(" nocase
+				$shell_string = "shell_exec" nocase
+			
+			condition:
+				1 of them
+		}`,
+
+		// RAT patterns
+		`rule RAT_Static {
+			meta:
+				description = "Remote Access Trojan patterns - Static"
+				author = "EDR System"
+				severity = 4
+				threat_type = "rat"
+				tags = "rat static"
+			
+			strings:
+				$rat_string = "remote access" nocase
+				$backdoor_string = "backdoor" nocase
+				$keylogger_string = "keylogger" nocase
+			
+			condition:
+				1 of them
+		}`,
+	}
+
+	rulesLoaded := 0
+	for i, rule := range staticRules {
+		err := compiler.AddString(rule, fmt.Sprintf("static_rule_%d", i))
+		if err != nil {
+			ys.logger.Error("Failed to compile static rule %d: %v", i, err)
+			continue
+		}
+		rulesLoaded++
+	}
+
+	ys.logger.Info("Loaded %d static YARA rules", rulesLoaded)
+
+	if rulesLoaded == 0 {
+		return fmt.Errorf("no static rules loaded")
+	}
+
+	// Get compiled rules
+	ys.rulesMu.Lock()
+	defer ys.rulesMu.Unlock()
+
+	ys.rules, err = compiler.GetRules()
+	if err != nil {
+		return fmt.Errorf("failed to compile static YARA rules: %w", err)
+	}
+
+	ys.logger.Info("Static YARA rules loaded successfully")
+	return nil
 }

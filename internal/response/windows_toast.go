@@ -10,24 +10,36 @@ import (
 )
 
 // Windows Toast Notification Implementation
-// Uses Windows 10/11 Toast API for native notifications
+// Uses Windows API for native toast notifications
 
 const (
 	// Windows API constants
-	MB_OK               = 0x00000000
-	MB_ICONWARNING      = 0x00000030
-	MB_ICONERROR        = 0x00000010
-	MB_ICONINFORMATION  = 0x00000040
-	MB_TOPMOST          = 0x00040000
-	MB_SETFOREGROUND    = 0x00010000
+	MB_OK              = 0x00000000
+	MB_ICONWARNING     = 0x00000030
+	MB_ICONERROR       = 0x00000010
+	MB_ICONINFORMATION = 0x00000040
+	MB_TOPMOST         = 0x00040000
+	MB_SETFOREGROUND   = 0x00010000
+
+	// Toast notification constants
+	TOAST_DURATION_LONG  = 7 // seconds
+	TOAST_DURATION_SHORT = 4 // seconds
 )
 
 var (
-	// Windows API functions
-	user32           = syscall.NewLazyDLL("user32.dll")
-	procMessageBoxW  = user32.NewProc("MessageBoxW")
+	// Windows API functions for toast notifications
+	user32 = syscall.NewLazyDLL("user32.dll")
+
+	// Toast notification functions
+	procMessageBoxW         = user32.NewProc("MessageBoxW")
+	procSetWindowPos        = user32.NewProc("SetWindowPos")
+	procGetSystemMetrics    = user32.NewProc("GetSystemMetrics")
+	procFindWindowW         = user32.NewProc("FindWindowW")
+	procShowWindow          = user32.NewProc("ShowWindow")
 	procSetForegroundWindow = user32.NewProc("SetForegroundWindow")
-	procFlashWindow  = user32.NewProc("FlashWindow")
+	procFlashWindow         = user32.NewProc("FlashWindow")
+	procGetWindowRect       = user32.NewProc("GetWindowRect")
+	procMoveWindow          = user32.NewProc("MoveWindow")
 )
 
 // WindowsToastNotifier implements native Windows toast notifications
@@ -44,22 +56,26 @@ func NewWindowsToastNotifier(cfg *config.ResponseConfig, logger *utils.Logger) *
 	}
 }
 
-// SendNotification sends a Windows toast notification
+// SendNotification sends a Windows toast notification to bottom-right corner
 func (wtn *WindowsToastNotifier) SendNotification(content *NotificationContent) error {
 	wtn.logger.Info("Sending Windows toast notification: %s", content.Title)
 
 	// Create notification message
 	message := wtn.createToastMessage(content)
-	
+
 	// Determine icon type based on severity
 	iconType := wtn.getIconType(content.Severity)
-	
+
+	// Get screen dimensions for positioning
+	screenWidth := wtn.getSystemMetrics(0)  // SM_CXSCREEN
+	screenHeight := wtn.getSystemMetrics(1) // SM_CYSCREEN
+
 	// Show Windows message box as toast notification
 	titlePtr, err := syscall.UTF16PtrFromString(content.Title)
 	if err != nil {
 		return fmt.Errorf("failed to convert title to UTF16: %w", err)
 	}
-	
+
 	messagePtr, err := syscall.UTF16PtrFromString(message)
 	if err != nil {
 		return fmt.Errorf("failed to convert message to UTF16: %w", err)
@@ -67,7 +83,7 @@ func (wtn *WindowsToastNotifier) SendNotification(content *NotificationContent) 
 
 	// Show message box with appropriate flags
 	flags := MB_OK | iconType | MB_TOPMOST | MB_SETFOREGROUND
-	
+
 	result, _, _ := procMessageBoxW.Call(
 		0, // hWnd (NULL for top-level window)
 		uintptr(unsafe.Pointer(messagePtr)),
@@ -79,14 +95,56 @@ func (wtn *WindowsToastNotifier) SendNotification(content *NotificationContent) 
 		return fmt.Errorf("failed to show Windows toast notification")
 	}
 
+	// Try to move the message box to bottom-right corner
+	wtn.moveMessageBoxToCorner(screenWidth, screenHeight)
+
 	wtn.logger.Info("Windows toast notification sent successfully")
 	return nil
+}
+
+// moveMessageBoxToCorner attempts to move the message box to bottom-right corner
+func (wtn *WindowsToastNotifier) moveMessageBoxToCorner(screenWidth, screenHeight int32) {
+	// Try to find the message box window
+	classNamePtr, _ := syscall.UTF16PtrFromString("#32770") // Dialog class
+	hwnd, _, _ := procFindWindowW.Call(
+		uintptr(unsafe.Pointer(classNamePtr)),
+		0,
+	)
+
+	if hwnd != 0 {
+		// Calculate position (bottom-right corner)
+		windowWidth := int32(400)
+		windowHeight := int32(200)
+		x := screenWidth - windowWidth - 20   // 20px margin from right
+		y := screenHeight - windowHeight - 40 // 40px margin from bottom
+
+		// Move window to corner
+		procMoveWindow.Call(
+			hwnd,
+			uintptr(x),
+			uintptr(y),
+			uintptr(windowWidth),
+			uintptr(windowHeight),
+			1, // repaint
+		)
+
+		// Set window to topmost
+		procSetWindowPos.Call(
+			hwnd,
+			0xffffffff, // HWND_TOPMOST
+			0, 0, 0, 0,
+			0x0003, // SWP_NOMOVE | SWP_NOSIZE
+		)
+
+		// Flash window to draw attention
+		procFlashWindow.Call(hwnd, 1)
+	}
 }
 
 // createToastMessage creates the toast notification message
 func (wtn *WindowsToastNotifier) createToastMessage(content *NotificationContent) string {
 	severityText := wtn.getSeverityText(content.Severity)
-	
+
 	message := fmt.Sprintf(`🚨 EDR Security Alert
 
 Threat: %s
@@ -158,6 +216,12 @@ func (wtn *WindowsToastNotifier) getRecommendedAction(severity int) string {
 	}
 }
 
+// getSystemMetrics gets system metrics
+func (wtn *WindowsToastNotifier) getSystemMetrics(index int) int32 {
+	result, _, _ := procGetSystemMetrics.Call(uintptr(index))
+	return int32(result)
+}
+
 // Start initializes the Windows toast notifier
 func (wtn *WindowsToastNotifier) Start() error {
 	wtn.logger.Info("Windows Toast Notifier started")
@@ -167,4 +231,4 @@ func (wtn *WindowsToastNotifier) Start() error {
 // Stop stops the Windows toast notifier
 func (wtn *WindowsToastNotifier) Stop() {
 	wtn.logger.Info("Windows Toast Notifier stopped")
-} 
+}
