@@ -269,13 +269,23 @@ func (pm *ProcessMonitor) handleNewProcess(processID, parentProcessID uint32, pr
 
 // getProcessInfo gets detailed information about a process
 func (pm *ProcessMonitor) getProcessInfo(processID uint32) (*ProcessInfo, error) {
+	// Try with limited information first (for system processes)
 	handle, err := windows.OpenProcess(
-		windows.PROCESS_QUERY_INFORMATION|windows.PROCESS_VM_READ,
+		windows.PROCESS_QUERY_LIMITED_INFORMATION,
 		false,
 		processID,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open process: %w", err)
+		// If limited access fails, try with full access
+		handle, err = windows.OpenProcess(
+			windows.PROCESS_QUERY_INFORMATION|windows.PROCESS_VM_READ,
+			false,
+			processID,
+		)
+		if err != nil {
+			pm.logger.Warn("Failed to get process info for %s (PID: %d): %v", pm.getProcessName(processID), processID, err)
+			return nil, fmt.Errorf("failed to open process: %w", err)
+		}
 	}
 	defer windows.CloseHandle(handle)
 

@@ -157,8 +157,9 @@ type YaraConfig struct {
 	RulesSource    string   `yaml:"rules_source"`
 	Categories     []string `yaml:"categories"`
 	MaxScanThreads int      `yaml:"max_scan_threads"`
-	ScanTimeout    int      `yaml:"scan_timeout"`
+	ScanTimeout    int      `yaml:"scan_timeout"` // seconds
 	RulesPath      string   `yaml:"rules_path"`
+	MaxFileSize    string   `yaml:"max_file_size"` // e.g., "100MB"
 }
 
 type LogConfig struct {
@@ -296,6 +297,7 @@ func Load(configPath string) (*Config, error) {
 			MaxScanThreads: viper.GetInt("yara.max_scan_threads"),
 			ScanTimeout:    viper.GetInt("yara.scan_timeout"),
 			RulesPath:      viper.GetString("yara.rules_path"),
+			MaxFileSize:    viper.GetString("yara.max_file_size"),
 		},
 		Response: ResponseConfig{
 			NotificationSettings: NotificationSettings{
@@ -421,15 +423,16 @@ func setDefaults() {
 	viper.SetDefault("monitoring.behavior.max_bytes_sent", 10485760)
 	viper.SetDefault("monitoring.behavior.max_bytes_received", 10485760)
 
-	// Yara defaults
+	// YARA defaults
 	viper.SetDefault("yara.enabled", true)
-	viper.SetDefault("yara.auto_update", true)
+	viper.SetDefault("yara.auto_update", false)
 	viper.SetDefault("yara.update_interval", "24h")
-	viper.SetDefault("yara.rules_source", "local")
+	viper.SetDefault("yara.rules_source", "https://github.com/Yara-Rules/rules/archive/master.zip")
 	viper.SetDefault("yara.categories", []string{"malware", "backdoor", "trojan", "ransomware"})
 	viper.SetDefault("yara.max_scan_threads", 4)
 	viper.SetDefault("yara.scan_timeout", 30)
 	viper.SetDefault("yara.rules_path", "yara-rules")
+	viper.SetDefault("yara.max_file_size", "100MB")
 
 	// Response defaults
 	viper.SetDefault("response.notification_settings.toast_enabled", true)
@@ -678,6 +681,7 @@ func createDefaultConfig() *Config {
 			MaxScanThreads: 1,
 			ScanTimeout:    30,
 			RulesPath:      "",
+			MaxFileSize:    "100MB",
 		},
 		Response: ResponseConfig{
 			NotificationSettings: NotificationSettings{

@@ -303,6 +303,14 @@ func (fm *FileMonitor) processFileEvent(filePath string, action uint32) {
 					return
 				}
 				if result != nil && result.Matched {
+					// Print alert directly to terminal
+					fmt.Printf("\n🔍 FILE MONITOR: YARA threat detected!\n")
+					fmt.Printf("File: %s\n", filePath)
+					fmt.Printf("Action: %s\n", fm.determineAction(action))
+					fmt.Printf("Rule: %s\n", result.RuleName)
+					fmt.Printf("Severity: %d\n", result.Severity)
+					fmt.Printf("🔍 END FILE MONITOR ALERT\n\n")
+
 					fm.logger.Warn("YARA threat detected: %s -> %s", filePath, result.RuleName)
 				}
 			}()

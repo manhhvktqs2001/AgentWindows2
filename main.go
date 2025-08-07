@@ -1,12 +1,13 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
@@ -16,6 +17,13 @@ import (
 	"edr-agent-windows/internal/config"
 	"edr-agent-windows/internal/service"
 	"edr-agent-windows/internal/utils"
+
+	"io"
+	"net/http"
+	"sort"
+
+	"encoding/json"
+	"net"
 
 	"golang.org/x/sys/windows"
 )
@@ -38,10 +46,28 @@ func requestAdminPrivileges() error {
 	cwd, _ := os.Getwd()
 	args := os.Args[1:]
 
+	// Check if we're running from go run (temporary executable)
+	if strings.Contains(exe, "go-build") || strings.Contains(exe, "Temp") {
+		fmt.Println("⚠️  Detected go run mode - building executable first...")
+
+		// Build the executable
+		buildCmd := exec.Command("go", "build", "-o", "edr-agent.exe", ".")
+		buildCmd.Dir = cwd
+		buildCmd.Stdout = os.Stdout
+		buildCmd.Stderr = os.Stderr
+
+		if err := buildCmd.Run(); err != nil {
+			return fmt.Errorf("failed to build executable: %w", err)
+		}
+
+		// Use the built executable
+		exe = filepath.Join(cwd, "edr-agent.exe")
+	}
+
 	verbPtr, _ := windows.UTF16PtrFromString(verb)
 	exePtr, _ := windows.UTF16PtrFromString(exe)
 	cwdPtr, _ := windows.UTF16PtrFromString(cwd)
-	argPtr, _ := windows.UTF16PtrFromString(fmt.Sprintf("%s %s", exe, strings.Join(args, " ")))
+	argPtr, _ := windows.UTF16PtrFromString(strings.Join(args, " "))
 
 	var showCmd int32 = 1 //SW_NORMAL
 
@@ -82,6 +108,8 @@ func main() {
 		reset       = flag.Bool("reset", false, "Reset agent registration (force new registration)")
 		updateRules = flag.Bool("update-rules", false, "Update YARA rules")
 		report      = flag.Bool("report", false, "Generate system report")
+		testYara    = flag.String("test-yara", "", "Test YARA scanning on specific file")
+		console     = flag.Bool("console", false, "Run in console mode (not as service)")
 	)
 	flag.Parse()
 
@@ -175,6 +203,13 @@ func main() {
 
 	// Initialize logger
 	logger := utils.NewLogger(&cfg.Log)
+	defer logger.Close()
+
+	// Test YARA functionality if requested
+	if *testYara != "" {
+		testYaraScanning(*testYara, cfg, logger)
+		return
+	}
 
 	// Log startup information
 	logger.Info("=== EDR Agent Windows Starting ===")
@@ -190,6 +225,34 @@ func main() {
 	logger.Info("  - Registry: %v", cfg.Monitoring.Registry.Enabled)
 	logger.Info("YARA Enabled: %v", cfg.Yara.Enabled)
 
+	// Show loaded YARA rules
+	rules, err := filepath.Glob(filepath.Join(cfg.Yara.RulesPath, "**/*.yar"))
+	if err != nil {
+		// Fallback to simple glob if recursive not supported
+		rules, err = filepath.Glob(filepath.Join(cfg.Yara.RulesPath, "*.yar"))
+		if err != nil {
+			logger.Error("Failed to list YARA rules: %v", err)
+			fmt.Printf("Failed to list YARA rules: %v\n", err)
+		}
+	}
+	if err == nil {
+		// Sort rules for better display
+		sort.Slice(rules, func(i, j int) bool {
+			return rules[i] < rules[j]
+		})
+
+		logger.Info("Loaded %d YARA rule files:", len(rules))
+		fmt.Printf("\n=== Loaded %d YARA rule files ===\n", len(rules))
+		for i, rule := range rules {
+			// Get relative path from rules directory
+			relPath, _ := filepath.Rel(cfg.Yara.RulesPath, rule)
+			content, _ := os.ReadFile(rule)
+			logger.Info("   %d. %s (%d bytes)", i+1, relPath, len(content))
+			fmt.Printf("   %d. %s (%d bytes)\n", i+1, relPath, len(content))
+		}
+		fmt.Println("")
+	}
+
 	// Create agent
 	agentInstance, err := agent.NewAgent(cfg, logger)
 	if err != nil {
@@ -197,58 +260,286 @@ func main() {
 		log.Fatalf("Failed to create agent: %v", err)
 	}
 
-	// Check if running as service
-	if service.IsRunningAsService() {
+	// Determine run mode
+	if service.IsRunningAsService() && !*console {
+		// Run as Windows service
 		logger.Info("🔧 Running as Windows service")
 		if err := service.Run(agentInstance); err != nil {
 			logger.Error("Service failed: %v", err)
 			os.Exit(1)
 		}
 	} else {
-		logger.Info("💻 Running as console application")
+		// Run in console mode
+		logger.Info("💻 Running in console mode")
 
-		// Create context for graceful shutdown
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
-		// Handle shutdown signals
-		sigChan := make(chan os.Signal, 1)
-		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-		// Start agent in goroutine
-		go func() {
-			if err := agentInstance.Start(); err != nil {
-				logger.Error("Failed to start agent: %v", err)
-				cancel()
-			}
-		}()
-
-		// Wait for startup
-		time.Sleep(2 * time.Second)
-
-		fmt.Println("✅ EDR Agent started successfully")
-		fmt.Println("📡 Agent is running and connected to server")
-		fmt.Println("🔄 Heartbeat interval:", cfg.Agent.HeartbeatInterval, "seconds")
-		fmt.Println("📊 Monitoring active:")
-		fmt.Printf("   - File System: %v\n", cfg.Monitoring.FileSystem.Enabled)
-		fmt.Printf("   - Processes: %v\n", cfg.Monitoring.Processes.Enabled)
-		fmt.Printf("   - Network: %v\n", cfg.Monitoring.Network.Enabled)
-		fmt.Printf("   - Registry: %v\n", cfg.Monitoring.Registry.Enabled)
-		fmt.Printf("   - YARA Rules: %v\n", cfg.Yara.Enabled)
-		fmt.Println("Press Ctrl+C to stop...")
-
-		// Wait for shutdown signal
-		select {
-		case <-sigChan:
-			logger.Info("🛑 Received shutdown signal")
-		case <-ctx.Done():
-			logger.Info("🛑 Agent stopped")
+		// Start agent
+		if err := agentInstance.Start(); err != nil {
+			logger.Error("Failed to start agent: %v", err)
+			log.Fatalf("Failed to start agent: %v", err)
 		}
 
-		fmt.Println("\n🛑 Shutting down agent...")
+		logger.Info("✅ EDR Agent started successfully")
+		logger.Info("Press Ctrl+C to stop")
+
+		// Wait for interrupt signal
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+		<-sigChan
+
+		logger.Info("Shutting down...")
 		agentInstance.Stop()
-		logger.Info("EDR Agent stopped")
+		logger.Info("✅ EDR Agent stopped")
 	}
+}
+
+// testYaraScanning tests YARA scanning functionality
+func testYaraScanning(filePath string, cfg *config.Config, logger *utils.Logger) {
+	fmt.Printf("🔍 Testing YARA scanning on: %s\n", filePath)
+
+	// Check if file exists
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		fmt.Printf("❌ File not found: %s\n", filePath)
+		return
+	}
+
+	// Create YARA scanner
+	scanner := createYaraScanner(cfg, logger)
+
+	// Scan file
+	if s, ok := scanner.(interface {
+		ScanFile(string) (*scanResult, error)
+	}); ok {
+		result, err := s.ScanFile(filePath)
+		if err != nil {
+			fmt.Printf("❌ Scan failed: %v\n", err)
+			return
+		}
+
+		// Display results
+		fmt.Printf("\n=== YARA Scan Results ===\n")
+		fmt.Printf("File: %s\n", result.FilePath)
+		fmt.Printf("Matched: %v\n", result.Matched)
+
+		if result.Matched {
+			fmt.Printf("🚨 THREAT DETECTED!\n")
+			fmt.Printf("Rule: %s\n", result.RuleName)
+			fmt.Printf("Severity: %d\n", result.Severity)
+			fmt.Printf("Tags: %v\n", result.RuleTags)
+			fmt.Printf("Description: %s\n", result.Description)
+			fmt.Printf("File Hash: %s\n", result.FileHash)
+		} else {
+			fmt.Printf("✅ File is clean\n")
+		}
+
+		fmt.Printf("Scan Time: %dms\n", result.ScanTime)
+		fmt.Printf("File Size: %d bytes\n", result.FileSize)
+	} else {
+		fmt.Printf("❌ Scanner does not support ScanFile method\n")
+	}
+}
+
+// createYaraScanner creates and configures YARA scanner for testing
+func createYaraScanner(cfg *config.Config, logger *utils.Logger) interface{} {
+	// Import scanner package functions
+	scanner := newYaraScanner(&cfg.Yara, logger)
+
+	// Load rules
+	if err := loadRules(scanner); err != nil {
+		logger.Error("Failed to load YARA rules: %v", err)
+		fmt.Printf("⚠️  Warning: Failed to load YARA rules: %v\n", err)
+		fmt.Printf("Creating test rules...\n")
+		createTestRules(cfg.Yara.RulesPath)
+		loadRules(scanner)
+	}
+
+	return scanner
+}
+
+// createTestRules creates test rules for demonstration
+func createTestRules(rulesPath string) {
+	// Create rules directory
+	if err := os.MkdirAll(rulesPath, 0755); err != nil {
+		fmt.Printf("Failed to create rules directory: %v\n", err)
+		return
+	}
+
+	// Create test malware file for demonstration
+	testFile := "test_malware.txt"
+	testContent := "This is a test malware file for EDR testing"
+
+	if err := os.WriteFile(testFile, []byte(testContent), 0644); err != nil {
+		fmt.Printf("Failed to create test file: %v\n", err)
+	} else {
+		fmt.Printf("📁 Created test file: %s\n", testFile)
+		fmt.Printf("💡 You can test with: go run main.go -test-yara %s\n", testFile)
+	}
+
+	// Create EICAR test file
+	eicarContent := `X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*`
+	eicarFile := "eicar_test.txt"
+
+	if err := os.WriteFile(eicarFile, []byte(eicarContent), 0644); err != nil {
+		fmt.Printf("Failed to create EICAR test file: %v\n", err)
+	} else {
+		fmt.Printf("📁 Created EICAR test file: %s\n", eicarFile)
+		fmt.Printf("💡 You can test with: go run main.go -test-yara %s\n", eicarFile)
+	}
+
+	fmt.Printf("✅ Test files created successfully\n")
+}
+
+// Helper functions to work with scanner interface
+func newYaraScanner(cfg *config.YaraConfig, logger *utils.Logger) interface{} {
+	// This would call the actual scanner.NewYaraScanner
+	// For now, return a placeholder
+	return &yaraTestScanner{cfg: cfg, logger: logger}
+}
+
+func loadRules(scanner interface{}) error {
+	if s, ok := scanner.(interface{ LoadRules() error }); ok {
+		return s.LoadRules()
+	}
+	return fmt.Errorf("scanner does not support LoadRules")
+}
+
+// Temporary scanner interface for testing
+type yaraTestScanner struct {
+	cfg    *config.YaraConfig
+	logger *utils.Logger
+}
+
+func (s *yaraTestScanner) LoadRules() error {
+	s.logger.Info("Loading YARA rules from: %s", s.cfg.RulesPath)
+
+	// List all rules in the directory and subdirectories
+	rules, err := filepath.Glob(filepath.Join(s.cfg.RulesPath, "**/*.yar"))
+	if err != nil {
+		// Fallback to simple glob if recursive not supported
+		rules, err = filepath.Glob(filepath.Join(s.cfg.RulesPath, "*.yar"))
+		if err != nil {
+			return fmt.Errorf("failed to list rules: %w", err)
+		}
+	}
+
+	s.logger.Info("Found %d YARA rule files", len(rules))
+	for i, rule := range rules {
+		relPath, _ := filepath.Rel(s.cfg.RulesPath, rule)
+		content, _ := os.ReadFile(rule)
+		s.logger.Info("Rule %d: %s (%d bytes)", i+1, relPath, len(content))
+	}
+
+	return nil
+}
+
+func (s *yaraTestScanner) ScanFile(filePath string) (*scanResult, error) {
+	// Read the file to scan
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, err
+	}
+
+	result := &scanResult{
+		FilePath: filePath,
+		Matched:  false,
+		FileSize: int64(len(content)),
+		ScanTime: time.Now().UnixMilli(),
+	}
+
+	contentStr := string(content)
+
+	// Load and parse YARA rules from all subdirectories
+	rules, err := filepath.Glob(filepath.Join(s.cfg.RulesPath, "**/*.yar"))
+	if err != nil {
+		// Fallback to simple glob if recursive not supported
+		rules, err = filepath.Glob(filepath.Join(s.cfg.RulesPath, "*.yar"))
+		if err != nil {
+			return nil, fmt.Errorf("failed to list rules: %w", err)
+		}
+	}
+
+	s.logger.Info("Scanning file %s against %d YARA rules", filePath, len(rules))
+
+	// Simple rule parsing and matching
+	for _, rulePath := range rules {
+		ruleContent, err := os.ReadFile(rulePath)
+		if err != nil {
+			continue
+		}
+
+		lines := strings.Split(string(ruleContent), "\n")
+
+		// Extract rule name and patterns
+		var ruleDisplayName string
+		var patterns []string
+
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "rule ") {
+				parts := strings.Fields(line)
+				if len(parts) >= 2 {
+					ruleDisplayName = parts[1]
+				}
+			} else if strings.Contains(line, "$") && strings.Contains(line, "=") {
+				// Extract string pattern
+				if strings.Contains(line, "=") {
+					parts := strings.Split(line, "=")
+					if len(parts) >= 2 {
+						pattern := strings.Trim(strings.TrimSpace(parts[1]), `"`)
+						patterns = append(patterns, pattern)
+					}
+				}
+			}
+		}
+
+		// Check if any pattern matches
+		for _, pattern := range patterns {
+			if contains(contentStr, pattern) {
+				result.Matched = true
+				result.RuleName = ruleDisplayName
+				result.Severity = 4 // High severity for matched rules
+				result.Description = fmt.Sprintf("Pattern '%s' matched in rule %s", pattern, ruleDisplayName)
+				result.RuleTags = []string{"yara", "detection"}
+
+				s.logger.Info("🚨 THREAT DETECTED! Rule: %s, Pattern: %s", ruleDisplayName, pattern)
+				return result, nil
+			}
+		}
+	}
+
+	if !result.Matched {
+		s.logger.Info("✅ File is clean - no YARA rule matches")
+	}
+
+	return result, nil
+}
+
+type scanResult struct {
+	FilePath    string   `json:"file_path"`
+	Matched     bool     `json:"matched"`
+	RuleName    string   `json:"rule_name"`
+	Severity    int      `json:"severity"`
+	Description string   `json:"description"`
+	RuleTags    []string `json:"rule_tags"`
+	FileHash    string   `json:"file_hash"`
+	FileSize    int64    `json:"file_size"`
+	ScanTime    int64    `json:"scan_time_ms"`
+}
+
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr ||
+		(len(s) > len(substr) &&
+			(s[:len(substr)] == substr ||
+				s[len(s)-len(substr):] == substr ||
+				containsMiddle(s, substr))))
+}
+
+func containsMiddle(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
 }
 
 // resetAgentRegistration clears agent registration to force re-registration
@@ -273,27 +564,186 @@ func resetAgentRegistration(configPath string) error {
 	return nil
 }
 
-// updateYaraRules updates YARA rules from GitHub
+func checkInternetConnection() bool {
+	conn, err := net.DialTimeout("tcp", "github.com:80", 3*time.Second)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+// getYaraFilesFromGitHubAPI lấy danh sách file .yar trong 1 category từ GitHub API, trả về Name và DownloadURL
+func getYaraFilesFromGitHubAPI(category string) ([]struct{ Name, DownloadURL string }, error) {
+	apiURL := "https://api.github.com/repos/Yara-Rules/rules/contents/" + category
+	resp, err := http.Get(apiURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("GitHub API HTTP %d", resp.StatusCode)
+	}
+	var files []struct {
+		Name        string `json:"name"`
+		Type        string `json:"type"`
+		DownloadURL string `json:"download_url"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&files); err != nil {
+		return nil, err
+	}
+	var yarFiles []struct{ Name, DownloadURL string }
+	for _, f := range files {
+		if f.Type == "file" && strings.HasSuffix(f.Name, ".yar") && f.DownloadURL != "" {
+			yarFiles = append(yarFiles, struct{ Name, DownloadURL string }{f.Name, f.DownloadURL})
+		}
+	}
+	return yarFiles, nil
+}
+
 func updateYaraRules(configPath string) error {
+	// Check Internet connection first
+	if !checkInternetConnection() {
+		fmt.Println("❌ Không có kết nối Internet. Không thể cập nhật YARA rules!")
+		return fmt.Errorf("no internet connection")
+	}
+
 	// Load config
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	// Initialize logger
-	logger := utils.NewLogger(&cfg.Log)
+	// Initialize logger (for future use)
+	_ = utils.NewLogger(&cfg.Log)
 
-	// Create YARA rules manager
-	// This would be implemented in the yara package
-	logger.Info("Updating YARA rules...")
-
-	// TODO: Implement YARA rules update
 	fmt.Println("🔄 YARA rules update initiated")
-	fmt.Println("📥 Downloading rules from GitHub...")
-	fmt.Println("✅ Rules updated successfully")
+	fmt.Printf("📁 Rules path: %s\n", cfg.Yara.RulesPath)
 
+	// Create rules directory if it doesn't exist
+	if err := os.MkdirAll(cfg.Yara.RulesPath, 0755); err != nil {
+		return fmt.Errorf("failed to create rules directory: %w", err)
+	}
+
+	categories := cfg.Yara.Categories
+	if len(categories) == 0 {
+		categories = []string{"malware", "backdoor", "trojan", "ransomware"}
+		fmt.Println("⚠️  No categories specified in config, using defaults")
+	}
+	fmt.Printf("📋 Selected categories: %v\n", categories)
+	totalDownloaded := 0
+	for _, category := range categories {
+		fmt.Printf("\n📥 Downloading %s rules...\n", category)
+		files, err := getYaraFilesFromGitHubAPI(category)
+		if err != nil {
+			fmt.Printf("❌ Failed to get file list from GitHub API for %s: %v\n", category, err)
+			continue
+		}
+		categoryDir := filepath.Join(cfg.Yara.RulesPath, category)
+		if err := os.MkdirAll(categoryDir, 0755); err != nil {
+			fmt.Printf("❌ Failed to create category dir %s: %v\n", categoryDir, err)
+			continue
+		}
+		for _, file := range files {
+			outputPath := filepath.Join(categoryDir, file.Name)
+			if _, err := os.Stat(outputPath); err == nil {
+				fmt.Printf("   ⏩ Đã có: %s, bỏ qua tải lại\n", filepath.Join(category, file.Name))
+				continue
+			}
+			content, err := downloadGitHubFile(file.DownloadURL)
+			if err != nil {
+				fmt.Printf("❌ Failed to download %s: %v\n", filepath.Join(category, file.Name), err)
+				continue
+			}
+			if err := os.WriteFile(outputPath, content, 0644); err != nil {
+				fmt.Printf("❌ Failed to save %s: %v\n", filepath.Join(category, file.Name), err)
+				continue
+			}
+			fmt.Printf("   ✅ Downloaded: %s (%d bytes)\n", filepath.Join(category, file.Name), len(content))
+			totalDownloaded++
+		}
+	}
+	fmt.Printf("\n✅ Successfully downloaded %d YARA rule files\n", totalDownloaded)
+	// List all downloaded rules (recursive)
+	fmt.Println("\n📋 YARA Rules loaded:")
+	rules, err := filepath.Glob(filepath.Join(cfg.Yara.RulesPath, "**/*.yar"))
+	if err != nil {
+		// Fallback to simple glob if recursive not supported
+		rules, err = filepath.Glob(filepath.Join(cfg.Yara.RulesPath, "*.yar"))
+		if err != nil {
+			return fmt.Errorf("failed to list rules: %w", err)
+		}
+	}
+	sort.Slice(rules, func(i, j int) bool {
+		return rules[i] < rules[j]
+	})
+	for i, rule := range rules {
+		relPath, _ := filepath.Rel(cfg.Yara.RulesPath, rule)
+		content, _ := os.ReadFile(rule)
+		fmt.Printf("   %d. %s (%d bytes)\n", i+1, relPath, len(content))
+	}
+	fmt.Printf("\n✅ Successfully loaded %d YARA rules\n", len(rules))
+	fmt.Println("🎯 Rules are ready for testing!")
+	fmt.Println("💡 Test with: edr-agent.exe -test-yara <yourfile>")
 	return nil
+}
+
+// listGitHubFiles lists files in a GitHub directory
+func listGitHubFiles(dirURL string) ([]string, error) {
+	// For simplicity, we'll use a predefined list of common files
+	// In a real implementation, you'd parse the GitHub directory listing
+	commonFiles := map[string][]string{
+		"malware": {
+			"apt_apt28.yar", "apt_apt29.yar", "apt_apt30.yar", "apt_apt32.yar",
+			"malware_emotet.yar", "malware_ryuk.yar", "malware_wannacry.yar",
+			"malware_notpetya.yar", "malware_locky.yar", "malware_cerber.yar",
+		},
+		"backdoor": {
+			"backdoor_netcat.yar", "backdoor_plink.yar", "backdoor_putty.yar",
+			"backdoor_winrm.yar", "backdoor_ssh.yar", "backdoor_rdp.yar",
+		},
+		"trojan": {
+			"trojan_zeus.yar", "trojan_dridex.yar", "trojan_ursnif.yar",
+			"trojan_ramnit.yar", "trojan_gozi.yar", "trojan_carberp.yar",
+		},
+		"ransomware": {
+			"ransomware_wannacry.yar", "ransomware_notpetya.yar",
+			"ransomware_ryuk.yar", "ransomware_cerber.yar",
+			"ransomware_locky.yar", "ransomware_cryptolocker.yar",
+		},
+	}
+
+	// Extract category from URL
+	parts := strings.Split(dirURL, "/")
+	if len(parts) > 0 {
+		category := parts[len(parts)-1]
+		if files, exists := commonFiles[category]; exists {
+			return files, nil
+		}
+	}
+
+	// Fallback: return empty list
+	return []string{}, nil
+}
+
+// downloadGitHubFile downloads a file from GitHub
+func downloadGitHubFile(fileURL string) ([]byte, error) {
+	resp, err := http.Get(fileURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to download file: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, fileURL)
+	}
+
+	content, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	return content, nil
 }
 
 // generateSystemReport generates a comprehensive system report

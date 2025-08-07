@@ -34,18 +34,18 @@ const (
 	HKEY_USERS         = 0x80000003
 	HKEY_CLASSES_ROOT  = 0x80000000
 
-	REG_NOTIFY_CHANGE_NAME     = 0x00000001
+	REG_NOTIFY_CHANGE_NAME       = 0x00000001
 	REG_NOTIFY_CHANGE_ATTRIBUTES = 0x00000002
-	REG_NOTIFY_CHANGE_LAST_SET = 0x00000004
-	REG_NOTIFY_CHANGE_SECURITY = 0x00000008
+	REG_NOTIFY_CHANGE_LAST_SET   = 0x00000004
+	REG_NOTIFY_CHANGE_SECURITY   = 0x00000008
 
-	REG_OPTION_NON_VOLATILE = 0x00000000
-	REG_OPTION_VOLATILE     = 0x00000001
-	REG_OPTION_CREATE_LINK  = 0x00000002
+	REG_OPTION_NON_VOLATILE   = 0x00000000
+	REG_OPTION_VOLATILE       = 0x00000001
+	REG_OPTION_CREATE_LINK    = 0x00000002
 	REG_OPTION_BACKUP_RESTORE = 0x00000004
-	REG_OPTION_OPEN_LINK    = 0x00000008
+	REG_OPTION_OPEN_LINK      = 0x00000008
 
-	KEY_QUERY_VALUE         = 0x0001
+	KEY_QUERY_VALUE        = 0x0001
 	KEY_SET_VALUE          = 0x0002
 	KEY_CREATE_SUB_KEY     = 0x0004
 	KEY_ENUMERATE_SUB_KEYS = 0x0008
@@ -56,15 +56,15 @@ const (
 	KEY_EXECUTE            = 0x20019
 	KEY_ALL_ACCESS         = 0xF003F
 
-	REG_SZ        = 1
-	REG_EXPAND_SZ = 2
-	REG_BINARY    = 3
-	REG_DWORD     = 4
+	REG_SZ                  = 1
+	REG_EXPAND_SZ           = 2
+	REG_BINARY              = 3
+	REG_DWORD               = 4
 	REG_DWORD_LITTLE_ENDIAN = 4
 	REG_DWORD_BIG_ENDIAN    = 5
-	REG_LINK      = 6
-	REG_MULTI_SZ  = 7
-	REG_QWORD     = 11
+	REG_LINK                = 6
+	REG_MULTI_SZ            = 7
+	REG_QWORD               = 11
 	REG_QWORD_LITTLE_ENDIAN = 11
 )
 
@@ -72,15 +72,15 @@ var (
 	regAdvapi32 = windows.NewLazySystemDLL("advapi32.dll")
 	regKernel32 = windows.NewLazySystemDLL("kernel32.dll")
 
-	procRegOpenKeyExW     = regAdvapi32.NewProc("RegOpenKeyExW")
-	procRegCreateKeyExW   = regAdvapi32.NewProc("RegCreateKeyExW")
-	procRegCloseKey       = regAdvapi32.NewProc("RegCloseKey")
-	procRegQueryValueExW  = regAdvapi32.NewProc("RegQueryValueExW")
-	procRegSetValueExW    = regAdvapi32.NewProc("RegSetValueExW")
-	procRegDeleteValueW   = regAdvapi32.NewProc("RegDeleteValueW")
-	procRegDeleteKeyW     = regAdvapi32.NewProc("RegDeleteKeyW")
-	procRegEnumKeyExW     = regAdvapi32.NewProc("RegEnumKeyExW")
-	procRegEnumValueW     = regAdvapi32.NewProc("RegEnumValueW")
+	procRegOpenKeyExW           = regAdvapi32.NewProc("RegOpenKeyExW")
+	procRegCreateKeyExW         = regAdvapi32.NewProc("RegCreateKeyExW")
+	procRegCloseKey             = regAdvapi32.NewProc("RegCloseKey")
+	procRegQueryValueExW        = regAdvapi32.NewProc("RegQueryValueExW")
+	procRegSetValueExW          = regAdvapi32.NewProc("RegSetValueExW")
+	procRegDeleteValueW         = regAdvapi32.NewProc("RegDeleteValueW")
+	procRegDeleteKeyW           = regAdvapi32.NewProc("RegDeleteKeyW")
+	procRegEnumKeyExW           = regAdvapi32.NewProc("RegEnumKeyExW")
+	procRegEnumValueW           = regAdvapi32.NewProc("RegEnumValueW")
 	procRegNotifyChangeKeyValue = regAdvapi32.NewProc("RegNotifyChangeKeyValue")
 )
 
@@ -192,17 +192,34 @@ func (rm *RegistryMonitor) monitorRegistryKey(watcher *RegistryWatcher) {
 		case <-rm.stopChan:
 			return
 		default:
+			// Create event for registry notification
+			event, err := windows.CreateEvent(nil, 0, 0, nil)
+			if err != nil {
+				rm.logger.Error("Failed to create event for %s: %v", watcher.keyPath, err)
+				time.Sleep(time.Second)
+				continue
+			}
+			defer windows.CloseHandle(event)
+
 			// Wait for registry changes
 			ret, _, _ := procRegNotifyChangeKeyValue.Call(
 				uintptr(watcher.handle),
 				1, // bWatchSubtree
 				REG_NOTIFY_CHANGE_NAME|REG_NOTIFY_CHANGE_ATTRIBUTES|REG_NOTIFY_CHANGE_LAST_SET|REG_NOTIFY_CHANGE_SECURITY,
-				0, // hEvent
+				uintptr(event),
 				1, // fAsynchronous
 			)
 
 			if ret != 0 {
 				rm.logger.Error("RegNotifyChangeKeyValue failed for %s: %d", watcher.keyPath, ret)
+				time.Sleep(time.Second)
+				continue
+			}
+
+			// Wait for the event to be signaled
+			_, err = windows.WaitForSingleObject(event, windows.INFINITE)
+			if err != nil {
+				rm.logger.Error("WaitForSingleObject failed for %s: %v", watcher.keyPath, err)
 				time.Sleep(time.Second)
 				continue
 			}
@@ -326,7 +343,7 @@ func (rm *RegistryMonitor) createRegistryEvent(keyPath, valueName, action string
 			ID:        rm.generateEventID(),
 			AgentID:   rm.agentID,
 			Timestamp: time.Now(),
-			EventType:  "registry_event",
+			EventType: "registry_event",
 			Severity:  severity,
 			Source:    "registry_monitor",
 		},
