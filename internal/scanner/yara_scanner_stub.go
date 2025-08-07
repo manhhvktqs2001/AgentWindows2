@@ -10,8 +10,10 @@ import (
 )
 
 type YaraScanner struct {
-	config *config.YaraConfig
-	logger *utils.Logger
+	config       *config.YaraConfig
+	logger       *utils.Logger
+	agentID      string
+	serverClient interface{}
 }
 
 func NewYaraScanner(cfg *config.YaraConfig, logger *utils.Logger) *YaraScanner {
@@ -19,6 +21,22 @@ func NewYaraScanner(cfg *config.YaraConfig, logger *utils.Logger) *YaraScanner {
 		config: cfg,
 		logger: logger,
 	}
+}
+
+// SetAgentID sets the agent ID for alert creation
+func (ys *YaraScanner) SetAgentID(agentID string) {
+	ys.agentID = agentID
+}
+
+// SetServerClient sets the server client for sending alerts
+func (ys *YaraScanner) SetServerClient(serverClient interface{}) {
+	ys.serverClient = serverClient
+}
+
+// SetResponseManager sets the response manager for handling threats
+func (ys *YaraScanner) SetResponseManager(responseManager interface{}) {
+	// Stub implementation
+	ys.logger.Debug("Response manager set (stub)")
 }
 
 func (ys *YaraScanner) ScanFile(filePath string) (*models.ThreatInfo, error) {

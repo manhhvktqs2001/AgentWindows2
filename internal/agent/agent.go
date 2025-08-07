@@ -11,6 +11,7 @@ import (
 	"edr-agent-windows/internal/communication"
 	"edr-agent-windows/internal/config"
 	"edr-agent-windows/internal/monitoring"
+	"edr-agent-windows/internal/response"
 	"edr-agent-windows/internal/scanner"
 	"edr-agent-windows/internal/utils"
 )
@@ -26,6 +27,9 @@ type Agent struct {
 	processMonitor  *monitoring.ProcessMonitor
 	networkMonitor  *monitoring.NetworkMonitor
 	registryMonitor *monitoring.RegistryMonitor
+
+	// Response System
+	responseManager *response.ResponseManager
 
 	// Control channels
 	stopChan  chan bool
@@ -69,6 +73,9 @@ func NewAgent(cfg *config.Config, logger *utils.Logger) (*Agent, error) {
 	networkMonitor := monitoring.NewNetworkMonitor(&cfg.Monitoring.Network, logger)
 	registryMonitor := monitoring.NewRegistryMonitor(&cfg.Monitoring.Registry, logger)
 
+	// Initialize Response Manager
+	responseManager := response.NewResponseManager(&cfg.Response, logger, serverClient)
+
 	agent := &Agent{
 		config:          cfg,
 		logger:          logger,
@@ -78,9 +85,17 @@ func NewAgent(cfg *config.Config, logger *utils.Logger) (*Agent, error) {
 		processMonitor:  processMonitor,
 		networkMonitor:  networkMonitor,
 		registryMonitor: registryMonitor,
+		responseManager: responseManager,
 		stopChan:        make(chan bool),
 		eventChan:       make(chan Event, cfg.Agent.MaxQueueSize),
 		taskChan:        make(chan Task, 100),
+	}
+
+	// Kết nối YARA scanner với server client để gửi alert
+	yaraScanner.SetServerClient(serverClient)
+	yaraScanner.SetResponseManager(responseManager)
+	if cfg.Agent.ID != "" {
+		yaraScanner.SetAgentID(cfg.Agent.ID)
 	}
 
 	return agent, nil
@@ -177,6 +192,11 @@ func (a *Agent) Start() error {
 
 	a.logger.Info("Starting EDR Agent...")
 
+	// Start Response Manager first
+	if err := a.responseManager.Start(); err != nil {
+		return fmt.Errorf("failed to start response manager: %w", err)
+	}
+
 	// Register with server
 	err := a.registerWithServer()
 	if err != nil {
@@ -267,6 +287,9 @@ func (a *Agent) Stop() {
 
 	// Signal stop to all workers
 	close(a.stopChan)
+
+	// Stop Response Manager
+	a.responseManager.Stop()
 
 	// Stop monitors
 	a.fileMonitor.Stop()

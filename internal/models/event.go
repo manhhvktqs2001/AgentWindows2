@@ -47,12 +47,17 @@ type RegistryInfo struct {
 
 // ThreatInfo contains threat detection information
 type ThreatInfo struct {
-	ThreatType     string   `json:"threat_type"`
-	ThreatName     string   `json:"threat_name"`
-	Confidence     float64  `json:"confidence"`
-	YaraRules      []string `json:"yara_rules,omitempty"`
-	MITRETechnique string   `json:"mitre_technique,omitempty"`
-	Description    string   `json:"description"`
+	ThreatType     string    `json:"threat_type"`
+	ThreatName     string    `json:"threat_name"`
+	Confidence     float64   `json:"confidence"`
+	Severity       int       `json:"severity"`
+	FilePath       string    `json:"file_path"`
+	ProcessID      int       `json:"process_id"`
+	ProcessName    string    `json:"process_name"`
+	YaraRules      []string  `json:"yara_rules,omitempty"`
+	MITRETechnique string    `json:"mitre_technique,omitempty"`
+	Description    string    `json:"description"`
+	Timestamp      time.Time `json:"timestamp"`
 }
 
 // FileEvent represents a file system event

@@ -10,11 +10,50 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// ResponseConfig cấu hình cho Response System
+type ResponseConfig struct {
+	NotificationSettings NotificationSettings `yaml:"notification_settings"`
+	SeverityThresholds   SeverityThresholds   `yaml:"severity_thresholds"`
+	UserInteraction      UserInteraction      `yaml:"user_interaction"`
+	Customization        Customization        `yaml:"customization"`
+}
+
+// NotificationSettings cấu hình thông báo
+type NotificationSettings struct {
+	ToastEnabled        bool `yaml:"toast_enabled"`
+	SystemTrayEnabled   bool `yaml:"system_tray_enabled"`
+	DesktopAlertEnabled bool `yaml:"desktop_alert_enabled"`
+	SoundEnabled        bool `yaml:"sound_enabled"`
+	TimeoutSeconds      int  `yaml:"timeout_seconds"`
+}
+
+// SeverityThresholds ngưỡng severity
+type SeverityThresholds struct {
+	ShowUserAlerts int `yaml:"show_user_alerts"`
+	AutoQuarantine int `yaml:"auto_quarantine"`
+	BlockExecution int `yaml:"block_execution"`
+}
+
+// UserInteraction cấu hình tương tác người dùng
+type UserInteraction struct {
+	AllowUserOverride    bool `yaml:"allow_user_override"`
+	RequireAdminForAllow bool `yaml:"require_admin_for_allow"`
+	TimeoutSeconds       int  `yaml:"timeout_seconds"`
+}
+
+// Customization cấu hình tùy chỉnh
+type Customization struct {
+	CompanyBranding bool   `yaml:"company_branding"`
+	CustomMessages  bool   `yaml:"custom_messages"`
+	Language        string `yaml:"language"`
+}
+
+// Config cấu hình chính của agent
 type Config struct {
-	Server     ServerConfig     `yaml:"server"`
 	Agent      AgentDetails     `yaml:"agent"`
-	Monitoring MonitoringConfig `yaml:"monitoring"`
+	Server     ServerConfig     `yaml:"server"`
 	Yara       YaraConfig       `yaml:"yara"`
+	Monitoring MonitoringConfig `yaml:"monitoring"`
 	Response   ResponseConfig   `yaml:"response"`
 	Log        LogConfig        `yaml:"logging"`
 }
@@ -89,12 +128,6 @@ type YaraConfig struct {
 	MaxScanThreads int      `yaml:"max_scan_threads"`
 	ScanTimeout    int      `yaml:"scan_timeout"`
 	RulesPath      string   `yaml:"rules_path"`
-}
-
-type ResponseConfig struct {
-	AutoQuarantine   bool `yaml:"auto_quarantine"`
-	AutoRemediation  bool `yaml:"auto_remediation"`
-	NetworkIsolation bool `yaml:"network_isolation"`
 }
 
 type LogConfig struct {
@@ -207,9 +240,28 @@ func Load(configPath string) (*Config, error) {
 			RulesPath:      viper.GetString("yara.rules_path"),
 		},
 		Response: ResponseConfig{
-			AutoQuarantine:   viper.GetBool("response.auto_quarantine"),
-			AutoRemediation:  viper.GetBool("response.auto_remediation"),
-			NetworkIsolation: viper.GetBool("response.network_isolation"),
+			NotificationSettings: NotificationSettings{
+				ToastEnabled:        viper.GetBool("response.notification_settings.toast_enabled"),
+				SystemTrayEnabled:   viper.GetBool("response.notification_settings.system_tray_enabled"),
+				DesktopAlertEnabled: viper.GetBool("response.notification_settings.desktop_alert_enabled"),
+				SoundEnabled:        viper.GetBool("response.notification_settings.sound_enabled"),
+				TimeoutSeconds:      viper.GetInt("response.notification_settings.timeout_seconds"),
+			},
+			SeverityThresholds: SeverityThresholds{
+				ShowUserAlerts: viper.GetInt("response.severity_thresholds.show_user_alerts"),
+				AutoQuarantine: viper.GetInt("response.severity_thresholds.auto_quarantine"),
+				BlockExecution: viper.GetInt("response.severity_thresholds.block_execution"),
+			},
+			UserInteraction: UserInteraction{
+				AllowUserOverride:    viper.GetBool("response.user_interaction.allow_user_override"),
+				RequireAdminForAllow: viper.GetBool("response.user_interaction.require_admin_for_allow"),
+				TimeoutSeconds:       viper.GetInt("response.user_interaction.timeout_seconds"),
+			},
+			Customization: Customization{
+				CompanyBranding: viper.GetBool("response.customization.company_branding"),
+				CustomMessages:  viper.GetBool("response.customization.custom_messages"),
+				Language:        viper.GetString("response.customization.language"),
+			},
 		},
 		Log: LogConfig{
 			Level:    viper.GetString("logging.level"),
@@ -297,9 +349,20 @@ func setDefaults() {
 	viper.SetDefault("yara.rules_path", "yara-rules")
 
 	// Response defaults
-	viper.SetDefault("response.auto_quarantine", false)
-	viper.SetDefault("response.auto_remediation", false)
-	viper.SetDefault("response.network_isolation", false)
+	viper.SetDefault("response.notification_settings.toast_enabled", true)
+	viper.SetDefault("response.notification_settings.system_tray_enabled", true)
+	viper.SetDefault("response.notification_settings.desktop_alert_enabled", true)
+	viper.SetDefault("response.notification_settings.sound_enabled", true)
+	viper.SetDefault("response.notification_settings.timeout_seconds", 10)
+	viper.SetDefault("response.severity_thresholds.show_user_alerts", 1)
+	viper.SetDefault("response.severity_thresholds.auto_quarantine", 2)
+	viper.SetDefault("response.severity_thresholds.block_execution", 3)
+	viper.SetDefault("response.user_interaction.allow_user_override", false)
+	viper.SetDefault("response.user_interaction.require_admin_for_allow", true)
+	viper.SetDefault("response.user_interaction.timeout_seconds", 30)
+	viper.SetDefault("response.customization.company_branding", false)
+	viper.SetDefault("response.customization.custom_messages", false)
+	viper.SetDefault("response.customization.language", "en")
 
 	// Log defaults
 	viper.SetDefault("logging.level", "info")
@@ -411,9 +474,28 @@ func CreateDefaultConfig(filePath string) error {
 			RulesPath:      "yara-rules",
 		},
 		Response: ResponseConfig{
-			AutoQuarantine:   false,
-			AutoRemediation:  false,
-			NetworkIsolation: false,
+			NotificationSettings: NotificationSettings{
+				ToastEnabled:        true,
+				SystemTrayEnabled:   true,
+				DesktopAlertEnabled: true,
+				SoundEnabled:        true,
+				TimeoutSeconds:      10,
+			},
+			SeverityThresholds: SeverityThresholds{
+				ShowUserAlerts: 1,
+				AutoQuarantine: 2,
+				BlockExecution: 3,
+			},
+			UserInteraction: UserInteraction{
+				AllowUserOverride:    false,
+				RequireAdminForAllow: true,
+				TimeoutSeconds:       30,
+			},
+			Customization: Customization{
+				CompanyBranding: false,
+				CustomMessages:  false,
+				Language:        "en",
+			},
 		},
 		Log: LogConfig{
 			Level:    "info",
@@ -513,9 +595,28 @@ func createDefaultConfig() *Config {
 			RulesPath:      "",
 		},
 		Response: ResponseConfig{
-			AutoQuarantine:   false,
-			AutoRemediation:  false,
-			NetworkIsolation: false,
+			NotificationSettings: NotificationSettings{
+				ToastEnabled:        false,
+				SystemTrayEnabled:   false,
+				DesktopAlertEnabled: false,
+				SoundEnabled:        false,
+				TimeoutSeconds:      0,
+			},
+			SeverityThresholds: SeverityThresholds{
+				ShowUserAlerts: 0,
+				AutoQuarantine: 0,
+				BlockExecution: 0,
+			},
+			UserInteraction: UserInteraction{
+				AllowUserOverride:    false,
+				RequireAdminForAllow: false,
+				TimeoutSeconds:       0,
+			},
+			Customization: Customization{
+				CompanyBranding: false,
+				CustomMessages:  false,
+				Language:        "",
+			},
 		},
 		Log: LogConfig{
 			Level:    "info",

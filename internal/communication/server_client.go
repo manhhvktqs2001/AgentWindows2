@@ -330,3 +330,40 @@ func (sc *ServerClient) CheckAgentExistsByMAC(macAddress string) (bool, string, 
 		return false, "", "", fmt.Errorf("server returned status %d: %s", resp.StatusCode, result.Message)
 	}
 }
+
+// SendAlert sends an alert to the server
+func (sc *ServerClient) SendAlert(alertData map[string]interface{}) error {
+	url := sc.config.URL + "/api/v1/agents/alerts"
+
+	jsonData, err := json.Marshal(alertData)
+	if err != nil {
+		sc.logger.Error("Failed to marshal alert data: %v", err)
+		return err
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		sc.logger.Error("Failed to create alert request: %v", err)
+		return err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", sc.config.APIKey)
+	req.Header.Set("X-Agent-ID", sc.agentID)
+
+	resp, err := sc.httpClient.Do(req)
+	if err != nil {
+		sc.logger.Error("Failed to send alert: %v", err)
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		sc.logger.Error("Send alert failed: %d, response: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("send alert failed: %d", resp.StatusCode)
+	}
+
+	sc.logger.Info("Alert sent to server successfully")
+	return nil
+}
