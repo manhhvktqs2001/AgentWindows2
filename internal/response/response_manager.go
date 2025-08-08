@@ -151,8 +151,7 @@ func (rm *ResponseManager) processThreat(threat *models.ThreatInfo) {
 		rm.logger.Warn("Response channel full, dropping response")
 	}
 
-	// Step 7: Send to server (disabled to avoid duplicate alerts)
-	// rm.sendToServer(threat, response)
+	rm.sendToServer(threat, response)
 
 	processingTime := time.Since(startTime)
 	rm.logger.Info("Threat processed in %v: %s (Severity: %d)", processingTime, threat.ThreatName, severity)
@@ -232,17 +231,24 @@ func (rm *ResponseManager) responseProcessor() {
 	}
 }
 
-// processResponse xử lý một response cụ thể
+// Thay thế hàm processResponse trong response_manager.go (dòng 152-160):
+
 func (rm *ResponseManager) processResponse(response *ResponseAction) {
 	rm.logger.Info("Processing response: %s for threat: %s", response.ActionType, response.ThreatInfo.ThreatName)
 
-	// Send notification to user if needed
+	// QUAN TRỌNG: Send notification to user NGAY LẬP TỨC
 	if response.UserNotified {
+		rm.logger.Info("🚨 SENDING USER NOTIFICATION - Severity: %d", response.Severity)
 		err := rm.notificationCtrl.SendNotification(response.ThreatInfo, response.Severity)
 		if err != nil {
-			rm.logger.Error("Failed to send notification: %v", err)
+			rm.logger.Error("❌ Failed to send notification: %v", err)
+		} else {
+			rm.logger.Info("✅ User notification sent successfully")
 		}
 	}
+
+	// Send to server (uncomment this line)
+	rm.sendToServer(response.ThreatInfo, response)
 
 	// Log response action
 	rm.logger.Info("Response completed: %s (Severity: %d)", response.ActionType, response.Severity)
