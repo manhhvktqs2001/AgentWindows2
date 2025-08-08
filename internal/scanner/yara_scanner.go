@@ -43,6 +43,30 @@ type ScanResult struct {
 	Description   string    `json:"description"`
 }
 
+// YaraScanCallback implements the ScanCallback interface for go-yara v4
+type YaraScanCallback struct {
+	matches []yara.MatchRule
+	logger  *utils.Logger
+}
+
+// RuleMatching implements the ScanCallbackMatch interface
+// This is the correct signature for go-yara v4
+func (cb *YaraScanCallback) RuleMatching(sc *yara.ScanContext, r *yara.Rule) (bool, error) {
+	matchRule := yara.MatchRule{
+		Rule:      r.Identifier(),
+		Namespace: r.Namespace(),
+		Tags:      r.Tags(),
+		Metas:     r.Metas(),
+		// Strings field intentionally left empty; retrieving match strings via ScanContext is not available here
+	}
+
+	cb.matches = append(cb.matches, matchRule)
+	cb.logger.Debug("YARA rule matched: %s (namespace: %s, tags: %v)",
+		matchRule.Rule, matchRule.Namespace, matchRule.Tags)
+
+	return false, nil // Continue scanning (false = don't abort)
+}
+
 func NewYaraScanner(cfg *config.YaraConfig, logger *utils.Logger) *YaraScanner {
 	scanner := &YaraScanner{
 		config: cfg,
@@ -279,15 +303,8 @@ func (ys *YaraScanner) ScanFile(filePath string) (*ScanResult, error) {
 
 	startTime := time.Now()
 
-	// Open file for scanning
-	file, err := os.Open(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open file for scanning: %w", err)
-	}
-	defer file.Close()
-
-	// Get file info
-	fileInfo, err := file.Stat()
+	// Get file info first (không cần mở file để lấy info)
+	fileInfo, err := os.Stat(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get file info: %w", err)
 	}
@@ -308,16 +325,24 @@ func (ys *YaraScanner) ScanFile(filePath string) (*ScanResult, error) {
 		}, nil
 	}
 
-	// Calculate file hash firstQ
+	// Calculate file hash
 	fileHash := ys.calculateFileHash(filePath)
 
-	// Scan file với timeout
-	timeout := ys.config.ScanTimeout
+	// Scan file với timeout - CORRECT API USAGE cho go-yara v4
+	timeout := time.Duration(ys.config.ScanTimeout) * time.Second
 	if timeout == 0 {
-		timeout = 30 // Default 30 seconds
+		timeout = 30 * time.Second // Default 30 seconds
 	}
 
-	matches, err := ys.rules.ScanFile(file, 0, timeout)
+	// Create callback để collect matches
+	callback := &YaraScanCallback{
+		matches: make([]yara.MatchRule, 0),
+		logger:  ys.logger,
+	}
+
+	// Use CORRECT YARA v4 API: ScanFile với callback
+	// Signature: ScanFile(filename string, flags ScanFlags, timeout time.Duration, cb ScanCallback) error
+	err = ys.rules.ScanFile(filePath, 0, timeout, callback)
 	if err != nil {
 		return nil, fmt.Errorf("YARA scan failed: %w", err)
 	}
@@ -325,7 +350,7 @@ func (ys *YaraScanner) ScanFile(filePath string) (*ScanResult, error) {
 	scanDuration := time.Since(startTime)
 
 	result := &ScanResult{
-		Matched:       len(matches) > 0,
+		Matched:       len(callback.matches) > 0,
 		FilePath:      filePath,
 		FileSize:      fileInfo.Size(),
 		ScanTimestamp: time.Now(),
@@ -334,25 +359,25 @@ func (ys *YaraScanner) ScanFile(filePath string) (*ScanResult, error) {
 	}
 
 	// Debug: Log scan results
-	ys.logger.Debug("YARA scan completed for %s: %d matches found", filePath, len(matches))
-	if len(matches) > 0 {
-		for i, match := range matches {
-			ys.logger.Debug("Match %d: Rule=%s, Tags=%s", i+1, match.Rule, match.Tags)
+	ys.logger.Debug("YARA scan completed for %s: %d matches found", filePath, len(callback.matches))
+	if len(callback.matches) > 0 {
+		for i, match := range callback.matches {
+			ys.logger.Debug("Match %d: Rule=%s, Tags=%v", i+1, match.Rule, match.Tags)
 		}
 	}
 
 	if result.Matched {
-		// Print all matches
-		fmt.Printf("\n🚨🚨🚨 YARA THREAT DETECTED! 🚨🚨🚨\n")
-		fmt.Printf("File: %s\n", filePath)
-		fmt.Printf("Total Matches: %d\n", len(matches))
+		// Print all matches - Force flush to ensure immediate display
+		fmt.Fprintf(os.Stdout, "\n🚨🚨🚨 YARA THREAT DETECTED! 🚨🚨🚨\n")
+		fmt.Fprintf(os.Stdout, "File: %s\n", filePath)
+		fmt.Fprintf(os.Stdout, "Total Matches: %d\n", len(callback.matches))
 
 		// Show all matching rules
-		for i, match := range matches {
-			fmt.Printf("\nMatch %d:\n", i+1)
-			fmt.Printf("  Rule: %s\n", match.Rule)
-			fmt.Printf("  Tags: %s\n", match.Tags)
-			fmt.Printf("  Namespace: %s\n", match.Namespace)
+		for i, match := range callback.matches {
+			fmt.Fprintf(os.Stdout, "\nMatch %d:\n", i+1)
+			fmt.Fprintf(os.Stdout, "  Rule: %s\n", match.Rule)
+			fmt.Fprintf(os.Stdout, "  Tags: %v\n", match.Tags)
+			fmt.Fprintf(os.Stdout, "  Namespace: %s\n", match.Namespace)
 		}
 
 		// Prioritize rules based on threat type and severity
@@ -360,7 +385,7 @@ func (ys *YaraScanner) ScanFile(filePath string) (*ScanResult, error) {
 		var highestSeverity int = 0
 
 		// First, try to find EICAR rules (highest priority for testing)
-		for _, match := range matches {
+		for _, match := range callback.matches {
 			ruleNameLower := strings.ToLower(match.Rule)
 			if strings.Contains(ruleNameLower, "eicar") {
 				selectedMatch = &match
@@ -370,7 +395,7 @@ func (ys *YaraScanner) ScanFile(filePath string) (*ScanResult, error) {
 
 		// If no EICAR rule found, prioritize by threat type
 		if selectedMatch == nil {
-			for _, match := range matches {
+			for _, match := range callback.matches {
 				ruleNameLower := strings.ToLower(match.Rule)
 				severity := ys.getRuleSeverity(match.Rule)
 
@@ -388,7 +413,7 @@ func (ys *YaraScanner) ScanFile(filePath string) (*ScanResult, error) {
 
 		// If still no specific rule found, prioritize by severity
 		if selectedMatch == nil {
-			for _, match := range matches {
+			for _, match := range callback.matches {
 				severity := ys.getRuleSeverity(match.Rule)
 				if severity > highestSeverity {
 					selectedMatch = &match
@@ -398,8 +423,8 @@ func (ys *YaraScanner) ScanFile(filePath string) (*ScanResult, error) {
 		}
 
 		// If still no specific rule found, use first match
-		if selectedMatch == nil && len(matches) > 0 {
-			selectedMatch = &matches[0]
+		if selectedMatch == nil && len(callback.matches) > 0 {
+			selectedMatch = &callback.matches[0]
 		}
 
 		// If no matches found, this shouldn't happen but handle it
@@ -409,18 +434,21 @@ func (ys *YaraScanner) ScanFile(filePath string) (*ScanResult, error) {
 		}
 
 		result.RuleName = selectedMatch.Rule
-		result.RuleTags = strings.Split(selectedMatch.Tags, " ")
+		result.RuleTags = selectedMatch.Tags
 		result.Severity = ys.getRuleSeverity(selectedMatch.Rule)
 		result.Description = fmt.Sprintf("File matched YARA rule: %s", selectedMatch.Rule)
 
-		fmt.Printf("\nSelected Rule: %s\n", result.RuleName)
-		fmt.Printf("Severity: %d\n", result.Severity)
-		fmt.Printf("Tags: %v\n", result.RuleTags)
-		fmt.Printf("Description: %s\n", result.Description)
-		fmt.Printf("File Hash: %s\n", result.FileHash)
-		fmt.Printf("File Size: %d bytes\n", result.FileSize)
-		fmt.Printf("Scan Time: %dms\n", result.ScanTime)
-		fmt.Printf("🚨🚨🚨 END ALERT 🚨🚨🚨\n\n")
+		fmt.Fprintf(os.Stdout, "\nSelected Rule: %s\n", result.RuleName)
+		fmt.Fprintf(os.Stdout, "Severity: %d\n", result.Severity)
+		fmt.Fprintf(os.Stdout, "Tags: %v\n", result.RuleTags)
+		fmt.Fprintf(os.Stdout, "Description: %s\n", result.Description)
+		fmt.Fprintf(os.Stdout, "File Hash: %s\n", result.FileHash)
+		fmt.Fprintf(os.Stdout, "File Size: %d bytes\n", result.FileSize)
+		fmt.Fprintf(os.Stdout, "Scan Time: %dms\n", result.ScanTime)
+		fmt.Fprintf(os.Stdout, "🚨🚨🚨 END ALERT 🚨🚨🚨\n\n")
+
+		// Force flush to ensure immediate display
+		os.Stdout.Sync()
 
 		ys.logger.Warn("🚨 YARA THREAT DETECTED: %s -> Rule: %s, Severity: %d",
 			filePath, selectedMatch.Rule, result.Severity)
@@ -429,6 +457,64 @@ func (ys *YaraScanner) ScanFile(filePath string) (*ScanResult, error) {
 		ys.handleThreatDetection(filePath, result, fileInfo)
 	} else {
 		ys.logger.Debug("YARA scan clean: %s (%.2fms)", filePath, float64(scanDuration.Microseconds())/1000)
+	}
+
+	return result, nil
+}
+
+// ScanMemory scans in-memory data with YARA rules
+func (ys *YaraScanner) ScanMemory(data []byte) (*ScanResult, error) {
+	if !ys.config.Enabled {
+		return &ScanResult{Matched: false}, nil
+	}
+
+	ys.rulesMu.RLock()
+	defer ys.rulesMu.RUnlock()
+
+	if ys.rules == nil {
+		ys.logger.Debug("No YARA rules loaded, skipping memory scan")
+		return &ScanResult{Matched: false}, nil
+	}
+
+	startTime := time.Now()
+
+	// Scan timeout
+	timeout := time.Duration(ys.config.ScanTimeout) * time.Second
+	if timeout == 0 {
+		timeout = 30 * time.Second
+	}
+
+	// Create callback để collect matches
+	callback := &YaraScanCallback{
+		matches: make([]yara.MatchRule, 0),
+		logger:  ys.logger,
+	}
+
+	// Use CORRECT YARA v4 API: ScanMem với callback
+	err := ys.rules.ScanMem(data, 0, timeout, callback)
+	if err != nil {
+		return nil, fmt.Errorf("YARA memory scan failed: %w", err)
+	}
+
+	scanDuration := time.Since(startTime)
+
+	result := &ScanResult{
+		Matched:       len(callback.matches) > 0,
+		FilePath:      "memory",
+		FileSize:      int64(len(data)),
+		ScanTimestamp: time.Now(),
+		ScanTime:      scanDuration.Milliseconds(),
+	}
+
+	if result.Matched && len(callback.matches) > 0 {
+		selectedMatch := &callback.matches[0] // Use first match for simplicity
+		result.RuleName = selectedMatch.Rule
+		result.RuleTags = selectedMatch.Tags
+		result.Severity = ys.getRuleSeverity(selectedMatch.Rule)
+		result.Description = fmt.Sprintf("Memory matched YARA rule: %s", selectedMatch.Rule)
+
+		ys.logger.Warn("🚨 YARA MEMORY THREAT DETECTED: Rule: %s, Severity: %d",
+			selectedMatch.Rule, result.Severity)
 	}
 
 	return result, nil
@@ -668,79 +754,20 @@ func (ys *YaraScanner) LoadStaticRules() error {
 				$eicar_string
 		}`,
 
-		// Ransomware patterns
-		`rule Ransomware_Static {
+		// Simple test patterns
+		`rule Simple_Test {
 			meta:
-				description = "Ransomware detection patterns - Static"
+				description = "Simple test pattern"
 				author = "EDR System"
-				severity = 5
-				threat_type = "ransomware"
-				tags = "ransomware static"
+				severity = 2
+				threat_type = "test"
+				tags = "test simple"
 			
 			strings:
-				$encrypt_string = "encrypt" nocase
-				$ransom_string = "ransom" nocase
-				$bitcoin_string = "bitcoin" nocase
-				$payment_string = "payment" nocase
-				$decrypt_string = "decrypt" nocase
+				$test = "test" nocase
 			
 			condition:
-				2 of them
-		}`,
-
-		// Malware patterns
-		`rule Malware_Static {
-			meta:
-				description = "Malware detection patterns - Static"
-				author = "EDR System"
-				severity = 3
-				threat_type = "malware"
-				tags = "malware static"
-			
-			strings:
-				$malware_string = "This is a test malware file for EDR testing" nocase
-				$virus_string = "virus" nocase
-				$trojan_string = "trojan" nocase
-			
-			condition:
-				1 of them
-		}`,
-
-		// WebShell patterns
-		`rule WebShell_Static {
-			meta:
-				description = "WebShell detection patterns - Static"
-				author = "EDR System"
-				severity = 4
-				threat_type = "webshell"
-				tags = "webshell static"
-			
-			strings:
-				$eval_string = "eval(" nocase
-				$exec_string = "exec(" nocase
-				$system_string = "system(" nocase
-				$shell_string = "shell_exec" nocase
-			
-			condition:
-				1 of them
-		}`,
-
-		// RAT patterns
-		`rule RAT_Static {
-			meta:
-				description = "Remote Access Trojan patterns - Static"
-				author = "EDR System"
-				severity = 4
-				threat_type = "rat"
-				tags = "rat static"
-			
-			strings:
-				$rat_string = "remote access" nocase
-				$backdoor_string = "backdoor" nocase
-				$keylogger_string = "keylogger" nocase
-			
-			condition:
-				1 of them
+				$test
 		}`,
 	}
 
@@ -771,4 +798,30 @@ func (ys *YaraScanner) LoadStaticRules() error {
 
 	ys.logger.Info("Static YARA rules loaded successfully")
 	return nil
+}
+
+// Cleanup destroys the YARA rules and frees memory
+func (ys *YaraScanner) Cleanup() {
+	ys.rulesMu.Lock()
+	defer ys.rulesMu.Unlock()
+
+	if ys.rules != nil {
+		ys.rules.Destroy()
+		ys.rules = nil
+		ys.logger.Info("YARA scanner cleanup completed")
+	}
+}
+
+// GetMatchedRulesCount returns the number of loaded rules
+func (ys *YaraScanner) GetMatchedRulesCount() int {
+	ys.rulesMu.RLock()
+	defer ys.rulesMu.RUnlock()
+
+	if ys.rules == nil {
+		return 0
+	}
+
+	// Get rules slice from the Rules object
+	rules := ys.rules.GetRules()
+	return len(rules)
 }

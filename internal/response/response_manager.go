@@ -2,6 +2,7 @@ package response
 
 import (
 	"fmt"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -150,8 +151,8 @@ func (rm *ResponseManager) processThreat(threat *models.ThreatInfo) {
 		rm.logger.Warn("Response channel full, dropping response")
 	}
 
-	// Step 7: Send to server
-	rm.sendToServer(threat, response)
+	// Step 7: Send to server (disabled to avoid duplicate alerts)
+	// rm.sendToServer(threat, response)
 
 	processingTime := time.Since(startTime)
 	rm.logger.Info("Threat processed in %v: %s (Severity: %d)", processingTime, threat.ThreatName, severity)
@@ -278,13 +279,19 @@ func (rm *ResponseManager) sendToServer(threat *models.ThreatInfo, response *Res
 
 	// Create alert data
 	alertData := map[string]interface{}{
-		"threat_name":   threat.ThreatName,
-		"file_path":     threat.FilePath,
-		"severity":      threat.Severity,
-		"action_type":   response.ActionType,
-		"auto_executed": response.AutoExecuted,
-		"timestamp":     response.Timestamp,
-		"evidence":      response.Evidence,
+		"rule_name":      threat.ThreatName, // Sử dụng ThreatName làm rule_name
+		"title":          fmt.Sprintf("EDR Security Alert - %s", threat.ThreatName),
+		"description":    threat.Description,
+		"file_path":      threat.FilePath,
+		"file_name":      filepath.Base(threat.FilePath),
+		"severity":       threat.Severity,
+		"action_type":    response.ActionType,
+		"auto_executed":  response.AutoExecuted,
+		"detection_time": response.Timestamp.Format(time.RFC3339),
+		"status":         "new",
+		"event_type":     "threat_detection",
+		"timestamp":      response.Timestamp,
+		"evidence":       response.Evidence,
 	}
 
 	// Send to server

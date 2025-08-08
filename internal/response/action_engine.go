@@ -2,6 +2,7 @@ package response
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -50,7 +51,8 @@ func (ae *ActionEngine) QuarantineFile(filePath string) error {
 
 	// Check if file exists
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		return fmt.Errorf("file does not exist: %s", filePath)
+		ae.logger.Warn("File does not exist, skipping quarantine: %s", filePath)
+		return nil // Don't return error, just skip
 	}
 
 	// Check if already quarantined
@@ -62,6 +64,7 @@ func (ae *ActionEngine) QuarantineFile(filePath string) error {
 	// Perform quarantine
 	err := ae.quarantineManager.QuarantineFile(filePath)
 	if err != nil {
+		ae.logger.Error("Failed to quarantine file: %v", err)
 		return fmt.Errorf("failed to quarantine file: %w", err)
 	}
 
@@ -98,6 +101,11 @@ func (ae *ActionEngine) RestoreFile(filePath string) error {
 func (ae *ActionEngine) TerminateProcesses(processID int) error {
 	ae.logger.Info("Terminating process: %d", processID)
 
+	if processID <= 0 {
+		ae.logger.Debug("Skip terminate: invalid PID %d", processID)
+		return nil
+	}
+
 	// Check if process was already terminated
 	if ae.terminatedProcesses[processID] {
 		ae.logger.Debug("Process already terminated: %d", processID)
@@ -120,6 +128,11 @@ func (ae *ActionEngine) TerminateProcesses(processID int) error {
 // BlockNetworkConnections chặn kết nối mạng
 func (ae *ActionEngine) BlockNetworkConnections(processID int) error {
 	ae.logger.Info("Blocking network connections for process: %d", processID)
+
+	if processID <= 0 {
+		ae.logger.Debug("Skip block network: invalid PID %d", processID)
+		return nil
+	}
 
 	// Create connection key
 	connectionKey := fmt.Sprintf("process_%d", processID)
@@ -272,16 +285,166 @@ func (qm *QuarantineManager) Stop() {
 
 // QuarantineFile cách ly file
 func (qm *QuarantineManager) QuarantineFile(filePath string) error {
+	// Check if file exists first
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		qm.logger.Warn("File does not exist, skipping quarantine: %s", filePath)
+		return nil // Don't return error, just skip
+	}
+
 	// Create quarantine file path
 	fileName := filepath.Base(filePath)
 	quarantinePath := filepath.Join(qm.quarantineDir, fmt.Sprintf("%s_%d", fileName, time.Now().Unix()))
 
-	// Move file to quarantine
-	if err := os.Rename(filePath, quarantinePath); err != nil {
-		return fmt.Errorf("failed to move file to quarantine: %w", err)
+	// Try multiple approaches with retry logic
+	maxRetries := 3
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		qm.logger.Debug("Quarantine attempt %d/%d for file: %s", attempt, maxRetries, filePath)
+
+		// Check if file still exists before attempting
+		if _, err := os.Stat(filePath); os.IsNotExist(err) {
+			qm.logger.Warn("File no longer exists during quarantine attempt %d: %s", attempt, filePath)
+			return nil // File was deleted during quarantine process
+		}
+
+		// Try to move file first (most efficient)
+		if err := os.Rename(filePath, quarantinePath); err == nil {
+			qm.logger.Info("File quarantined (moved): %s -> %s", filePath, quarantinePath)
+			return nil
+		} else {
+			qm.logger.Debug("Move failed (attempt %d): %v", attempt, err)
+		}
+
+		// If move fails, try copy approach
+		if stat, statErr := os.Stat(filePath); statErr == nil {
+			if stat.IsDir() {
+				// Handle directory quarantine
+				if err := qm.quarantineDirectory(filePath, quarantinePath); err == nil {
+					qm.logger.Info("Directory quarantined (copied): %s -> %s", filePath, quarantinePath)
+					return nil
+				} else {
+					qm.logger.Debug("Directory copy failed (attempt %d): %v", attempt, err)
+				}
+			} else {
+				// Handle file quarantine
+				if err := qm.copyFileContents(filePath, quarantinePath); err == nil {
+					qm.logger.Info("File quarantined (copied): %s -> %s", filePath, quarantinePath)
+					return nil
+				} else {
+					qm.logger.Debug("File copy failed (attempt %d): %v", attempt, err)
+				}
+			}
+		} else if os.IsNotExist(statErr) {
+			qm.logger.Warn("File no longer exists during quarantine attempt %d: %s", attempt, filePath)
+			return nil // File was deleted during quarantine process
+		}
+
+		// Wait before retry (exponential backoff)
+		if attempt < maxRetries {
+			waitTime := time.Duration(attempt) * time.Second
+			qm.logger.Debug("Waiting %v before retry", waitTime)
+			time.Sleep(waitTime)
+		}
 	}
 
-	qm.logger.Info("File quarantined: %s -> %s", filePath, quarantinePath)
+	return fmt.Errorf("failed to quarantine file after %d attempts: %s", maxRetries, filePath)
+}
+
+// quarantineDirectory handles directory quarantine with better error handling
+func (qm *QuarantineManager) quarantineDirectory(srcDir, dstDir string) error {
+	// Create destination directory
+	if err := os.MkdirAll(dstDir, 0755); err != nil {
+		return fmt.Errorf("failed to create quarantine directory: %w", err)
+	}
+
+	// Walk through source directory
+	return filepath.Walk(srcDir, func(src string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			// Skip files that can't be accessed
+			qm.logger.Debug("Skipping inaccessible file: %s", src)
+			return nil
+		}
+
+		// Calculate relative path
+		rel, err := filepath.Rel(srcDir, src)
+		if err != nil {
+			return fmt.Errorf("failed to calculate relative path: %w", err)
+		}
+
+		dst := filepath.Join(dstDir, rel)
+
+		if info.IsDir() {
+			// Create directory
+			if err := os.MkdirAll(dst, 0755); err != nil {
+				return fmt.Errorf("failed to create directory %s: %w", dst, err)
+			}
+		} else {
+			// Ensure parent directory exists
+			if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+				return fmt.Errorf("failed to create parent directory for %s: %w", dst, err)
+			}
+
+			// Copy file with retry
+			if err := qm.copyFileContents(src, dst); err != nil {
+				qm.logger.Debug("Failed to copy file %s: %v", src, err)
+				// Continue with other files instead of failing completely
+				return nil
+			}
+		}
+
+		return nil
+	})
+}
+
+// copyFileContents copies a file's contents from src to dst
+func (qm *QuarantineManager) copyFileContents(src, dst string) error {
+	// Try to open source file with different access modes
+	var in *os.File
+	var err error
+
+	// First try: normal read access
+	in, err = os.Open(src)
+	if err != nil {
+		// Second try: read-only with share access
+		in, err = os.OpenFile(src, os.O_RDONLY, 0)
+		if err != nil {
+			// Third try: read with share delete (Windows specific)
+			// This might work even if file is locked by another process
+			return fmt.Errorf("failed to open file after multiple attempts: %w", err)
+		}
+	}
+	defer in.Close()
+
+	// Create destination file
+	out, err := os.Create(dst)
+	if err != nil {
+		return fmt.Errorf("failed to create destination file: %w", err)
+	}
+	defer func() {
+		_ = out.Close()
+	}()
+
+	// Copy with buffer for better performance
+	buffer := make([]byte, 32*1024) // 32KB buffer
+	for {
+		n, readErr := in.Read(buffer)
+		if n > 0 {
+			if _, writeErr := out.Write(buffer[:n]); writeErr != nil {
+				return fmt.Errorf("failed to write to destination: %w", writeErr)
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return fmt.Errorf("failed to read source file: %w", readErr)
+		}
+	}
+
+	// Ensure data is written to disk
+	if err = out.Sync(); err != nil {
+		return fmt.Errorf("failed to sync destination file: %w", err)
+	}
+
 	return nil
 }
 

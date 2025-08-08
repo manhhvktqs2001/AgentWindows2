@@ -26,6 +26,9 @@ import (
 	"net"
 
 	"golang.org/x/sys/windows"
+
+	"edr-agent-windows/internal/scanner"
+	"reflect"
 )
 
 var (
@@ -294,11 +297,11 @@ func main() {
 
 // testYaraScanning tests YARA scanning functionality
 func testYaraScanning(filePath string, cfg *config.Config, logger *utils.Logger) {
-	fmt.Printf("🔍 Testing YARA scanning on: %s\n", filePath)
+	fmt.Fprintf(os.Stdout, "🔍 Testing YARA scanning on: %s\n", filePath)
 
 	// Check if file exists
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		fmt.Printf("❌ File not found: %s\n", filePath)
+		fmt.Fprintf(os.Stdout, "❌ File not found: %s\n", filePath)
 		return
 	}
 
@@ -307,49 +310,94 @@ func testYaraScanning(filePath string, cfg *config.Config, logger *utils.Logger)
 
 	// Scan file
 	if s, ok := scanner.(interface {
-		ScanFile(string) (*scanResult, error)
+		ScanFile(string) (interface{}, error)
 	}); ok {
 		result, err := s.ScanFile(filePath)
 		if err != nil {
-			fmt.Printf("❌ Scan failed: %v\n", err)
+			fmt.Fprintf(os.Stdout, "❌ Scan failed: %v\n", err)
 			return
 		}
 
-		// Display results
-		fmt.Printf("\n=== YARA Scan Results ===\n")
-		fmt.Printf("File: %s\n", result.FilePath)
-		fmt.Printf("Matched: %v\n", result.Matched)
-
-		if result.Matched {
-			fmt.Printf("🚨 THREAT DETECTED!\n")
-			fmt.Printf("Rule: %s\n", result.RuleName)
-			fmt.Printf("Severity: %d\n", result.Severity)
-			fmt.Printf("Tags: %v\n", result.RuleTags)
-			fmt.Printf("Description: %s\n", result.Description)
-			fmt.Printf("File Hash: %s\n", result.FileHash)
-		} else {
-			fmt.Printf("✅ File is clean\n")
+		// Use reflection to access the result fields
+		v := reflect.ValueOf(result)
+		if v.Kind() == reflect.Ptr {
+			v = v.Elem()
 		}
 
-		fmt.Printf("Scan Time: %dms\n", result.ScanTime)
-		fmt.Printf("File Size: %d bytes\n", result.FileSize)
+		// Display results
+		fmt.Fprintf(os.Stdout, "\n=== YARA Scan Results ===\n")
+
+		// Get FilePath
+		if filePathField := v.FieldByName("FilePath"); filePathField.IsValid() {
+			fmt.Fprintf(os.Stdout, "File: %s\n", filePathField.Interface())
+		}
+
+		// Get Matched
+		if matchedField := v.FieldByName("Matched"); matchedField.IsValid() {
+			matched := matchedField.Interface().(bool)
+			fmt.Fprintf(os.Stdout, "Matched: %v\n", matched)
+
+			if matched {
+				fmt.Fprintf(os.Stdout, "🚨 THREAT DETECTED!\n")
+
+				// Get RuleName
+				if ruleNameField := v.FieldByName("RuleName"); ruleNameField.IsValid() {
+					fmt.Fprintf(os.Stdout, "Rule: %s\n", ruleNameField.Interface())
+				}
+
+				// Get Severity
+				if severityField := v.FieldByName("Severity"); severityField.IsValid() {
+					fmt.Fprintf(os.Stdout, "Severity: %d\n", severityField.Interface())
+				}
+
+				// Get RuleTags
+				if ruleTagsField := v.FieldByName("RuleTags"); ruleTagsField.IsValid() {
+					fmt.Fprintf(os.Stdout, "Tags: %v\n", ruleTagsField.Interface())
+				}
+
+				// Get Description
+				if descriptionField := v.FieldByName("Description"); descriptionField.IsValid() {
+					fmt.Fprintf(os.Stdout, "Description: %s\n", descriptionField.Interface())
+				}
+
+				// Get FileHash
+				if fileHashField := v.FieldByName("FileHash"); fileHashField.IsValid() {
+					fmt.Fprintf(os.Stdout, "File Hash: %s\n", fileHashField.Interface())
+				}
+			} else {
+				fmt.Fprintf(os.Stdout, "✅ File is clean\n")
+			}
+
+			// Get ScanTime
+			if scanTimeField := v.FieldByName("ScanTime"); scanTimeField.IsValid() {
+				fmt.Fprintf(os.Stdout, "Scan Time: %dms\n", scanTimeField.Interface())
+			}
+
+			// Get FileSize
+			if fileSizeField := v.FieldByName("FileSize"); fileSizeField.IsValid() {
+				fmt.Fprintf(os.Stdout, "File Size: %d bytes\n", fileSizeField.Interface())
+			}
+		}
+
+		// Force flush to ensure immediate display
+		os.Stdout.Sync()
 	} else {
-		fmt.Printf("❌ Scanner does not support ScanFile method\n")
+		fmt.Fprintf(os.Stdout, "❌ Scanner does not support ScanFile method\n")
 	}
 }
 
 // createYaraScanner creates and configures YARA scanner for testing
 func createYaraScanner(cfg *config.Config, logger *utils.Logger) interface{} {
 	// Import scanner package functions
-	scanner := newYaraScanner(&cfg.Yara, logger)
+	scanner := scanner.NewYaraScanner(&cfg.Yara, logger)
 
 	// Load rules
-	if err := loadRules(scanner); err != nil {
+	if err := scanner.LoadRules(); err != nil {
 		logger.Error("Failed to load YARA rules: %v", err)
 		fmt.Printf("⚠️  Warning: Failed to load YARA rules: %v\n", err)
 		fmt.Printf("Creating test rules...\n")
 		createTestRules(cfg.Yara.RulesPath)
-		loadRules(scanner)
+		scanner.LoadRules()
 	}
 
 	return scanner
@@ -431,14 +479,14 @@ func (s *yaraTestScanner) LoadRules() error {
 	return nil
 }
 
-func (s *yaraTestScanner) ScanFile(filePath string) (*scanResult, error) {
+func (s *yaraTestScanner) ScanFile(filePath string) (*scanner.ScanResult, error) {
 	// Read the file to scan
 	content, err := os.ReadFile(filePath)
 	if err != nil {
 		return nil, err
 	}
 
-	result := &scanResult{
+	result := &scanner.ScanResult{
 		FilePath: filePath,
 		Matched:  false,
 		FileSize: int64(len(content)),

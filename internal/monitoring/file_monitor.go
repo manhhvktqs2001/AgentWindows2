@@ -25,6 +25,7 @@ type FileMonitor struct {
 	watchers  map[string]*DirectoryWatcher
 	agentID   string               // Add agent ID field
 	scanner   *scanner.YaraScanner // Add YARA scanner
+	lastAlert map[string]time.Time
 }
 
 type DirectoryWatcher struct {
@@ -57,15 +58,16 @@ type FILE_NOTIFY_INFORMATION struct {
 	FileName        [1]uint16
 }
 
-func NewFileMonitor(cfg *config.FileSystemConfig, logger *utils.Logger) *FileMonitor {
+func NewFileMonitor(cfg *config.FileSystemConfig, logger *utils.Logger, yaraScanner *scanner.YaraScanner) *FileMonitor {
 	return &FileMonitor{
 		config:    cfg,
 		logger:    logger,
 		eventChan: make(chan models.FileEvent, 1000),
 		stopChan:  make(chan bool),
 		watchers:  make(map[string]*DirectoryWatcher),
-		agentID:   "",  // Will be set later
-		scanner:   nil, // Will be set later
+		agentID:   "",          // Will be set later
+		scanner:   yaraScanner, // Provided by caller
+		lastAlert: make(map[string]time.Time),
 	}
 }
 
@@ -78,18 +80,22 @@ func (fm *FileMonitor) Start() error {
 		return fmt.Errorf("no paths configured for monitoring")
 	}
 
+	fm.logger.Info("Configured paths for monitoring: %v", fm.config.Paths)
+
 	// Start watching each configured path
 	for _, path := range fm.config.Paths {
+		fm.logger.Debug("Attempting to watch directory: %s", path)
 		if err := fm.watchDirectory(path); err != nil {
 			fm.logger.Warn("Failed to watch directory %s: %v", path, err)
 			continue
 		}
+		fm.logger.Info("Successfully started watching directory: %s", path)
 	}
 
 	// Start event processing goroutine
 	go fm.processEvents()
 
-	fm.logger.Info("File system monitor started successfully")
+	fm.logger.Info("File system monitor started successfully - watching %d directories", len(fm.watchers))
 	return nil
 }
 
@@ -177,6 +183,8 @@ func (fm *FileMonitor) watchDirectory(path string) error {
 
 // monitorDirectory monitors a single directory for changes
 func (fm *FileMonitor) monitorDirectory(watcher *DirectoryWatcher) {
+	fm.logger.Info("Starting directory monitoring for: %s", watcher.path)
+
 	buffer := make([]byte, 4096)
 	var overlapped windows.Overlapped
 	var bytesReturned uint32
@@ -184,6 +192,7 @@ func (fm *FileMonitor) monitorDirectory(watcher *DirectoryWatcher) {
 	for {
 		select {
 		case <-fm.stopChan:
+			fm.logger.Info("Stopping directory monitoring for: %s", watcher.path)
 			return
 		default:
 			// Read directory changes using Windows API
@@ -219,6 +228,8 @@ func (fm *FileMonitor) monitorDirectory(watcher *DirectoryWatcher) {
 				continue
 			}
 
+			fm.logger.Debug("Directory change detected for: %s (bytes: %d)", watcher.path, bytesReturned)
+
 			// Process the changes
 			fm.processDirectoryChanges(watcher.path, buffer[:bytesReturned])
 		}
@@ -227,6 +238,8 @@ func (fm *FileMonitor) monitorDirectory(watcher *DirectoryWatcher) {
 
 // processDirectoryChanges processes directory change notifications
 func (fm *FileMonitor) processDirectoryChanges(dirPath string, buffer []byte) {
+	fm.logger.Debug("Processing directory changes for: %s (buffer size: %d)", dirPath, len(buffer))
+
 	offset := uint32(0)
 
 	for offset < uint32(len(buffer)) {
@@ -235,6 +248,8 @@ func (fm *FileMonitor) processDirectoryChanges(dirPath string, buffer []byte) {
 		// Extract filename
 		filename := windows.UTF16ToString((*[1 << 20]uint16)(unsafe.Pointer(&info.FileName[0]))[:info.FileNameLength/2])
 		fullPath := filepath.Join(dirPath, filename)
+
+		fm.logger.Debug("Directory change detected: %s (action: %d)", fullPath, info.Action)
 
 		// Process the event
 		fm.processFileEvent(fullPath, info.Action)
@@ -249,8 +264,11 @@ func (fm *FileMonitor) processDirectoryChanges(dirPath string, buffer []byte) {
 
 // processFileEvent processes a single file event
 func (fm *FileMonitor) processFileEvent(filePath string, action uint32) {
+	fm.logger.Debug("Processing file event: %s, action: %d", filePath, action)
+
 	// Skip if file should be excluded
 	if fm.shouldExcludeFile(filePath) {
+		fm.logger.Debug("File excluded from monitoring: %s", filePath)
 		return
 	}
 
@@ -259,6 +277,7 @@ func (fm *FileMonitor) processFileEvent(filePath string, action uint32) {
 	if err != nil {
 		// File might have been deleted
 		fileInfo = nil
+		fm.logger.Debug("File not found (may be deleted): %s", filePath)
 	}
 
 	// Create file event
@@ -285,12 +304,14 @@ func (fm *FileMonitor) processFileEvent(filePath string, action uint32) {
 		event.UserID = fm.getCurrentUser()
 	}
 
+	fm.logger.Debug("Created file event: %s - %s (size: %d)", event.Action, filePath, event.FileSize)
+
 	// Send event
 	select {
 	case fm.eventChan <- event:
-		fm.logger.Debug("File event: %s - %s", event.Action, filePath)
+		fm.logger.Debug("File event sent to channel: %s - %s", event.Action, filePath)
 	default:
-		fm.logger.Warn("Event channel full, dropping file event")
+		fm.logger.Warn("Event channel full, dropping file event: %s", filePath)
 	}
 
 	// Scan file with YARA if scanner is available and file is created/modified
@@ -303,13 +324,21 @@ func (fm *FileMonitor) processFileEvent(filePath string, action uint32) {
 					return
 				}
 				if result != nil && result.Matched {
-					// Print alert directly to terminal
-					fmt.Printf("\n🔍 FILE MONITOR: YARA threat detected!\n")
-					fmt.Printf("File: %s\n", filePath)
-					fmt.Printf("Action: %s\n", fm.determineAction(action))
-					fmt.Printf("Rule: %s\n", result.RuleName)
-					fmt.Printf("Severity: %d\n", result.Severity)
-					fmt.Printf("🔍 END FILE MONITOR ALERT\n\n")
+					key := filePath + "|" + result.RuleName
+					if t, ok := fm.lastAlert[key]; ok && time.Since(t) < 60*time.Second {
+						return
+					}
+					fm.lastAlert[key] = time.Now()
+					// Print alert directly to terminal - Force flush to ensure immediate display
+					fmt.Fprintf(os.Stdout, "\n🔍 FILE MONITOR: YARA threat detected!\n")
+					fmt.Fprintf(os.Stdout, "File: %s\n", filePath)
+					fmt.Fprintf(os.Stdout, "Action: %s\n", fm.determineAction(action))
+					fmt.Fprintf(os.Stdout, "Rule: %s\n", result.RuleName)
+					fmt.Fprintf(os.Stdout, "Severity: %d\n", result.Severity)
+					fmt.Fprintf(os.Stdout, "🔍 END FILE MONITOR ALERT\n\n")
+
+					// Force flush to ensure immediate display
+					os.Stdout.Sync()
 
 					fm.logger.Warn("YARA threat detected: %s -> %s", filePath, result.RuleName)
 				}
@@ -324,6 +353,20 @@ func (fm *FileMonitor) shouldExcludeFile(filePath string) bool {
 	ext := strings.ToLower(filepath.Ext(filePath))
 	for _, excludeExt := range fm.config.ExcludeExtensions {
 		if strings.EqualFold(ext, excludeExt) {
+			return true
+		}
+	}
+
+	// Exclude noisy/self paths
+	lower := strings.ToLower(filePath)
+	noisy := []string{
+		"\\elastic\\agent\\data\\",
+		"\\gopls\\",
+		"\\yara-rules\\",
+		"\\quarantine\\",
+	}
+	for _, n := range noisy {
+		if strings.Contains(lower, strings.ToLower(n)) {
 			return true
 		}
 	}

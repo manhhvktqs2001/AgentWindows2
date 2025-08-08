@@ -23,15 +23,10 @@ type Agent struct {
 	scanner      *scanner.YaraScanner
 
 	// Monitors
-	fileMonitor      *monitoring.FileMonitor
-	processMonitor   *monitoring.ProcessMonitor
-	networkMonitor   *monitoring.NetworkMonitor
-	registryMonitor  *monitoring.RegistryMonitor
-	memoryScanner    *monitoring.MemoryScanner
-	behaviorAnalyzer *monitoring.BehaviorAnalyzer
-
-	// Response System
-	responseManager *response.ResponseManager
+	fileMonitor     *monitoring.FileMonitor
+	processMonitor  *monitoring.ProcessMonitor
+	networkMonitor  *monitoring.NetworkMonitor
+	registryMonitor *monitoring.RegistryMonitor
 
 	// Control channels
 	stopChan  chan bool
@@ -61,130 +56,47 @@ func NewAgent(cfg *config.Config, logger *utils.Logger) (*Agent, error) {
 	// Initialize server client
 	serverClient := communication.NewServerClient(cfg.Server, logger)
 
-	// Set agent ID if available in config
-	if cfg.Agent.ID != "" {
-		serverClient.SetAgentID(cfg.Agent.ID)
-	}
-
 	// Initialize YARA scanner
 	yaraScanner := scanner.NewYaraScanner(&cfg.Yara, logger)
 
 	// Initialize monitors
-	fileMonitor := monitoring.NewFileMonitor(&cfg.Monitoring.FileSystem, logger)
+	fileMonitor := monitoring.NewFileMonitor(&cfg.Monitoring.FileSystem, logger, yaraScanner)
 	processMonitor := monitoring.NewProcessMonitor(&cfg.Monitoring.Processes, logger)
 	networkMonitor := monitoring.NewNetworkMonitor(&cfg.Monitoring.Network, logger)
 	registryMonitor := monitoring.NewRegistryMonitor(&cfg.Monitoring.Registry, logger)
-	memoryScanner := monitoring.NewMemoryScanner(&cfg.Monitoring.Memory, logger)
-	behaviorAnalyzer := monitoring.NewBehaviorAnalyzer(&cfg.Monitoring.Behavior, logger)
-
-	// Initialize Response Manager
-	responseManager := response.NewResponseManager(&cfg.Response, logger, serverClient)
 
 	agent := &Agent{
-		config:           cfg,
-		logger:           logger,
-		serverClient:     serverClient,
-		scanner:          yaraScanner,
-		fileMonitor:      fileMonitor,
-		processMonitor:   processMonitor,
-		networkMonitor:   networkMonitor,
-		registryMonitor:  registryMonitor,
-		memoryScanner:    memoryScanner,
-		behaviorAnalyzer: behaviorAnalyzer,
-		responseManager:  responseManager,
-		stopChan:         make(chan bool),
-		eventChan:        make(chan Event, cfg.Agent.MaxQueueSize),
-		taskChan:         make(chan Task, 100),
+		config:          cfg,
+		logger:          logger,
+		serverClient:    serverClient,
+		scanner:         yaraScanner,
+		fileMonitor:     fileMonitor,
+		processMonitor:  processMonitor,
+		networkMonitor:  networkMonitor,
+		registryMonitor: registryMonitor,
+		stopChan:        make(chan bool),
+		eventChan:       make(chan Event, cfg.Agent.MaxQueueSize),
+		taskChan:        make(chan Task, 100),
 	}
 
-	// Kết nối YARA scanner với server client để gửi alert
+	// Wire server client and response manager to scanner for alerting/notifications
 	yaraScanner.SetServerClient(serverClient)
-	yaraScanner.SetResponseManager(responseManager)
+
+	// Create and start Response Manager
+	responseManager := response.NewResponseManager(&cfg.Response, logger, serverClient)
+	if err := responseManager.Start(); err != nil {
+		logger.Error("Failed to start Response Manager: %v", err)
+	} else {
+		// Pass Response Manager to scanner so detections trigger user notifications and actions
+		yaraScanner.SetResponseManager(responseManager)
+	}
+
+	// Propagate AgentID to scanner if already set in config
 	if cfg.Agent.ID != "" {
 		yaraScanner.SetAgentID(cfg.Agent.ID)
 	}
 
 	return agent, nil
-}
-
-// Thực hiện đăng ký agent mới
-func (a *Agent) performNewRegistration(macAddress string) error {
-	// Lấy thông tin hệ thống
-	hostname, err := os.Hostname()
-	if err != nil {
-		return fmt.Errorf("failed to get hostname: %w", err)
-	}
-
-	ip, err := a.getIPAddress()
-	if err != nil {
-		return fmt.Errorf("failed to get IP address: %w", err)
-	}
-
-	osVersion, err := a.getOSVersion()
-	if err != nil {
-		return fmt.Errorf("failed to get OS version: %w", err)
-	}
-
-	systemInfo := a.getSystemInfo()
-
-	// Tạo request đăng ký với authentication
-	registration := communication.AgentRegistrationRequest{
-		AuthToken:    a.config.Server.AuthToken, // Pre-shared auth token
-		Hostname:     hostname,
-		IPAddress:    ip,
-		MACAddress:   macAddress,
-		OSType:       runtime.GOOS,
-		OSVersion:    osVersion,
-		Architecture: runtime.GOARCH,
-		AgentVersion: "1.0.0",
-		SystemInfo:   systemInfo,
-	}
-
-	// Gửi request đăng ký
-	result, err := a.serverClient.Register(registration)
-	if err != nil {
-		return fmt.Errorf("failed to register with server: %w", err)
-	}
-
-	// Cập nhật cấu hình với thông tin mới
-	a.config.Agent.ID = result.AgentID
-	if result.APIKey != "" {
-		a.config.Server.APIKey = result.APIKey
-		a.logger.Info("Updated API key from server")
-	}
-
-	// Lưu cấu hình
-	if err := a.saveConfigToFile(); err != nil {
-		a.logger.Warn("Failed to save agent config: %v", err)
-	}
-
-	a.logger.Info("Successfully registered new agent - ID: %s", result.AgentID)
-	a.logger.Info("System Info - Hostname: %s, IP: %s, MAC: %s, OS: %s %s", hostname, ip, macAddress, runtime.GOOS, osVersion)
-	return nil
-}
-
-// Lưu cấu hình agent vào file
-func (a *Agent) saveConfigToFile() error {
-	// Tìm đường dẫn config file
-	configFile := "config.yaml"
-
-	// Kiểm tra các vị trí có thể có của config file
-	possiblePaths := []string{
-		"config.yaml",
-		"./config/config.yaml",
-		"C:\\Program Files\\EDR-Agent\\config.yaml",
-	}
-
-	// Sử dụng file đầu tiên tồn tại hoặc tạo mới tại vị trí mặc định
-	for _, path := range possiblePaths {
-		if _, err := os.Stat(path); err == nil {
-			configFile = path
-			break
-		}
-	}
-
-	// Sử dụng SaveWithBackup để tạo backup trước khi lưu
-	return config.SaveWithBackup(a.config, configFile)
 }
 
 // Start agent
@@ -198,117 +110,64 @@ func (a *Agent) Start() error {
 
 	a.logger.Info("Starting EDR Agent...")
 
-	// Start Response Manager first
-	if err := a.responseManager.Start(); err != nil {
-		return fmt.Errorf("failed to start response manager: %w", err)
-	}
-
 	// Register with server
 	err := a.registerWithServer()
 	if err != nil {
 		return fmt.Errorf("failed to register with server: %w", err)
 	}
 
+	// Propagate AgentID to serverClient and monitors
+	a.serverClient.SetAgentID(a.config.Agent.ID)
+	// Also propagate to scanner so alerts include agent_id
+	if a.scanner != nil {
+		a.scanner.SetAgentID(a.config.Agent.ID)
+		if loadErr := a.scanner.LoadRules(); loadErr != nil {
+			a.logger.Warn("Failed to load YARA rules: %v", loadErr)
+		}
+	}
+	a.fileMonitor.SetAgentID(a.config.Agent.ID)
+	a.processMonitor.SetAgentID(a.config.Agent.ID)
+	a.networkMonitor.SetAgentID(a.config.Agent.ID)
+	a.registryMonitor.SetAgentID(a.config.Agent.ID)
+
 	// Start monitors
 	if a.config.Monitoring.FileSystem.Enabled {
-		// Set agent ID for file monitor
-		a.fileMonitor.SetAgentID(a.config.Agent.ID)
-		// Set YARA scanner for file monitor
-		a.fileMonitor.SetScanner(a.scanner)
 		err = a.fileMonitor.Start()
 		if err != nil {
 			a.logger.Error("Failed to start file monitor: %v", err)
 		}
-		// Forward file events to agent eventChan
-		go func() {
-			for event := range a.fileMonitor.GetEventChannel() {
-				a.RegisterEvent(&event)
-			}
-		}()
 	}
 
 	if a.config.Monitoring.Processes.Enabled {
-		// Set agent ID for process monitor
-		a.processMonitor.SetAgentID(a.config.Agent.ID)
 		err = a.processMonitor.Start()
 		if err != nil {
 			a.logger.Error("Failed to start process monitor: %v", err)
 		}
-		// Forward process events to agent eventChan
-		go func() {
-			for event := range a.processMonitor.GetEventChannel() {
-				a.RegisterEvent(&event)
-			}
-		}()
 	}
 
 	if a.config.Monitoring.Network.Enabled {
-		// Set agent ID for network monitor
-		a.networkMonitor.SetAgentID(a.config.Agent.ID)
 		err = a.networkMonitor.Start()
 		if err != nil {
 			a.logger.Error("Failed to start network monitor: %v", err)
 		}
-		// Forward network events to agent eventChan
-		go func() {
-			for event := range a.networkMonitor.GetEventChannel() {
-				a.RegisterEvent(&event)
-			}
-		}()
 	}
 
 	if a.config.Monitoring.Registry.Enabled {
-		// Set agent ID for registry monitor
-		a.registryMonitor.SetAgentID(a.config.Agent.ID)
 		err = a.registryMonitor.Start()
 		if err != nil {
 			a.logger.Error("Failed to start registry monitor: %v", err)
 		}
-		// Forward registry events to agent eventChan
-		go func() {
-			for event := range a.registryMonitor.GetEventChannel() {
-				a.RegisterEvent(&event)
-			}
-		}()
-	}
-
-	if a.config.Monitoring.Memory.Enabled {
-		// Set agent ID for memory scanner
-		a.memoryScanner.SetAgentID(a.config.Agent.ID)
-		err = a.memoryScanner.Start()
-		if err != nil {
-			a.logger.Error("Failed to start memory scanner: %v", err)
-		}
-		// Forward memory events to agent eventChan
-		go func() {
-			for event := range a.memoryScanner.GetEventChannel() {
-				a.RegisterEvent(&event)
-			}
-		}()
-	}
-
-	if a.config.Monitoring.Behavior.Enabled {
-		// Set agent ID for behavior analyzer
-		a.behaviorAnalyzer.SetAgentID(a.config.Agent.ID)
-		err = a.behaviorAnalyzer.Start()
-		if err != nil {
-			a.logger.Error("Failed to start behavior analyzer: %v", err)
-		}
-		// Forward behavior events to agent eventChan
-		go func() {
-			for event := range a.behaviorAnalyzer.GetEventChannel() {
-				a.RegisterEvent(&event)
-			}
-		}()
 	}
 
 	// Start background workers
 	go a.heartbeatWorker()
 	go a.eventWorker()
 	go a.taskWorker()
+	go a.monitorEventWorker() // Start the new monitor event worker
 
 	a.isRunning = true
 	a.logger.Info("EDR Agent started successfully")
+
 	return nil
 }
 
@@ -326,16 +185,11 @@ func (a *Agent) Stop() {
 	// Signal stop to all workers
 	close(a.stopChan)
 
-	// Stop Response Manager
-	a.responseManager.Stop()
-
 	// Stop monitors
 	a.fileMonitor.Stop()
 	a.processMonitor.Stop()
 	a.networkMonitor.Stop()
 	a.registryMonitor.Stop()
-	a.memoryScanner.Stop()
-	a.behaviorAnalyzer.Stop()
 
 	a.isRunning = false
 	a.logger.Info("EDR Agent stopped")
@@ -343,75 +197,67 @@ func (a *Agent) Stop() {
 
 // Register event
 func (a *Agent) RegisterEvent(event Event) {
+	a.logger.Debug("Registering event: %s from agent %s", event.GetType(), event.GetAgentID())
 	select {
 	case a.eventChan <- event:
+		a.logger.Debug("Event registered successfully: %s", event.GetType())
 	default:
-		a.logger.Warn("Event queue full, dropping event")
+		a.logger.Warn("Event queue full, dropping event: %s", event.GetType())
 	}
 }
 
 // Register with server
 func (a *Agent) registerWithServer() error {
-	// Bước 1: Lấy MAC address trước tiên
-	macAddress, err := a.getMACAddress()
+	hostname, err := os.Hostname()
 	if err != nil {
-		a.logger.Warn("Failed to get MAC address: %v", err)
-		return fmt.Errorf("cannot register without MAC address: %w", err)
+		return fmt.Errorf("failed to get hostname: %w", err)
 	}
 
-	a.logger.Info("Agent MAC Address: %s", macAddress)
-
-	// Bước 2: Kiểm tra xem agent đã tồn tại chưa bằng MAC address
-	exists, existingAgentID, existingAPIKey, err := a.serverClient.CheckAgentExistsByMAC(macAddress)
+	ip, err := a.getIPAddress()
 	if err != nil {
-		a.logger.Error("Failed to check agent existence by MAC: %v", err)
-		// Nếu không check được, vẫn tiếp tục đăng ký mới để tránh treo
-	} else if exists {
-		// Agent đã tồn tại, sử dụng thông tin hiện có
-		a.logger.Info("Agent already exists with MAC %s, Agent ID: %s", macAddress, existingAgentID)
+		return fmt.Errorf("failed to get IP address: %w", err)
+	}
 
-		// Cập nhật thông tin agent từ server
-		a.config.Agent.ID = existingAgentID
+	osVersion, err := a.getOSVersion()
+	if err != nil {
+		return fmt.Errorf("failed to get OS version: %w", err)
+	}
 
-		if existingAPIKey != "" {
-			oldAPIKey := a.config.Server.APIKey
-			a.config.Server.APIKey = existingAPIKey
-			a.serverClient.UpdateAPIKey(existingAPIKey)
-			a.logger.Info("Updated API key: %s -> %s", oldAPIKey, existingAPIKey)
+	// Try check-by-MAC first
+	exists, agentID, apiKey, err := a.serverClient.CheckAgentExistsByMAC(a.getPrimaryMAC())
+	if err == nil && exists {
+		a.config.Agent.ID = agentID
+		if apiKey != "" {
+			a.config.Server.APIKey = apiKey
 		}
-
-		// Lưu cấu hình đã cập nhật
-		if err := a.saveConfigToFile(); err != nil {
-			a.logger.Warn("Failed to save updated config: %v", err)
-		}
-
-		// Kiểm tra kết nối bằng heartbeat
-		if err := a.sendHeartbeat(); err != nil {
-			a.logger.Warn("Heartbeat failed with existing registration: %v", err)
-			// Có thể server đã reset, thử đăng ký lại
-			return a.performNewRegistration(macAddress)
-		}
-
-		a.logger.Info("Successfully connected with existing agent registration")
+		a.logger.Info("Agent exists on server, using ID: %s", agentID)
 		return nil
 	}
 
-	// Bước 3: Agent chưa tồn tại, thực hiện đăng ký mới
-	a.logger.Info("Agent not found with MAC %s, performing new registration", macAddress)
-	return a.performNewRegistration(macAddress)
-}
+	registration := communication.AgentRegistrationRequest{
+		AuthToken:    a.config.Server.AuthToken,
+		Hostname:     hostname,
+		IPAddress:    ip,
+		MACAddress:   a.getPrimaryMAC(),
+		OSType:       runtime.GOOS,
+		OSVersion:    osVersion,
+		Architecture: runtime.GOARCH,
+		AgentVersion: "1.0.0",
+		SystemInfo:   map[string]interface{}{},
+	}
 
-// saveAgentID saves the agent ID and API key to the config file
-func (a *Agent) saveAgentID(agentID string) error {
-	// Update the config with the new agent ID and API key
-	a.config.Agent.ID = agentID
-	a.config.Server.APIKey = a.serverClient.GetAPIKey()
+	resp, err := a.serverClient.Register(registration)
+	if err != nil {
+		return err
+	}
 
-	// Update server client agent ID
-	a.serverClient.SetAgentID(agentID)
+	a.config.Agent.ID = resp.AgentID
+	if resp.APIKey != "" {
+		a.config.Server.APIKey = resp.APIKey
+	}
 
-	// Save to config file
-	return config.Save(a.config, "config.yaml")
+	a.logger.Info("Registered with server, Agent ID: %s", resp.AgentID)
+	return nil
 }
 
 // Send heartbeat
@@ -455,14 +301,17 @@ func (a *Agent) heartbeatWorker() {
 
 func (a *Agent) eventWorker() {
 	events := make([]Event, 0, a.config.Agent.EventBatchSize)
-	ticker := time.NewTicker(5 * time.Second) // Send batch every 5 seconds
+	ticker := time.NewTicker(2 * time.Second) // Send batch every 2 seconds instead of 5
 	defer ticker.Stop()
+
+	a.logger.Info("Event worker started - will send events to server every 2 seconds or when batch is full")
 
 	for {
 		select {
 		case <-a.stopChan:
 			// Send remaining events
 			if len(events) > 0 {
+				a.logger.Info("Sending %d remaining events to server", len(events))
 				// Convert []Event to []interface{}
 				interfaceEvents := make([]interface{}, len(events))
 				for i, event := range events {
@@ -473,10 +322,12 @@ func (a *Agent) eventWorker() {
 			return
 
 		case event := <-a.eventChan:
+			a.logger.Debug("Received event in eventWorker: %s", event.GetType())
 			events = append(events, event)
 
-			// Send batch when full
-			if len(events) >= a.config.Agent.EventBatchSize {
+			// Send batch when full or when we have a significant number
+			if len(events) >= a.config.Agent.EventBatchSize || len(events) >= 50 {
+				a.logger.Info("Sending batch of %d events to server (batch full)", len(events))
 				// Convert []Event to []interface{}
 				interfaceEvents := make([]interface{}, len(events))
 				for i, event := range events {
@@ -489,6 +340,7 @@ func (a *Agent) eventWorker() {
 		case <-ticker.C:
 			// Send batch on timer
 			if len(events) > 0 {
+				a.logger.Info("Sending batch of %d events to server (timer)", len(events))
 				// Convert []Event to []interface{}
 				interfaceEvents := make([]interface{}, len(events))
 				for i, event := range events {
@@ -511,6 +363,41 @@ func (a *Agent) taskWorker() {
 			if err != nil {
 				a.logger.Error("Task execution failed: %v", err)
 			}
+		}
+	}
+}
+
+// monitorEventWorker collects events from all monitors and sends them to the agent's event system
+func (a *Agent) monitorEventWorker() {
+	// Get event channels from all monitors
+	fileEvents := a.fileMonitor.GetEventChannel()
+	processEvents := a.processMonitor.GetEventChannel()
+	networkEvents := a.networkMonitor.GetEventChannel()
+	registryEvents := a.registryMonitor.GetEventChannel()
+
+	a.logger.Info("Monitor event worker started - listening for events from all monitors")
+
+	for {
+		select {
+		case <-a.stopChan:
+			a.logger.Info("Monitor event worker stopped")
+			return
+		case event := <-fileEvents:
+			// Convert FileEvent to Event interface and register
+			a.logger.Debug("Received file event: %s", event.EventType)
+			a.RegisterEvent(&event)
+		case event := <-processEvents:
+			// Convert ProcessEvent to Event interface and register
+			a.logger.Debug("Received process event: %s", event.EventType)
+			a.RegisterEvent(&event)
+		case event := <-networkEvents:
+			// Convert NetworkEvent to Event interface and register
+			a.logger.Debug("Received network event: %s", event.EventType)
+			a.RegisterEvent(&event)
+		case event := <-registryEvents:
+			// Convert RegistryEvent to Event interface and register
+			a.logger.Debug("Received registry event: %s", event.EventType)
+			a.RegisterEvent(&event)
 		}
 	}
 }
@@ -561,77 +448,6 @@ func (a *Agent) getIPAddress() (string, error) {
 	return "127.0.0.1", nil // Fallback to localhost
 }
 
-func (a *Agent) getMACAddress() (string, error) {
-	interfaces, err := net.Interfaces()
-	if err != nil {
-		return "", fmt.Errorf("failed to get network interfaces: %w", err)
-	}
-
-	// Ưu tiên 1: Interface có IP và đang hoạt động
-	for _, iface := range interfaces {
-		// Bỏ qua loopback và interface không hoạt động
-		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
-			continue
-		}
-
-		// Kiểm tra có MAC address không
-		if iface.HardwareAddr == nil {
-			continue
-		}
-
-		// Kiểm tra interface có IPv4 address không
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-
-		hasIPv4 := false
-		for _, addr := range addrs {
-			if ipnet, ok := addr.(*net.IPNet); ok {
-				if ip := ipnet.IP.To4(); ip != nil && !ip.IsLoopback() {
-					hasIPv4 = true
-					break
-				}
-			}
-		}
-
-		if hasIPv4 {
-			macAddr := iface.HardwareAddr.String()
-			a.logger.Debug("Selected primary interface: %s, MAC: %s", iface.Name, macAddr)
-			return macAddr, nil
-		}
-	}
-
-	// Ưu tiên 2: Bất kỳ interface nào có MAC address và đang hoạt động
-	for _, iface := range interfaces {
-		if iface.Flags&net.FlagUp != 0 && iface.HardwareAddr != nil {
-			macAddr := iface.HardwareAddr.String()
-			a.logger.Debug("Selected fallback interface: %s, MAC: %s", iface.Name, macAddr)
-			return macAddr, nil
-		}
-	}
-
-	return "", fmt.Errorf("no suitable MAC address found")
-}
-
-func (a *Agent) getSystemInfo() map[string]interface{} {
-	return map[string]interface{}{
-		"cpu_cores":  runtime.NumCPU(),
-		"go_version": runtime.Version(),
-		"go_os":      runtime.GOOS,
-		"go_arch":    runtime.GOARCH,
-		"hostname":   a.getHostname(),
-	}
-}
-
-func (a *Agent) getHostname() string {
-	hostname, err := os.Hostname()
-	if err != nil {
-		return "unknown"
-	}
-	return hostname
-}
-
 func (a *Agent) getOSVersion() (string, error) {
 	// Try to get Windows version from registry or system info
 	// For now, return a basic version based on runtime
@@ -641,4 +457,19 @@ func (a *Agent) getOSVersion() (string, error) {
 	default:
 		return runtime.GOOS, nil
 	}
+}
+
+// getPrimaryMAC returns the first non-loopback MAC address
+func (a *Agent) getPrimaryMAC() string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagLoopback != 0 || len(iface.HardwareAddr) == 0 {
+			continue
+		}
+		return iface.HardwareAddr.String()
+	}
+	return ""
 }

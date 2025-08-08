@@ -151,6 +151,12 @@ func (sc *ServerClient) Register(registration AgentRegistrationRequest) (*AgentR
 func (sc *ServerClient) SendHeartbeat(data HeartbeatData) error {
 	url := fmt.Sprintf("%s/api/v1/agents/heartbeat", sc.config.URL)
 
+	// If server URL empty or API key missing, skip quietly
+	if sc.config.URL == "" || sc.config.APIKey == "" {
+		sc.logger.Debug("Skipping heartbeat: server URL or API key not set")
+		return nil
+	}
+
 	jsonData, err := json.Marshal(data)
 	if err != nil {
 		return err
@@ -158,12 +164,14 @@ func (sc *ServerClient) SendHeartbeat(data HeartbeatData) error {
 
 	resp, err := sc.post(url, jsonData)
 	if err != nil {
-		return err
+		sc.logger.Warn("Heartbeat skipped (server unreachable): %v", err)
+		return nil
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("heartbeat failed: %d", resp.StatusCode)
+		sc.logger.Warn("Heartbeat not accepted (status %d). Suppressing error.", resp.StatusCode)
+		return nil
 	}
 
 	return nil
@@ -171,6 +179,11 @@ func (sc *ServerClient) SendHeartbeat(data HeartbeatData) error {
 
 func (sc *ServerClient) SendEvents(events []interface{}) error {
 	url := sc.config.URL + "/api/v1/agents/events"
+
+	if sc.config.URL == "" || sc.config.APIKey == "" || sc.agentID == "" {
+		sc.logger.Debug("Skipping send events: server URL/API key/agentID not set")
+		return nil
+	}
 
 	jsonData, err := json.Marshal(events)
 	if err != nil {
@@ -190,15 +203,15 @@ func (sc *ServerClient) SendEvents(events []interface{}) error {
 
 	resp, err := sc.httpClient.Do(req)
 	if err != nil {
-		sc.logger.Error("Failed to send events: %v", err)
-		return err
+		sc.logger.Warn("Send events skipped (server unreachable): %v", err)
+		return nil
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		body, _ := io.ReadAll(resp.Body)
-		sc.logger.Error("Send events failed: %d, response: %s", resp.StatusCode, string(body))
-		return fmt.Errorf("send events failed: %d", resp.StatusCode)
+		sc.logger.Warn("Send events not accepted: %d, response: %s (suppressed)", resp.StatusCode, string(body))
+		return nil
 	}
 
 	sc.logger.Info("Sent %d events to server", len(events))
@@ -335,6 +348,11 @@ func (sc *ServerClient) CheckAgentExistsByMAC(macAddress string) (bool, string, 
 func (sc *ServerClient) SendAlert(alertData map[string]interface{}) error {
 	url := sc.config.URL + "/api/v1/agents/alerts"
 
+	if sc.config.URL == "" || sc.config.APIKey == "" || sc.agentID == "" {
+		sc.logger.Debug("Skipping send alert: server URL/API key/agentID not set")
+		return nil
+	}
+
 	jsonData, err := json.Marshal(alertData)
 	if err != nil {
 		sc.logger.Error("Failed to marshal alert data: %v", err)
@@ -353,15 +371,19 @@ func (sc *ServerClient) SendAlert(alertData map[string]interface{}) error {
 
 	resp, err := sc.httpClient.Do(req)
 	if err != nil {
-		sc.logger.Error("Failed to send alert: %v", err)
-		return err
+		sc.logger.Warn("Send alert skipped (server unreachable): %v", err)
+		return nil
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		body, _ := io.ReadAll(resp.Body)
-		sc.logger.Error("Send alert failed: %d, response: %s", resp.StatusCode, string(body))
-		return fmt.Errorf("send alert failed: %d", resp.StatusCode)
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			sc.logger.Warn("Send alert unauthorized (suppressed): %d, response: %s", resp.StatusCode, string(body))
+			return nil
+		}
+		sc.logger.Warn("Send alert not accepted (suppressed): %d, response: %s", resp.StatusCode, string(body))
+		return nil
 	}
 
 	sc.logger.Info("Alert sent to server successfully")
