@@ -1,3 +1,6 @@
+// File: internal/response/windows_toast.go
+// Fix: Sửa lỗi hiển thị PowerShell balloon notification
+
 package response
 
 import (
@@ -49,7 +52,7 @@ func (wtn *WindowsToastNotifier) Stop() {
 	wtn.logger.Info("Windows Toast Notification system stopped")
 }
 
-// SendNotification hiển thị thông báo
+// SendNotification hiển thị thông báo - ĐÃ FIX
 func (wtn *WindowsToastNotifier) SendNotification(content *NotificationContent) error {
 	wtn.logger.Info("🚨 DISPLAYING SECURITY ALERT: %s", content.Title)
 
@@ -66,91 +69,205 @@ func (wtn *WindowsToastNotifier) SendNotification(content *NotificationContent) 
 	// Force flush console output
 	os.Stdout.Sync()
 
-	// Chỉ hiển thị balloon góc phải màn hình (không dùng fallback khác)
+	// FIX: Thử tất cả phương pháp hiển thị balloon với retry logic
 	go func() {
-		if err := wtn.showPowerShellBalloon(content); err == nil {
+		// Method 1: PowerShell Balloon (preferred)
+		if err := wtn.showPowerShellBalloonFixed(content); err == nil {
 			wtn.logger.Info("✅ PowerShell balloon notification displayed")
 			return
 		}
-		// Nếu thất bại, chỉ log để tránh hiện các dạng thông báo khác
-		wtn.logger.Debug("PowerShell balloon failed (no fallback shown): %v", err)
+
+		// Method 2: Windows Forms MessageBox
+		if err := wtn.showWindowsFormsMessageBox(content); err == nil {
+			wtn.logger.Info("✅ Windows Forms notification displayed")
+			return
+		}
+
+		// Method 3: PowerShell Toast (Windows 10+)
+		if err := wtn.showPowerShellToast(content); err == nil {
+			wtn.logger.Info("✅ PowerShell toast notification displayed")
+			return
+		}
+
+		// Method 4: Command prompt popup
+		wtn.showCommandPromptAlert(content)
+		wtn.logger.Info("✅ Command prompt notification displayed")
 	}()
 
 	return nil
 }
 
-// showPowerShellBalloon hiển thị balloon tip bằng PowerShell
-func (wtn *WindowsToastNotifier) showPowerShellBalloon(content *NotificationContent) error {
-	title := strings.ReplaceAll(content.Title, `"`, `'`)
-	message := strings.ReplaceAll(content.Message, `"`, `'`)
+// FIX: showPowerShellBalloonFixed - Version đã sửa lỗi
+func (wtn *WindowsToastNotifier) showPowerShellBalloonFixed(content *NotificationContent) error {
+	title := wtn.escapeString(content.Title)
+	message := wtn.escapeString(content.Message)
 
-	// Rút gọn message nếu quá dài
+	// Rút gọn message nếu quá dài (balloon có giới hạn ký tự)
+	if len(message) > 150 {
+		message = message[:150] + "..."
+	}
+
+	// FIX: Script PowerShell được tối ưu hóa với error handling
+	psScript := fmt.Sprintf(`
+try {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    $balloon = New-Object System.Windows.Forms.NotifyIcon
+    
+    # FIX: Sử dụng icon mặc định thay vì extract từ process
+    $balloon.Icon = [System.Drawing.SystemIcons]::Warning
+    $balloon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Warning
+    $balloon.BalloonTipText = "%s"
+    $balloon.BalloonTipTitle = "%s"
+    $balloon.Visible = $true
+    
+    # FIX: Hiển thị balloon với timeout dài hơn
+    $balloon.ShowBalloonTip(15000)
+    
+    # FIX: Đợi balloon hiển thị xong
+    Start-Sleep -Seconds 12
+    
+    # Cleanup
+    $balloon.Visible = $false
+    $balloon.Dispose()
+    
+    Write-Host "Balloon notification displayed successfully"
+    exit 0
+} catch {
+    Write-Error "Failed to show balloon: $_"
+    exit 1
+}
+`, message, title)
+
+	// FIX: Chạy PowerShell với các tham số tối ưu
+	cmd := exec.Command("powershell.exe",
+		"-WindowStyle", "Hidden",
+		"-ExecutionPolicy", "Bypass",
+		"-NoProfile",
+		"-Command", psScript)
+
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+
+	// FIX: Chạy và đợi kết quả
+	err := cmd.Run()
+	if err != nil {
+		wtn.logger.Debug("PowerShell balloon failed: %v", err)
+		return err
+	}
+
+	return nil
+}
+
+// FIX: Thêm method mới - Windows Forms MessageBox
+func (wtn *WindowsToastNotifier) showWindowsFormsMessageBox(content *NotificationContent) error {
+	title := wtn.escapeString(content.Title)
+	message := wtn.escapeString(content.Message)
+
 	if len(message) > 200 {
 		message = message[:200] + "..."
 	}
 
 	psScript := fmt.Sprintf(`
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-
-$balloon = New-Object System.Windows.Forms.NotifyIcon
-$path = Get-Process -id $pid | Select-Object -ExpandProperty Path
-$balloon.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon($path)
-$balloon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Warning
-$balloon.BalloonTipText = "%s"
-$balloon.BalloonTipTitle = "%s"
-$balloon.Visible = $true
-$balloon.ShowBalloonTip(10000)
-
-Start-Sleep 10
-$balloon.Dispose()
+try {
+    Add-Type -AssemblyName System.Windows.Forms
+    
+    $result = [System.Windows.Forms.MessageBox]::Show(
+        "%s", 
+        "%s", 
+        [System.Windows.Forms.MessageBoxButtons]::OK, 
+        [System.Windows.Forms.MessageBoxIcon]::Warning,
+        [System.Windows.Forms.MessageBoxDefaultButton]::Button1,
+        [System.Windows.Forms.MessageBoxOptions]::DefaultDesktopOnly
+    )
+    
+    Write-Host "MessageBox displayed successfully"
+    exit 0
+} catch {
+    Write-Error "Failed to show MessageBox: $_"
+    exit 1
+}
 `, message, title)
 
-	cmd := exec.Command("powershell.exe", "-WindowStyle", "Hidden", "-Command", psScript)
+	cmd := exec.Command("powershell.exe",
+		"-WindowStyle", "Hidden",
+		"-ExecutionPolicy", "Bypass",
+		"-NoProfile",
+		"-Command", psScript)
+
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 
-	return cmd.Start()
+	return cmd.Run()
 }
 
-// showMessageBox hiển thị MessageBox đơn giản
-func (wtn *WindowsToastNotifier) showMessageBox(content *NotificationContent) error {
-	title := strings.ReplaceAll(content.Title, `"`, `'`)
-	message := fmt.Sprintf("🚨 SECURITY ALERT\n\n%s\n\nSeverity: %s\nTime: %s\n\nThis alert will auto-close.",
-		strings.ReplaceAll(content.Message, `"`, `'`),
-		wtn.getSeverityText(content.Severity),
-		time.Now().Format("15:04:05"))
+// FIX: Thêm method mới - PowerShell Toast (Windows 10+)
+func (wtn *WindowsToastNotifier) showPowerShellToast(content *NotificationContent) error {
+	title := wtn.escapeString(content.Title)
+	message := wtn.escapeString(content.Message)
 
-	if len(message) > 400 {
-		message = message[:400] + "..."
+	if len(message) > 100 {
+		message = message[:100] + "..."
 	}
 
 	psScript := fmt.Sprintf(`
-Add-Type -AssemblyName System.Windows.Forms
-[System.Windows.Forms.MessageBox]::Show("%s", "%s", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
-`, message, title)
+try {
+    # FIX: Toast notification cho Windows 10+
+    $template = @"
+<toast>
+    <visual>
+        <binding template="ToastGeneric">
+            <text>%s</text>
+            <text>%s</text>
+        </binding>
+    </visual>
+</toast>
+"@
 
-	cmd := exec.Command("powershell.exe", "-WindowStyle", "Hidden", "-Command", psScript)
+    [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+    [Windows.UI.Notifications.ToastNotification, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+    [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
+
+    $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+    $xml.LoadXml($template)
+    $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
+    
+    $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("EDR Agent")
+    $notifier.Show($toast)
+    
+    Write-Host "Toast notification displayed successfully"
+    exit 0
+} catch {
+    Write-Error "Failed to show toast: $_"
+    exit 1
+}
+`, title, message)
+
+	cmd := exec.Command("powershell.exe",
+		"-WindowStyle", "Hidden",
+		"-ExecutionPolicy", "Bypass",
+		"-NoProfile",
+		"-Command", psScript)
+
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 
-	return cmd.Start()
+	return cmd.Run()
 }
 
-// showMsgBroadcast sử dụng msg.exe để broadcast popup đến tất cả sessions (best-effort)
-func (wtn *WindowsToastNotifier) showMsgBroadcast(content *NotificationContent) error {
-	title := strings.ReplaceAll(content.Title, "\"", `'`)
-	msg := content.Message
-	if len(msg) > 200 {
-		msg = msg[:200] + "..."
-	}
-	msg = strings.ReplaceAll(msg, "\r", " ")
-	msg = strings.ReplaceAll(msg, "\n", " ")
-	body := fmt.Sprintf("%s - %s", title, msg)
-	cmd := exec.Command("msg", "*", "/time:10", body)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	return cmd.Start()
+// FIX: Helper function để escape strings an toàn
+func (wtn *WindowsToastNotifier) escapeString(input string) string {
+	// Thay thế các ký tự đặc biệt có thể gây lỗi PowerShell
+	replacer := strings.NewReplacer(
+		`"`, `'`,
+		"`", "'",
+		"$", "USD",
+		"\r", " ",
+		"\n", " ",
+		"\t", " ",
+	)
+	return replacer.Replace(input)
 }
 
-// showCommandPromptAlert hiển thị alert bằng command prompt
+// showCommandPromptAlert hiển thị alert bằng command prompt (fallback cuối cùng)
 func (wtn *WindowsToastNotifier) showCommandPromptAlert(content *NotificationContent) {
 	alertFile := filepath.Join(wtn.scriptDir, "alert.bat")
 

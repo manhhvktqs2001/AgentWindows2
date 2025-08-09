@@ -230,8 +230,16 @@ func (ys *YaraScanner) ScanFile(filePath string) (*ScanResult, error) {
 	}, nil
 }
 
-// *** THÊM FUNCTION MỚI: REALTIME NOTIFICATION CHO STUB ***
+// *** FIX: REALTIME NOTIFICATION CHO STUB - CLEAN VERSION ***
 func (ys *YaraScanner) showRealtimeNotification(filePath string, result *ScanResult) {
+	// FIX: Kiểm tra toast notifier trước khi sử dụng
+	if ys.toastNotifier == nil {
+		ys.logger.Warn("Toast notifier not initialized for realtime alert (stub)")
+		// FIX: Fallback ngay lập tức nếu không có toast notifier
+		ys.showFallbackAlertStub(filePath, result)
+		return
+	}
+
 	// Check duplicate alert (dedup trong 30 giây)
 	key := filePath + "|" + result.RuleName
 	ys.alertMu.Lock()
@@ -245,23 +253,52 @@ func (ys *YaraScanner) showRealtimeNotification(filePath string, result *ScanRes
 	ys.lastAlert[key] = time.Now()
 	ys.alertMu.Unlock()
 
-	// Tạo notification content
-	content := &response.NotificationContent{
-		Title:     "🚨 YARA THREAT DETECTED",
-		Severity:  result.Severity,
-		Timestamp: time.Now(),
-		ThreatInfo: &models.ThreatInfo{
+	// FIX: Xử lý ThreatInfo an toàn cho stub
+	var threatInfo *models.ThreatInfo
+	if result != nil {
+		threatInfo = &models.ThreatInfo{
 			ThreatName:  result.RuleName,
 			FilePath:    filePath,
 			Description: result.Description,
 			Severity:    result.Severity,
-		},
+		}
 	}
 
-	// Format message dựa trên severity
+	// FIX: Tạo notification content với error handling
+	content := &response.NotificationContent{
+		Title:      "🚨 YARA THREAT DETECTED (STUB)",
+		Severity:   result.Severity,
+		Timestamp:  time.Now(),
+		ThreatInfo: threatInfo,
+	}
+
+	// FIX: Format message dựa trên severity với safe string handling
+	var fileName string
+	if filePath != "" {
+		fileName = filepath.Base(filePath)
+	} else {
+		fileName = "unknown file"
+	}
+
+	var ruleName string
+	if result != nil && result.RuleName != "" {
+		ruleName = result.RuleName
+	} else {
+		ruleName = "unknown rule"
+	}
+
+	var threatType string
+	if result != nil && len(result.RuleTags) > 0 {
+		threatType = ys.getThreatType(result.RuleTags)
+	} else {
+		threatType = "unknown"
+	}
+
+	timeStr := time.Now().Format("15:04:05")
+
 	switch result.Severity {
 	case 5: // Critical
-		content.Message = fmt.Sprintf(`🔴 CRITICAL THREAT DETECTED!
+		content.Message = fmt.Sprintf(`🔴 CRITICAL THREAT DETECTED! (STUB MODE)
 
 Rule: %s
 File: %s
@@ -271,14 +308,12 @@ Time: %s
 ⚠️ IMMEDIATE ACTION REQUIRED!
 File has been flagged for quarantine.
 
-This is a high-priority security alert.`,
-			result.RuleName,
-			filepath.Base(filePath),
-			ys.getThreatType(result.RuleTags),
-			time.Now().Format("15:04:05"))
+This is a high-priority security alert.
+Note: Running in stub mode (CGO disabled).`,
+			ruleName, fileName, threatType, timeStr)
 
 	case 4: // High
-		content.Message = fmt.Sprintf(`🟠 HIGH SEVERITY THREAT
+		content.Message = fmt.Sprintf(`🟠 HIGH SEVERITY THREAT (STUB MODE)
 
 Rule: %s
 File: %s
@@ -286,43 +321,162 @@ Threat Type: %s
 Time: %s
 
 ⚠️ Security threat detected.
-Please review this detection.`,
-			result.RuleName,
-			filepath.Base(filePath),
-			ys.getThreatType(result.RuleTags),
-			time.Now().Format("15:04:05"))
+Please review this detection.
+Note: Running in stub mode (CGO disabled).`,
+			ruleName, fileName, threatType, timeStr)
 
 	default: // Medium/Low
-		content.Message = fmt.Sprintf(`🟡 Security Alert
+		content.Message = fmt.Sprintf(`🟡 Security Alert (STUB MODE)
 
 Rule: %s
 File: %s
 Threat Type: %s
 Time: %s
 
-Suspicious activity detected.`,
-			result.RuleName,
-			filepath.Base(filePath),
-			ys.getThreatType(result.RuleTags),
-			time.Now().Format("15:04:05"))
+Suspicious activity detected.
+Note: Running in stub mode (CGO disabled).`,
+			ruleName, fileName, threatType, timeStr)
 	}
 
-	// Hiển thị notification NGAY LẬP TỨC
-	if ys.toastNotifier != nil {
-		ys.logger.Info("🚨 DISPLAYING REALTIME YARA ALERT (STUB): %s", result.RuleName)
-		err := ys.toastNotifier.SendNotification(content)
-		if err != nil {
-			ys.logger.Error("Failed to send realtime YARA notification (stub): %v", err)
-		} else {
-			ys.logger.Info("✅ Realtime YARA notification displayed successfully (stub)")
+	// FIX: Hiển thị notification với retry và error handling cho stub
+	ys.logger.Info("🚨 DISPLAYING REALTIME YARA ALERT (STUB): %s", ruleName)
+
+	// FIX: Chạy trong goroutine riêng để không block
+	go func() {
+		maxRetries := 3
+		for attempt := 1; attempt <= maxRetries; attempt++ {
+			err := ys.toastNotifier.SendNotification(content)
+			if err == nil {
+				ys.logger.Info("✅ Realtime YARA notification displayed successfully (stub, attempt %d)", attempt)
+				return
+			}
+
+			ys.logger.Warn("Failed to send realtime YARA notification (stub, attempt %d/%d): %v",
+				attempt, maxRetries, err)
+
+			if attempt < maxRetries {
+				// Wait before retry
+				time.Sleep(time.Duration(attempt) * time.Second)
+			}
 		}
+
+		// FIX: Fallback notification nếu tất cả attempts thất bại
+		ys.logger.Error("All notification attempts failed (stub), using fallback alert")
+		ys.showFallbackAlertStub(filePath, result)
+	}()
+}
+
+// FIX: Thêm fallback alert method cho stub
+func (ys *YaraScanner) showFallbackAlertStub(filePath string, result *ScanResult) {
+	var ruleName, threatType string
+	var severity int
+
+	if result != nil {
+		ruleName = result.RuleName
+		if len(result.RuleTags) > 0 {
+			threatType = ys.getThreatType(result.RuleTags)
+		} else {
+			threatType = "unknown"
+		}
+		severity = result.Severity
 	} else {
-		ys.logger.Warn("Toast notifier not available for realtime alert (stub)")
+		ruleName = "unknown"
+		threatType = "unknown"
+		severity = 3
+	}
+
+	fileName := filepath.Base(filePath)
+	timeStr := time.Now().Format("15:04:05")
+
+	// Fallback: In ra console với định dạng nổi bật
+	fmt.Printf("\n")
+	fmt.Printf("🚨🚨🚨 YARA ALERT (STUB FALLBACK) 🚨🚨🚨\n")
+	fmt.Printf("Rule: %s\n", ruleName)
+	fmt.Printf("File: %s\n", fileName)
+	fmt.Printf("Threat Type: %s\n", threatType)
+	fmt.Printf("Severity: %d\n", severity)
+	fmt.Printf("Time: %s\n", timeStr)
+	fmt.Printf("Mode: STUB (CGO disabled)\n")
+	fmt.Printf("🚨🚨🚨 END STUB FALLBACK ALERT 🚨🚨🚨\n")
+	fmt.Printf("\n")
+	os.Stdout.Sync()
+
+	// FIX: Tạo file alert trên desktop nếu có thể
+	ys.createDesktopAlertStub(filePath, result)
+}
+
+// FIX: Thêm method tạo alert file trên desktop cho stub
+func (ys *YaraScanner) createDesktopAlertStub(filePath string, result *ScanResult) {
+	// Lấy desktop path
+	desktopPath := os.Getenv("USERPROFILE")
+	if desktopPath == "" {
+		return
+	}
+	desktopPath = filepath.Join(desktopPath, "Desktop")
+
+	// Tạo alert file
+	alertFileName := fmt.Sprintf("EDR_YARA_Alert_STUB_%s.txt",
+		time.Now().Format("20060102_150405"))
+	alertFilePath := filepath.Join(desktopPath, alertFileName)
+
+	var ruleName, description string
+	var severity int
+	if result != nil {
+		ruleName = result.RuleName
+		description = result.Description
+		severity = result.Severity
+	} else {
+		ruleName = "unknown"
+		description = "YARA detection in stub mode"
+		severity = 3
+	}
+
+	alertContent := fmt.Sprintf(`EDR AGENT - YARA THREAT DETECTED (STUB MODE)
+========================================
+
+🚨 YARA THREAT DETECTED
+
+Rule: %s
+File: %s
+Severity: %d
+Time: %s
+Detection: YARA Rule Match (Stub Mode)
+Mode: CGO Disabled
+
+Description:
+%s
+
+Note: This detection was made in stub mode because
+CGO is disabled. For full YARA functionality,
+please enable CGO in your build.
+
+========================================
+This file was created by EDR Agent.
+Please review the detected threat.
+You can delete this file after reviewing.
+`,
+		ruleName,
+		filepath.Base(filePath),
+		severity,
+		time.Now().Format("2006-01-02 15:04:05"),
+		description,
+	)
+
+	err := os.WriteFile(alertFilePath, []byte(alertContent), 0644)
+	if err == nil {
+		ys.logger.Info("📄 Desktop alert file created (stub): %s", alertFilePath)
+	} else {
+		ys.logger.Debug("Failed to create desktop alert file (stub): %v", err)
 	}
 }
 
-// shouldSuppressDetection returns true if a detection should be suppressed as benign/noisy
+// FIX: shouldSuppressDetection với safe string handling
 func (ys *YaraScanner) shouldSuppressDetection(filePath, ruleName string) bool {
+	// FIX: Kiểm tra empty strings
+	if filePath == "" || ruleName == "" {
+		return false
+	}
+
 	lowerPath := strings.ToLower(filePath)
 	lowerRule := strings.ToLower(ruleName)
 
@@ -335,7 +489,7 @@ func (ys *YaraScanner) shouldSuppressDetection(filePath, ruleName string) bool {
 		strings.Contains(lowerRule, "powershell") ||
 		strings.Contains(lowerRule, "check_outputdebugstringa")
 
-		// Common benign paths
+	// Common benign paths
 	isBenignPath := strings.Contains(lowerPath, "\\windows\\") ||
 		strings.Contains(lowerPath, "edgewebview") ||
 		strings.Contains(lowerPath, "microsoft\\edge") ||
@@ -606,12 +760,25 @@ func (ys *YaraScanner) GetRulesInfo() map[string]interface{} {
 	}
 }
 
-// getThreatType classifies threat type from rule tags
+// FIX: getThreatType với safe handling cho empty tags
 func (ys *YaraScanner) getThreatType(tags []string) string {
+	// FIX: Kiểm tra empty tags
+	if len(tags) == 0 {
+		return "malware"
+	}
+
 	lowerTags := make([]string, 0, len(tags))
 	for _, t := range tags {
-		lowerTags = append(lowerTags, strings.ToLower(t))
+		if t != "" {
+			lowerTags = append(lowerTags, strings.ToLower(t))
+		}
 	}
+
+	// FIX: Kiểm tra nếu không có valid tags
+	if len(lowerTags) == 0 {
+		return "malware"
+	}
+
 	has := func(substr string) bool {
 		for _, t := range lowerTags {
 			if strings.Contains(t, substr) {
@@ -620,6 +787,7 @@ func (ys *YaraScanner) getThreatType(tags []string) string {
 		}
 		return false
 	}
+
 	switch {
 	case has("ransom"):
 		return "ransomware"

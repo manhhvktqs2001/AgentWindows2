@@ -496,6 +496,12 @@ func (ys *YaraScanner) ScanFile(filePath string) (*ScanResult, error) {
 
 // *** THÊM FUNCTION MỚI: REALTIME NOTIFICATION ***
 func (ys *YaraScanner) showRealtimeNotification(filePath string, result *ScanResult) {
+	// FIX: Kiểm tra toast notifier trước khi sử dụng
+	if ys.toastNotifier == nil {
+		ys.logger.Warn("Toast notifier not initialized for realtime alert")
+		return
+	}
+
 	// Check duplicate alert (dedup trong 30 giây)
 	key := filePath + "|" + result.RuleName
 	ys.alertMu.Lock()
@@ -509,20 +515,49 @@ func (ys *YaraScanner) showRealtimeNotification(filePath string, result *ScanRes
 	ys.lastAlert[key] = time.Now()
 	ys.alertMu.Unlock()
 
-	// Tạo notification content
-	content := &response.NotificationContent{
-		Title:     "🚨 YARA THREAT DETECTED",
-		Severity:  result.Severity,
-		Timestamp: time.Now(),
-		ThreatInfo: &models.ThreatInfo{
+	// FIX: Xử lý ThreatInfo an toàn
+	var threatInfo *models.ThreatInfo
+	if result != nil {
+		threatInfo = &models.ThreatInfo{
 			ThreatName:  result.RuleName,
 			FilePath:    filePath,
 			Description: result.Description,
 			Severity:    result.Severity,
-		},
+		}
 	}
 
-	// Format message dựa trên severity
+	// FIX: Tạo notification content với error handling
+	content := &response.NotificationContent{
+		Title:      "🚨 YARA THREAT DETECTED",
+		Severity:   result.Severity,
+		Timestamp:  time.Now(),
+		ThreatInfo: threatInfo,
+	}
+
+	// FIX: Format message dựa trên severity với safe string handling
+	var fileName string
+	if filePath != "" {
+		fileName = filepath.Base(filePath)
+	} else {
+		fileName = "unknown file"
+	}
+
+	var ruleName string
+	if result != nil && result.RuleName != "" {
+		ruleName = result.RuleName
+	} else {
+		ruleName = "unknown rule"
+	}
+
+	var threatType string
+	if result != nil && len(result.RuleTags) > 0 {
+		threatType = ys.getThreatType(result.RuleTags)
+	} else {
+		threatType = "unknown"
+	}
+
+	timeStr := time.Now().Format("15:04:05")
+
 	switch result.Severity {
 	case 5: // Critical
 		content.Message = fmt.Sprintf(`🔴 CRITICAL THREAT DETECTED!
@@ -536,10 +571,7 @@ Time: %s
 File has been flagged for quarantine.
 
 This is a high-priority security alert.`,
-			result.RuleName,
-			filepath.Base(filePath),
-			ys.getThreatType(result.RuleTags),
-			time.Now().Format("15:04:05"))
+			ruleName, fileName, threatType, timeStr)
 
 	case 4: // High
 		content.Message = fmt.Sprintf(`🟠 HIGH SEVERITY THREAT
@@ -551,10 +583,7 @@ Time: %s
 
 ⚠️ Security threat detected.
 Please review this detection.`,
-			result.RuleName,
-			filepath.Base(filePath),
-			ys.getThreatType(result.RuleTags),
-			time.Now().Format("15:04:05"))
+			ruleName, fileName, threatType, timeStr)
 
 	default: // Medium/Low
 		content.Message = fmt.Sprintf(`🟡 Security Alert
@@ -565,23 +594,96 @@ Threat Type: %s
 Time: %s
 
 Suspicious activity detected.`,
-			result.RuleName,
-			filepath.Base(filePath),
-			ys.getThreatType(result.RuleTags),
-			time.Now().Format("15:04:05"))
+			ruleName, fileName, threatType, timeStr)
 	}
 
-	// Hiển thị notification NGAY LẬP TỨC
-	if ys.toastNotifier != nil {
-		ys.logger.Info("🚨 DISPLAYING REALTIME YARA ALERT: %s", result.RuleName)
-		err := ys.toastNotifier.SendNotification(content)
-		if err != nil {
-			ys.logger.Error("Failed to send realtime YARA notification: %v", err)
-		} else {
-			ys.logger.Info("✅ Realtime YARA notification displayed successfully")
+	// FIX: Hiển thị notification với retry và error handling
+	ys.logger.Info("🚨 DISPLAYING REALTIME YARA ALERT: %s", ruleName)
+
+	// FIX: Chạy trong goroutine riêng để không block
+	go func() {
+		maxRetries := 3
+		for attempt := 1; attempt <= maxRetries; attempt++ {
+			err := ys.toastNotifier.SendNotification(content)
+			if err == nil {
+				ys.logger.Info("✅ Realtime YARA notification displayed successfully (attempt %d)", attempt)
+				return
+			}
+
+			ys.logger.Warn("Failed to send realtime YARA notification (attempt %d/%d): %v",
+				attempt, maxRetries, err)
+
+			if attempt < maxRetries {
+				// Wait before retry
+				time.Sleep(time.Duration(attempt) * time.Second)
+			}
 		}
+
+		// FIX: Fallback notification nếu tất cả attempts thất bại
+		ys.logger.Error("All notification attempts failed, using fallback alert")
+		ys.showFallbackAlert(content)
+	}()
+}
+
+// FIX: Thêm fallback alert method
+func (ys *YaraScanner) showFallbackAlert(content *response.NotificationContent) {
+	// Fallback: In ra console với định dạng nổi bật
+	fmt.Printf("\n")
+	fmt.Printf("🚨🚨🚨 YARA ALERT (FALLBACK) 🚨🚨🚨\n")
+	fmt.Printf("Title: %s\n", content.Title)
+	fmt.Printf("Severity: %d\n", content.Severity)
+	fmt.Printf("Time: %s\n", content.Timestamp.Format("15:04:05"))
+	fmt.Printf("Message:\n%s\n", content.Message)
+	fmt.Printf("🚨🚨🚨 END FALLBACK ALERT 🚨🚨🚨\n")
+	fmt.Printf("\n")
+	os.Stdout.Sync()
+
+	// FIX: Tạo file alert trên desktop nếu có thể
+	ys.createDesktopAlert(content)
+}
+
+// FIX: Thêm method tạo alert file trên desktop
+func (ys *YaraScanner) createDesktopAlert(content *response.NotificationContent) {
+	// Lấy desktop path
+	desktopPath := os.Getenv("USERPROFILE")
+	if desktopPath == "" {
+		return
+	}
+	desktopPath = filepath.Join(desktopPath, "Desktop")
+
+	// Tạo alert file
+	alertFileName := fmt.Sprintf("EDR_YARA_Alert_%s.txt",
+		time.Now().Format("20060102_150405"))
+	alertFilePath := filepath.Join(desktopPath, alertFileName)
+
+	alertContent := fmt.Sprintf(`EDR AGENT - YARA THREAT DETECTED
+========================================
+
+%s
+
+Severity: %d
+Time: %s
+Detection: YARA Rule Match
+
+Message:
+%s
+
+========================================
+This file was created by EDR Agent.
+Please review the detected threat.
+You can delete this file after reviewing.
+`,
+		content.Title,
+		content.Severity,
+		content.Timestamp.Format("2006-01-02 15:04:05"),
+		content.Message,
+	)
+
+	err := os.WriteFile(alertFilePath, []byte(alertContent), 0644)
+	if err == nil {
+		ys.logger.Info("📄 Desktop alert file created: %s", alertFilePath)
 	} else {
-		ys.logger.Warn("Toast notifier not available for realtime alert")
+		ys.logger.Debug("Failed to create desktop alert file: %v", err)
 	}
 }
 
