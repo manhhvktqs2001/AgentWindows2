@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"edr-agent-windows/internal/communication"
 	"edr-agent-windows/internal/config"
 	"edr-agent-windows/internal/models"
 	"edr-agent-windows/internal/utils"
@@ -53,15 +54,22 @@ func NewResponseManager(cfg *config.ResponseConfig, logger *utils.Logger, server
 		activeThreats:  make(map[string]*models.ThreatInfo),
 		quarantineList: make(map[string]bool),
 		whitelist:      make(map[string]bool),
-		threatChan:     make(chan *models.ThreatInfo, 100),
-		responseChan:   make(chan *ResponseAction, 100),
+		threatChan:     make(chan *models.ThreatInfo, 1000), // Tăng từ 100 lên 1000
+		responseChan:   make(chan *ResponseAction, 1000),    // Tăng từ 100 lên 1000
 		stopChan:       make(chan bool),
 	}
 
 	// Initialize components
 	rm.severityAssessor = NewSeverityAssessor(cfg, logger)
 	rm.notificationCtrl = NewNotificationController(cfg, logger)
-	rm.actionEngine = NewActionEngine(cfg, logger)
+
+	// Convert serverClient to proper type for ActionEngine
+	var serverClientTyped *communication.ServerClient
+	if sc, ok := serverClient.(*communication.ServerClient); ok {
+		serverClientTyped = sc
+	}
+
+	rm.actionEngine = NewActionEngine(cfg, logger, serverClientTyped)
 	rm.evidenceCollector = NewEvidenceCollector(cfg, logger)
 
 	return rm
@@ -96,12 +104,15 @@ func (rm *ResponseManager) HandleThreat(threat *models.ThreatInfo) error {
 	rm.activeThreats[threat.FilePath] = threat
 	rm.mu.Unlock()
 
-	// Send to threat processor
+	// Send to threat processor with non-blocking send and retry
 	select {
 	case rm.threatChan <- threat:
 		return nil
 	default:
-		return fmt.Errorf("threat channel full")
+		// Channel is full, try to process immediately
+		rm.logger.Warn("Threat channel full, processing threat immediately: %s", threat.ThreatName)
+		go rm.processThreat(threat)
+		return nil
 	}
 }
 
@@ -130,6 +141,14 @@ func (rm *ResponseManager) processThreat(threat *models.ThreatInfo) {
 	if rm.isWhitelisted(threat.FilePath) {
 		rm.logger.Info("Threat whitelisted: %s", threat.FilePath)
 		return
+	}
+
+	// Realtime user notification BEFORE automated actions (non-blocking toast/message)
+	// This ensures the user sees the alert immediately when detection happens
+	if rm.notificationCtrl != nil {
+		if err := rm.notificationCtrl.SendNotification(threat, severity); err != nil {
+			rm.logger.Error("Failed to send immediate notification: %v", err)
+		}
 	}
 
 	// Step 3: Determine response based on severity

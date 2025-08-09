@@ -15,6 +15,7 @@ import (
 
 	"edr-agent-windows/internal/agent"
 	"edr-agent-windows/internal/config"
+	"edr-agent-windows/internal/response"
 	"edr-agent-windows/internal/service"
 	"edr-agent-windows/internal/utils"
 
@@ -27,6 +28,7 @@ import (
 
 	"golang.org/x/sys/windows"
 
+	"edr-agent-windows/internal/models"
 	"edr-agent-windows/internal/scanner"
 	"reflect"
 )
@@ -101,18 +103,20 @@ func main() {
 
 	// Parse command line flags
 	var (
-		install     = flag.Bool("install", false, "Install as Windows service")
-		uninstall   = flag.Bool("uninstall", false, "Uninstall Windows service")
-		start       = flag.Bool("start", false, "Start Windows service")
-		stop        = flag.Bool("stop", false, "Stop Windows service")
-		status      = flag.Bool("status", false, "Check service status")
-		configPath  = flag.String("config", "config.yaml", "Path to configuration file")
-		version     = flag.Bool("version", false, "Show version information")
-		reset       = flag.Bool("reset", false, "Reset agent registration (force new registration)")
-		updateRules = flag.Bool("update-rules", false, "Update YARA rules")
-		report      = flag.Bool("report", false, "Generate system report")
-		testYara    = flag.String("test-yara", "", "Test YARA scanning on specific file")
-		console     = flag.Bool("console", false, "Run in console mode (not as service)")
+		install          = flag.Bool("install", false, "Install as Windows service")
+		uninstall        = flag.Bool("uninstall", false, "Uninstall Windows service")
+		start            = flag.Bool("start", false, "Start Windows service")
+		stop             = flag.Bool("stop", false, "Stop Windows service")
+		status           = flag.Bool("status", false, "Check service status")
+		configPath       = flag.String("config", "config.yaml", "Path to configuration file")
+		version          = flag.Bool("version", false, "Show version information")
+		reset            = flag.Bool("reset", false, "Reset agent registration (force new registration)")
+		updateRules      = flag.Bool("update-rules", false, "Update YARA rules")
+		report           = flag.Bool("report", false, "Generate system report")
+		testYara         = flag.String("test-yara", "", "Test YARA scanning on specific file")
+		console          = flag.Bool("console", false, "Run in console mode (not as service)")
+		testNotification = flag.Bool("test-notification", false, "Test notification system")
+		testAlert        = flag.Bool("test-alert", false, "Test security alert notification")
 	)
 	flag.Parse()
 
@@ -191,6 +195,18 @@ func main() {
 			log.Fatalf("Failed to generate system report: %v", err)
 		}
 		fmt.Println("✅ System report generated successfully")
+		return
+	}
+
+	// Test notification system
+	if *testNotification {
+		testNotificationSystem(*configPath)
+		return
+	}
+
+	// Test security alert
+	if *testAlert {
+		testSecurityAlert(*configPath)
 		return
 	}
 
@@ -293,6 +309,99 @@ func main() {
 		agentInstance.Stop()
 		logger.Info("✅ EDR Agent stopped")
 	}
+}
+
+// testNotificationSystem tests the notification system
+func testNotificationSystem(configPath string) {
+	fmt.Println("🧪 Testing EDR Notification System...")
+
+	// Load config
+	cfg, err := config.LoadOrCreate(configPath)
+	if err != nil {
+		fmt.Printf("❌ Failed to load config: %v\n", err)
+		return
+	}
+
+	// Initialize logger
+	logger := utils.NewLogger(&cfg.Log)
+	defer logger.Close()
+
+	fmt.Println("📢 Testing Windows Toast Notifier...")
+
+	// Create notification content
+	content := &response.NotificationContent{
+		Title:     "🧪 EDR Test Notification",
+		Message:   "This is a test notification from EDR Agent. The notification system is working correctly and can display security alerts when threats are detected.",
+		Severity:  4,
+		Timestamp: time.Now(),
+	}
+
+	// Create toast notifier
+	toastNotifier := response.NewWindowsToastNotifier(&cfg.Response, logger)
+	if err := toastNotifier.Start(); err != nil {
+		fmt.Printf("❌ Failed to start toast notifier: %v\n", err)
+		return
+	}
+
+	// Send test notification
+	err = toastNotifier.SendNotification(content)
+	if err != nil {
+		fmt.Printf("❌ Notification test failed: %v\n", err)
+	} else {
+		fmt.Printf("✅ Notification test completed successfully\n")
+		fmt.Printf("💡 You should see a test notification on your screen\n")
+	}
+
+	time.Sleep(3 * time.Second)
+	fmt.Println("🏁 Notification test completed")
+}
+
+// testSecurityAlert tests security alert notification
+func testSecurityAlert(configPath string) {
+	fmt.Println("🚨 Testing Security Alert Notification...")
+
+	// Load config
+	cfg, err := config.LoadOrCreate(configPath)
+	if err != nil {
+		fmt.Printf("❌ Failed to load config: %v\n", err)
+		return
+	}
+
+	// Initialize logger
+	logger := utils.NewLogger(&cfg.Log)
+	defer logger.Close()
+
+	// Create security alert content
+	content := &response.NotificationContent{
+		Title:     "🚨 SECURITY ALERT - Threat Detected",
+		Message:   "CRITICAL: YARA rule 'malware_detection' has identified a suspicious file at C:\\temp\\suspicious.exe. Threat level: HIGH. Immediate action recommended. File has been automatically quarantined for safety.",
+		Severity:  5,
+		Timestamp: time.Now(),
+		ThreatInfo: &models.ThreatInfo{
+			ThreatName:  "test_malware_detection",
+			FilePath:    "C:\\temp\\suspicious.exe",
+			Description: "Test malware detection alert",
+		},
+	}
+
+	// Create toast notifier
+	toastNotifier := response.NewWindowsToastNotifier(&cfg.Response, logger)
+	if err := toastNotifier.Start(); err != nil {
+		fmt.Printf("❌ Failed to start toast notifier: %v\n", err)
+		return
+	}
+
+	// Send security alert
+	err = toastNotifier.SendNotification(content)
+	if err != nil {
+		fmt.Printf("❌ Security alert test failed: %v\n", err)
+	} else {
+		fmt.Printf("✅ Security alert test completed successfully\n")
+		fmt.Printf("💡 You should see a critical security alert on your screen\n")
+	}
+
+	time.Sleep(5 * time.Second)
+	fmt.Println("🏁 Security alert test completed")
 }
 
 // testYaraScanning tests YARA scanning functionality
@@ -734,44 +843,6 @@ func updateYaraRules(configPath string) error {
 	fmt.Println("🎯 Rules are ready for testing!")
 	fmt.Println("💡 Test with: edr-agent.exe -test-yara <yourfile>")
 	return nil
-}
-
-// listGitHubFiles lists files in a GitHub directory
-func listGitHubFiles(dirURL string) ([]string, error) {
-	// For simplicity, we'll use a predefined list of common files
-	// In a real implementation, you'd parse the GitHub directory listing
-	commonFiles := map[string][]string{
-		"malware": {
-			"apt_apt28.yar", "apt_apt29.yar", "apt_apt30.yar", "apt_apt32.yar",
-			"malware_emotet.yar", "malware_ryuk.yar", "malware_wannacry.yar",
-			"malware_notpetya.yar", "malware_locky.yar", "malware_cerber.yar",
-		},
-		"backdoor": {
-			"backdoor_netcat.yar", "backdoor_plink.yar", "backdoor_putty.yar",
-			"backdoor_winrm.yar", "backdoor_ssh.yar", "backdoor_rdp.yar",
-		},
-		"trojan": {
-			"trojan_zeus.yar", "trojan_dridex.yar", "trojan_ursnif.yar",
-			"trojan_ramnit.yar", "trojan_gozi.yar", "trojan_carberp.yar",
-		},
-		"ransomware": {
-			"ransomware_wannacry.yar", "ransomware_notpetya.yar",
-			"ransomware_ryuk.yar", "ransomware_cerber.yar",
-			"ransomware_locky.yar", "ransomware_cryptolocker.yar",
-		},
-	}
-
-	// Extract category from URL
-	parts := strings.Split(dirURL, "/")
-	if len(parts) > 0 {
-		category := parts[len(parts)-1]
-		if files, exists := commonFiles[category]; exists {
-			return files, nil
-		}
-	}
-
-	// Fallback: return empty list
-	return []string{}, nil
 }
 
 // downloadGitHubFile downloads a file from GitHub

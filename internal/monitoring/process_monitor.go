@@ -225,7 +225,13 @@ func (pm *ProcessMonitor) handleNewProcess(processID, parentProcessID uint32, pr
 	// Get detailed process information
 	processInfo, err := pm.getProcessInfo(processID)
 	if err != nil {
-		pm.logger.Warn("Failed to get process info for %s (PID: %d): %v", processName, processID, err)
+		// Reduce noise: access denied on system processes is common
+		if strings.Contains(strings.ToLower(err.Error()), "access is denied") ||
+			strings.Contains(strings.ToLower(err.Error()), "parameter is incorrect") {
+			pm.logger.Debug("Process info access restricted for %s (PID: %d): %v", processName, processID, err)
+		} else {
+			pm.logger.Warn("Failed to get process info for %s (PID: %d): %v", processName, processID, err)
+		}
 		return
 	}
 
@@ -283,7 +289,13 @@ func (pm *ProcessMonitor) getProcessInfo(processID uint32) (*ProcessInfo, error)
 			processID,
 		)
 		if err != nil {
-			pm.logger.Warn("Failed to get process info for %s (PID: %d): %v", pm.getProcessName(processID), processID, err)
+			// Reduce noise for common system-protected processes
+			if strings.Contains(strings.ToLower(err.Error()), "access is denied") ||
+				strings.Contains(strings.ToLower(err.Error()), "parameter is incorrect") {
+				pm.logger.Debug("OpenProcess restricted for %s (PID: %d): %v", pm.getProcessName(processID), processID, err)
+			} else {
+				pm.logger.Warn("Failed to get process info for %s (PID: %d): %v", pm.getProcessName(processID), processID, err)
+			}
 			return nil, fmt.Errorf("failed to open process: %w", err)
 		}
 	}

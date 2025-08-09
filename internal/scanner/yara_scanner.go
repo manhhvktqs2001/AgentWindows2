@@ -622,6 +622,15 @@ func (ys *YaraScanner) calculateFileHash(filePath string) string {
 func (ys *YaraScanner) getRuleSeverity(ruleName string) int {
 	ruleNameLower := strings.ToLower(ruleName)
 
+	// De-emphasize environmental/anti-debug/vm rules commonly seen in benign system binaries
+	if strings.Contains(ruleNameLower, "debuggercheck") ||
+		strings.Contains(ruleNameLower, "vmdetect") ||
+		strings.Contains(ruleNameLower, "anti_dbg") ||
+		strings.Contains(ruleNameLower, "threadcontrol") ||
+		strings.Contains(ruleNameLower, "seh__vectored") {
+		return 1
+	}
+
 	// Critical severity (5) - Immediate action required
 	if strings.Contains(ruleNameLower, "ransomware") ||
 		strings.Contains(ruleNameLower, "backdoor") ||

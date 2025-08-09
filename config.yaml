@@ -1,0 +1,134 @@
+server:
+  url: "http://192.168.20.85:5000"
+  api_key: "f93ac1d1d7b64f07bd32c81e6ab8423e4cb7631f2051c9d8a2d340c5be3a4a9e"
+  auth_token: "edr_system_auth_2025"
+  timeout: 30
+  retry_count: 3
+  tls_verify: false
+
+agent:
+  id: ""
+  name: "edr-agent-windows"
+  heartbeat_interval: 60
+  event_batch_size: 100
+  max_queue_size: 10000
+
+monitoring:
+  file_system:
+    enabled: true
+    paths:
+      - "C:\\Users"
+      - "C:\\Program Files"
+      - "C:\\Program Files (x86)"
+      - "C:\\Windows\\System32"
+    recursive: true
+    real_time_scan: true
+    max_file_size: "100MB"
+    exclude_extensions:
+      - ".tmp"
+      - ".log"
+      - ".bak"
+
+  processes:
+    enabled: true
+    scan_executables: true
+    monitor_injections: true
+    track_network_connections: true
+    monitor_cmdline: true
+    exclude_names:
+      - "explorer.exe"
+      - "dwm.exe"
+      - "winlogon.exe"
+      - "MoUsoCoreWorker.exe"
+      - "taskhostw.exe"
+
+  network:
+    enabled: true
+    monitor_dns: true
+    block_malicious_ips: false
+    capture_packets: false
+    monitor_tcp: true
+    monitor_udp: false
+    scan_interval: 30
+    exclude_ports:
+      - 135
+      - 445
+      - 5985
+    suspicious_ports:
+      - 22
+      - 23
+      - 3389
+      - 5900
+      - 8080
+      - 4444
+      - 1337
+
+  registry:
+    enabled: true
+    monitor_autostart: true
+    track_security_settings: true
+    scan_interval: 30
+    paths:
+      - "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"
+      - "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce"
+      - "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"
+
+  memory:
+    enabled: true
+    scan_interval: 300
+    threat_threshold: 0.5
+    max_processes: 50
+
+  behavior:
+    enabled: true
+    analysis_interval: 60
+    threat_threshold: 0.6
+    data_retention: 24
+
+yara:
+  enabled: true
+  auto_update: false
+  update_interval: "24h"
+  rules_source: https://github.com/Yara-Rules/rules/archive/master.zip
+  categories:
+    - antidebug_antivm
+    - capabilities
+    - crypto
+    - exploit_kits
+    - maldocs
+    - malware
+    - packers
+    - webshells
+  max_scan_threads: 4
+  scan_timeout: 30
+  rules_path: yara-rules
+  max_file_size: "100MB"
+
+response:
+  notification_settings:
+    toast_enabled: true
+    system_tray_enabled: true
+    desktop_alert_enabled: true
+    sound_enabled: true
+    timeout_seconds: 10
+
+  severity_thresholds:
+    show_user_alerts: 3    # Show notifications for Medium+ severity
+    auto_quarantine: 4     # Auto quarantine for High+ severity
+    block_execution: 5     # Block execution for Critical severity
+
+  user_interaction:
+    allow_user_override: true
+    require_admin_for_allow: true
+    timeout_seconds: 30
+
+  customization:
+    company_branding: false
+    custom_messages: false
+    language: "en"
+
+logging:
+  level: "info"
+  format: "text"
+  file_path: "agent.log"
+  max_size: "10MB"

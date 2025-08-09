@@ -324,8 +324,29 @@ func (fm *FileMonitor) processFileEvent(filePath string, action uint32) {
 					return
 				}
 				if result != nil && result.Matched {
+					// Suppress common anti-debug/vm detections on system/Edge paths
+					lowerPath := strings.ToLower(filePath)
+					lowerRule := strings.ToLower(result.RuleName)
+					if (strings.Contains(lowerRule, "debuggercheck") ||
+						strings.Contains(lowerRule, "vmdetect") ||
+						strings.Contains(lowerRule, "anti_dbg") ||
+						strings.Contains(lowerRule, "threadcontrol") ||
+						strings.Contains(lowerRule, "seh__vectored")) &&
+						(strings.Contains(lowerPath, "\\windows\\") ||
+							strings.Contains(lowerPath, "edgewebview") ||
+							strings.Contains(lowerPath, "microsoft\\edge") ||
+							strings.Contains(lowerPath, "\\windows\\system32\\openssh\\") ||
+							strings.Contains(lowerPath, "\\cursor\\user\\workspacestorage\\") ||
+							strings.Contains(lowerPath, "workspacestorage") ||
+							strings.Contains(lowerPath, "globalstorage") ||
+							strings.Contains(lowerPath, "anysphere.cursor-retrieval")) {
+						fm.logger.Debug("Suppressing YARA detection for known benign system path: %s -> %s", filePath, result.RuleName)
+						return
+					}
+
+					// Increase dedup window to reduce spam
 					key := filePath + "|" + result.RuleName
-					if t, ok := fm.lastAlert[key]; ok && time.Since(t) < 60*time.Second {
+					if t, ok := fm.lastAlert[key]; ok && time.Since(t) < 5*time.Minute {
 						return
 					}
 					fm.lastAlert[key] = time.Now()

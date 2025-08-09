@@ -54,7 +54,7 @@ type Task interface {
 // Create new agent
 func NewAgent(cfg *config.Config, logger *utils.Logger) (*Agent, error) {
 	// Initialize server client
-	serverClient := communication.NewServerClient(cfg.Server, logger)
+	serverClient := communication.NewServerClient(&cfg.Server, logger)
 
 	// Initialize YARA scanner
 	yaraScanner := scanner.NewYaraScanner(&cfg.Yara, logger)
@@ -301,7 +301,13 @@ func (a *Agent) heartbeatWorker() {
 
 func (a *Agent) eventWorker() {
 	events := make([]Event, 0, a.config.Agent.EventBatchSize)
-	ticker := time.NewTicker(2 * time.Second) // Send batch every 2 seconds instead of 5
+	// Use heartbeat interval as a conservative default send interval if no dedicated config is available
+	// Avoid hardcoded 2s to reduce noisy batches
+	sendInterval := time.Duration(a.config.Agent.HeartbeatInterval) * time.Second
+	if sendInterval <= 0 {
+		sendInterval = 5 * time.Second
+	}
+	ticker := time.NewTicker(sendInterval)
 	defer ticker.Stop()
 
 	a.logger.Info("Event worker started - will send events to server every 2 seconds or when batch is full")
@@ -325,8 +331,8 @@ func (a *Agent) eventWorker() {
 			a.logger.Debug("Received event in eventWorker: %s", event.GetType())
 			events = append(events, event)
 
-			// Send batch when full or when we have a significant number
-			if len(events) >= a.config.Agent.EventBatchSize || len(events) >= 50 {
+			// Send batch when full according to configured batch size
+			if len(events) >= a.config.Agent.EventBatchSize {
 				a.logger.Info("Sending batch of %d events to server (batch full)", len(events))
 				// Convert []Event to []interface{}
 				interfaceEvents := make([]interface{}, len(events))

@@ -90,6 +90,12 @@ func (ys *YaraScanner) ScanFile(filePath string) (*ScanResult, error) {
 				}, nil
 			}
 			if result != nil && result.Matched {
+				// Suppress noisy/benign detections on system/Edge/PowerShell paths
+				if ys.shouldSuppressDetection(filePath, result.RuleName) {
+					ys.logger.Debug("Suppressed YARA detection (external): %s -> %s", filePath, result.RuleName)
+					return &ScanResult{Matched: false, FilePath: filePath, ScanTime: time.Now().UnixMilli(), ScanTimestamp: time.Now(), Description: "suppressed benign match"}, nil
+				}
+
 				if ys.shouldSuppress(filePath, result.RuleName, 60*time.Second) {
 					ys.logger.Debug("Suppressed duplicate YARA alert (external): %s | %s", filePath, result.RuleName)
 					return result, nil
@@ -185,6 +191,36 @@ func (ys *YaraScanner) ScanFile(filePath string) (*ScanResult, error) {
 		ScanTimestamp: time.Now(),
 		Description:   "YARA scanning disabled (CGO not available)",
 	}, nil
+}
+
+// shouldSuppressDetection returns true if a detection should be suppressed as benign/noisy
+func (ys *YaraScanner) shouldSuppressDetection(filePath, ruleName string) bool {
+	lowerPath := strings.ToLower(filePath)
+	lowerRule := strings.ToLower(ruleName)
+
+	// Common noisy rule names
+	isNoisyRule := strings.Contains(lowerRule, "debuggercheck") ||
+		strings.Contains(lowerRule, "vmdetect") ||
+		strings.Contains(lowerRule, "anti_dbg") ||
+		strings.Contains(lowerRule, "threadcontrol") ||
+		strings.Contains(lowerRule, "seh__vectored") ||
+		strings.Contains(lowerRule, "powershell") ||
+		strings.Contains(lowerRule, "check_outputdebugstringa")
+
+		// Common benign paths
+	isBenignPath := strings.Contains(lowerPath, "\\windows\\") ||
+		strings.Contains(lowerPath, "edgewebview") ||
+		strings.Contains(lowerPath, "microsoft\\edge") ||
+		strings.Contains(lowerPath, "windowspowershell") ||
+		strings.Contains(lowerPath, "\\windows\\system32\\openssh\\") ||
+		strings.Contains(lowerPath, "\\cursor\\user\\workspacestorage\\") ||
+		strings.Contains(lowerPath, "workspacestorage") ||
+		strings.Contains(lowerPath, "globalstorage") ||
+		strings.Contains(lowerPath, "anysphere.cursor-retrieval") ||
+		strings.Contains(lowerPath, "\\quarantine\\") ||
+		strings.Contains(lowerPath, "\\.git\\")
+
+	return isNoisyRule && isBenignPath
 }
 
 // scanWithExternalYara attempts to scan the file using external yara64.exe with rules in config.RulesPath
@@ -289,12 +325,13 @@ func (ys *YaraScanner) scanWithExternalYara(filePath string) (*ScanResult, bool,
 
 		if matchedRule != "" {
 			// Found a match
+			sev := ys.getRuleSeverityStub(matchedRule)
 			res := &ScanResult{
 				Matched:       true,
 				FilePath:      filePath,
 				RuleName:      matchedRule,
 				RuleTags:      []string{"external"},
-				Severity:      4,
+				Severity:      sev,
 				FileHash:      "",
 				ScanTime:      time.Now().UnixMilli(),
 				ScanTimestamp: time.Now(),
@@ -305,6 +342,36 @@ func (ys *YaraScanner) scanWithExternalYara(filePath string) (*ScanResult, bool,
 	}
 
 	return &ScanResult{Matched: false, FilePath: filePath, ScanTime: time.Now().UnixMilli(), ScanTimestamp: time.Now(), Description: "No match by external YARA"}, true, nil
+}
+
+// getRuleSeverityStub mirrors severity mapping logic for common rule names in stub mode
+func (ys *YaraScanner) getRuleSeverityStub(ruleName string) int {
+	rn := strings.ToLower(ruleName)
+	// De-emphasize noisy/benign environment detections
+	if strings.Contains(rn, "debuggercheck") ||
+		strings.Contains(rn, "debuggerexception") ||
+		strings.Contains(rn, "queryinfo") ||
+		strings.Contains(rn, "vmdetect") ||
+		strings.Contains(rn, "anti_dbg") ||
+		strings.Contains(rn, "threadcontrol") ||
+		strings.Contains(rn, "seh__vectored") ||
+		strings.Contains(rn, "check_outputdebugstringa") ||
+		strings.Contains(rn, "powershell") {
+		return 1
+	}
+	if strings.Contains(rn, "ransomware") || strings.Contains(rn, "backdoor") || strings.Contains(rn, "rootkit") || strings.Contains(rn, "eicar") || strings.Contains(rn, "exploit") {
+		return 5
+	}
+	if strings.Contains(rn, "trojan") || strings.Contains(rn, "keylogger") || strings.Contains(rn, "spyware") || strings.Contains(rn, "worm") || strings.Contains(rn, "rat") || strings.Contains(rn, "webshell") || strings.Contains(rn, "wshell") {
+		return 4
+	}
+	if strings.Contains(rn, "adware") || strings.Contains(rn, "pup") || strings.Contains(rn, "suspicious") || strings.Contains(rn, "malware") || strings.Contains(rn, "malw") {
+		return 3
+	}
+	if strings.Contains(rn, "toolkit") || strings.Contains(rn, "packer") || strings.Contains(rn, "crypto") || strings.Contains(rn, "capabilities") {
+		return 2
+	}
+	return 3
 }
 
 // handleThreatDetection processes a detected threat (stub parity)
