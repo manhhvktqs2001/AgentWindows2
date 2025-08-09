@@ -61,6 +61,12 @@ func (ae *ActionEngine) QuarantineFile(filePath string) error {
 		return nil // Don't return error, just skip
 	}
 
+	// Guard: Skip protected system paths to avoid bricking the OS
+	if ae.quarantineManager.isProtectedSystemPath(filePath) {
+		ae.logger.Warn("Skipping quarantine for protected system file: %s", filePath)
+		return nil
+	}
+
 	// Check if already quarantined
 	if ae.quarantinedFiles[filePath] {
 		ae.logger.Debug("File already quarantined: %s", filePath)
@@ -103,6 +109,12 @@ func (ae *ActionEngine) QuarantineFile(filePath string) error {
 				// Don't fail the quarantine process, just log the error
 			} else {
 				ae.logger.Info("✅ File uploaded to server successfully: %s", filepath.Base(quarantinePath))
+				// Delete local quarantine copy after successful upload
+				if remErr := os.Remove(quarantinePath); remErr != nil {
+					ae.logger.Warn("Failed to delete local quarantine file after upload: %s - %v", quarantinePath, remErr)
+				} else {
+					ae.logger.Info("🧹 Deleted local quarantine file after upload: %s", quarantinePath)
+				}
 			}
 		} else {
 			ae.logger.Warn("Server client not available, skipping server upload")
@@ -136,12 +148,12 @@ func (ae *ActionEngine) RestoreFile(filePath string) error {
 
 // TerminateProcesses kết thúc processes
 func (ae *ActionEngine) TerminateProcesses(processID int) error {
-	ae.logger.Info("Terminating process: %d", processID)
-
 	if processID <= 0 {
 		ae.logger.Debug("Skip terminate: invalid PID %d", processID)
 		return nil
 	}
+
+	ae.logger.Info("Terminating process: %d", processID)
 
 	// Check if process was already terminated
 	if ae.terminatedProcesses[processID] {
@@ -164,12 +176,12 @@ func (ae *ActionEngine) TerminateProcesses(processID int) error {
 
 // BlockNetworkConnections chặn kết nối mạng
 func (ae *ActionEngine) BlockNetworkConnections(processID int) error {
-	ae.logger.Info("Blocking network connections for process: %d", processID)
-
 	if processID <= 0 {
 		ae.logger.Debug("Skip block network: invalid PID %d", processID)
 		return nil
 	}
+
+	ae.logger.Info("Blocking network connections for process: %d", processID)
 
 	// Create connection key
 	connectionKey := fmt.Sprintf("process_%d", processID)
@@ -370,6 +382,12 @@ func (qm *QuarantineManager) waitForFileAccess(filePath string, maxWait time.Dur
 
 // QuarantineFile cách ly file
 func (qm *QuarantineManager) QuarantineFile(filePath string) (string, error) {
+	// Guard: Skip protected system paths to avoid breaking Windows
+	if qm.isProtectedSystemPath(filePath) {
+		qm.logger.Warn("Protected system path detected, skipping quarantine: %s", filePath)
+		return "", nil
+	}
+
 	// Prevent recursive self-quarantine of the quarantine directory
 	if strings.Contains(strings.ToLower(filePath), strings.ToLower(qm.quarantineDir)) {
 		qm.logger.Debug("Skipping self-quarantine path: %s", filePath)
@@ -1247,6 +1265,40 @@ func (qm *QuarantineManager) isProblematicFile(filePath string) bool {
 		}
 	}
 
+	return false
+}
+
+// isProtectedSystemPath returns true if the path is a critical Windows system file/dir
+func (qm *QuarantineManager) isProtectedSystemPath(filePath string) bool {
+	lower := strings.ToLower(filePath)
+	protectedPrefixes := []string{
+		`c:\windows\system32`,
+		`c:\windows\winsxs`,
+		`c:\windows\syswow64`,
+		`c:\windows\servicing`,
+		`c:\windows\security`,
+		`c:\windows\boot`,
+	}
+	protectedFiles := []string{
+		`c:\windows\system32\config\sam`,
+		`c:\windows\system32\config\system`,
+		`c:\windows\system32\config\software`,
+		`c:\windows\system32\config\security`,
+		`c:\windows\system32\config\components`,
+		`c:\windows\system32\ntoskrnl.exe`,
+		`c:\windows\system32\winlogon.exe`,
+		`c:\windows\system32\lsass.exe`,
+	}
+	for _, p := range protectedPrefixes {
+		if strings.HasPrefix(lower, p) {
+			return true
+		}
+	}
+	for _, f := range protectedFiles {
+		if lower == f {
+			return true
+		}
+	}
 	return false
 }
 

@@ -264,14 +264,6 @@ func (ys *YaraScanner) showRealtimeNotification(filePath string, result *ScanRes
 		}
 	}
 
-	// FIX: Tạo notification content với error handling
-	content := &response.NotificationContent{
-		Title:      "🚨 YARA THREAT DETECTED (STUB)",
-		Severity:   result.Severity,
-		Timestamp:  time.Now(),
-		ThreatInfo: threatInfo,
-	}
-
 	// FIX: Format message dựa trên severity với safe string handling
 	var fileName string
 	if filePath != "" {
@@ -287,6 +279,15 @@ func (ys *YaraScanner) showRealtimeNotification(filePath string, result *ScanRes
 		ruleName = "unknown rule"
 	}
 
+	// FIX: Tạo notification content với error handling
+	// Title and message will be normalized in notifier, but we still provide a clear default including rule name
+	content := &response.NotificationContent{
+		Title:      fmt.Sprintf("YARA: %s", ruleName),
+		Severity:   result.Severity,
+		Timestamp:  time.Now(),
+		ThreatInfo: threatInfo,
+	}
+
 	var threatType string
 	if result != nil && len(result.RuleTags) > 0 {
 		threatType = ys.getThreatType(result.RuleTags)
@@ -298,43 +299,15 @@ func (ys *YaraScanner) showRealtimeNotification(filePath string, result *ScanRes
 
 	switch result.Severity {
 	case 5: // Critical
-		content.Message = fmt.Sprintf(`🔴 CRITICAL THREAT DETECTED! (STUB MODE)
-
-Rule: %s
-File: %s
-Threat Type: %s
-Time: %s
-
-⚠️ IMMEDIATE ACTION REQUIRED!
-File has been flagged for quarantine.
-
-This is a high-priority security alert.
-Note: Running in stub mode (CGO disabled).`,
+		content.Message = fmt.Sprintf("Rule: %s\nFile: %s\nThreat: %s\nTime: %s\nAction: Quarantine pending (stub mode)",
 			ruleName, fileName, threatType, timeStr)
 
 	case 4: // High
-		content.Message = fmt.Sprintf(`🟠 HIGH SEVERITY THREAT (STUB MODE)
-
-Rule: %s
-File: %s
-Threat Type: %s
-Time: %s
-
-⚠️ Security threat detected.
-Please review this detection.
-Note: Running in stub mode (CGO disabled).`,
+		content.Message = fmt.Sprintf("Rule: %s\nFile: %s\nThreat: %s\nTime: %s\nAction: Review detection (stub mode)",
 			ruleName, fileName, threatType, timeStr)
 
 	default: // Medium/Low
-		content.Message = fmt.Sprintf(`🟡 Security Alert (STUB MODE)
-
-Rule: %s
-File: %s
-Threat Type: %s
-Time: %s
-
-Suspicious activity detected.
-Note: Running in stub mode (CGO disabled).`,
+		content.Message = fmt.Sprintf("Rule: %s\nFile: %s\nThreat: %s\nTime: %s\nNote: Stub mode (CGO disabled)",
 			ruleName, fileName, threatType, timeStr)
 	}
 
