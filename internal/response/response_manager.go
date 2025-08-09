@@ -3,6 +3,7 @@ package response
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -213,8 +214,8 @@ func (rm *ResponseManager) determineResponse(threat *models.ThreatInfo) *Respons
 func (rm *ResponseManager) executeAutomatedActions(threat *models.ThreatInfo, response *ResponseAction) {
 	rm.logger.Info("Executing automated actions for threat: %s", threat.ThreatName)
 
-	// Quarantine file if needed
-	if response.Severity >= 4 {
+	// Quarantine file if needed (skip environmental detections)
+	if response.Severity >= 4 && !rm.isEnvironmentalDetection(threat) {
 		err := rm.actionEngine.QuarantineFile(threat.FilePath)
 		if err != nil {
 			rm.logger.Error("Failed to quarantine file: %v", err)
@@ -278,6 +279,34 @@ func (rm *ResponseManager) isWhitelisted(filePath string) bool {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
 	return rm.whitelist[filePath]
+}
+
+// isEnvironmentalDetection nhận diện các detection môi trường/anti-debug/vm
+func (rm *ResponseManager) isEnvironmentalDetection(threat *models.ThreatInfo) bool {
+	name := strings.ToLower(threat.ThreatName)
+	path := strings.ToLower(threat.FilePath)
+	if strings.Contains(name, "vmdetect") ||
+		strings.Contains(name, "anti_dbg") ||
+		strings.Contains(name, "debuggercheck") ||
+		strings.Contains(name, "debuggerexception") ||
+		strings.Contains(name, "threadcontrol") ||
+		strings.Contains(name, "seh__vectored") ||
+		strings.Contains(name, "check_outputdebugstringa") {
+		// Also require that the path is a common benign/system location
+		if strings.Contains(path, "\\windows\\") ||
+			strings.Contains(path, "edgewebview") ||
+			strings.Contains(path, "microsoft\\edge") ||
+			strings.Contains(path, "windowspowershell") ||
+			strings.Contains(path, "\\windows\\system32\\openssh\\") ||
+			strings.Contains(path, "\\cursor\\user\\workspacestorage\\") ||
+			strings.Contains(path, "workspacestorage") ||
+			strings.Contains(path, "globalstorage") ||
+			strings.Contains(path, "anysphere.cursor-retrieval") ||
+			strings.Contains(path, "\\quarantine\\") {
+			return true
+		}
+	}
+	return false
 }
 
 // AddToWhitelist thêm file vào whitelist

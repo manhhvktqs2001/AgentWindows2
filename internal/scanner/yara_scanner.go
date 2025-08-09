@@ -15,6 +15,7 @@ import (
 
 	"edr-agent-windows/internal/config"
 	"edr-agent-windows/internal/models"
+	"edr-agent-windows/internal/response" // THÊM CHO REALTIME NOTIFICATION
 	"edr-agent-windows/internal/utils"
 
 	"github.com/hillu/go-yara/v4"
@@ -28,6 +29,11 @@ type YaraScanner struct {
 	agentID         string
 	serverClient    interface{} // Server client để gửi alert
 	responseManager interface{} // Response Manager để gửi cho Response System
+
+	// THÊM: Direct notification components cho realtime alert
+	toastNotifier *response.WindowsToastNotifier
+	lastAlert     map[string]time.Time
+	alertMu       sync.Mutex
 }
 
 type ScanResult struct {
@@ -69,8 +75,31 @@ func (cb *YaraScanCallback) RuleMatching(sc *yara.ScanContext, r *yara.Rule) (bo
 
 func NewYaraScanner(cfg *config.YaraConfig, logger *utils.Logger) *YaraScanner {
 	scanner := &YaraScanner{
-		config: cfg,
-		logger: logger,
+		config:    cfg,
+		logger:    logger,
+		lastAlert: make(map[string]time.Time),
+	}
+
+	// THÊM: Initialize direct toast notifier cho realtime alerts
+	if cfg.Enabled {
+		// Tạo default response config cho notification
+		responseConfig := &config.ResponseConfig{
+			NotificationSettings: config.NotificationSettings{
+				ToastEnabled:        true,
+				SystemTrayEnabled:   true,
+				DesktopAlertEnabled: true,
+				SoundEnabled:        true,
+				TimeoutSeconds:      10,
+			},
+		}
+
+		// Khởi tạo toast notifier trực tiếp
+		scanner.toastNotifier = response.NewWindowsToastNotifier(responseConfig, logger)
+		if err := scanner.toastNotifier.Start(); err != nil {
+			logger.Warn("Failed to start toast notifier in YARA scanner: %v", err)
+		} else {
+			logger.Info("✅ YARA Scanner: Realtime notification system ready")
+		}
 	}
 
 	// Load YARA rules nếu enabled
@@ -453,6 +482,9 @@ func (ys *YaraScanner) ScanFile(filePath string) (*ScanResult, error) {
 		ys.logger.Warn("🚨 YARA THREAT DETECTED: %s -> Rule: %s, Severity: %d",
 			filePath, selectedMatch.Rule, result.Severity)
 
+		// *** QUAN TRỌNG: REALTIME NOTIFICATION NGAY LẬP TỨC ***
+		go ys.showRealtimeNotification(filePath, result)
+
 		// Xử lý threat detection
 		ys.handleThreatDetection(filePath, result, fileInfo)
 	} else {
@@ -460,6 +492,97 @@ func (ys *YaraScanner) ScanFile(filePath string) (*ScanResult, error) {
 	}
 
 	return result, nil
+}
+
+// *** THÊM FUNCTION MỚI: REALTIME NOTIFICATION ***
+func (ys *YaraScanner) showRealtimeNotification(filePath string, result *ScanResult) {
+	// Check duplicate alert (dedup trong 30 giây)
+	key := filePath + "|" + result.RuleName
+	ys.alertMu.Lock()
+	if lastTime, exists := ys.lastAlert[key]; exists {
+		if time.Since(lastTime) < 30*time.Second {
+			ys.alertMu.Unlock()
+			ys.logger.Debug("Suppressed duplicate YARA alert: %s", key)
+			return
+		}
+	}
+	ys.lastAlert[key] = time.Now()
+	ys.alertMu.Unlock()
+
+	// Tạo notification content
+	content := &response.NotificationContent{
+		Title:     "🚨 YARA THREAT DETECTED",
+		Severity:  result.Severity,
+		Timestamp: time.Now(),
+		ThreatInfo: &models.ThreatInfo{
+			ThreatName:  result.RuleName,
+			FilePath:    filePath,
+			Description: result.Description,
+			Severity:    result.Severity,
+		},
+	}
+
+	// Format message dựa trên severity
+	switch result.Severity {
+	case 5: // Critical
+		content.Message = fmt.Sprintf(`🔴 CRITICAL THREAT DETECTED!
+
+Rule: %s
+File: %s
+Threat Type: %s
+Time: %s
+
+⚠️ IMMEDIATE ACTION REQUIRED!
+File has been flagged for quarantine.
+
+This is a high-priority security alert.`,
+			result.RuleName,
+			filepath.Base(filePath),
+			ys.getThreatType(result.RuleTags),
+			time.Now().Format("15:04:05"))
+
+	case 4: // High
+		content.Message = fmt.Sprintf(`🟠 HIGH SEVERITY THREAT
+
+Rule: %s
+File: %s
+Threat Type: %s
+Time: %s
+
+⚠️ Security threat detected.
+Please review this detection.`,
+			result.RuleName,
+			filepath.Base(filePath),
+			ys.getThreatType(result.RuleTags),
+			time.Now().Format("15:04:05"))
+
+	default: // Medium/Low
+		content.Message = fmt.Sprintf(`🟡 Security Alert
+
+Rule: %s
+File: %s
+Threat Type: %s
+Time: %s
+
+Suspicious activity detected.`,
+			result.RuleName,
+			filepath.Base(filePath),
+			ys.getThreatType(result.RuleTags),
+			time.Now().Format("15:04:05"))
+	}
+
+	// Hiển thị notification NGAY LẬP TỨC
+	if ys.toastNotifier != nil {
+		ys.logger.Info("🚨 DISPLAYING REALTIME YARA ALERT: %s", result.RuleName)
+		err := ys.toastNotifier.SendNotification(content)
+		if err != nil {
+			ys.logger.Error("Failed to send realtime YARA notification: %v", err)
+		} else {
+			ys.logger.Info("✅ Realtime YARA notification displayed successfully")
+		}
+	} else {
+		ys.logger.Warn("Toast notifier not available for realtime alert")
+	}
 }
 
 // ScanMemory scans in-memory data with YARA rules
@@ -515,6 +638,9 @@ func (ys *YaraScanner) ScanMemory(data []byte) (*ScanResult, error) {
 
 		ys.logger.Warn("🚨 YARA MEMORY THREAT DETECTED: Rule: %s, Severity: %d",
 			selectedMatch.Rule, result.Severity)
+
+		// Realtime notification cho memory scan
+		go ys.showRealtimeNotification("memory", result)
 	}
 
 	return result, nil
@@ -818,6 +944,12 @@ func (ys *YaraScanner) Cleanup() {
 		ys.rules.Destroy()
 		ys.rules = nil
 		ys.logger.Info("YARA scanner cleanup completed")
+	}
+
+	// Cleanup toast notifier
+	if ys.toastNotifier != nil {
+		ys.toastNotifier.Stop()
+		ys.logger.Info("YARA scanner notification system stopped")
 	}
 }
 

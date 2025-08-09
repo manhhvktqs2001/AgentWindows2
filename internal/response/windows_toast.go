@@ -66,22 +66,14 @@ func (wtn *WindowsToastNotifier) SendNotification(content *NotificationContent) 
 	// Force flush console output
 	os.Stdout.Sync()
 
-	// Thử hiển thị Windows notification
+	// Chỉ hiển thị balloon góc phải màn hình (không dùng fallback khác)
 	go func() {
-		// Method 1: PowerShell Balloon Tip
 		if err := wtn.showPowerShellBalloon(content); err == nil {
 			wtn.logger.Info("✅ PowerShell balloon notification displayed")
 			return
 		}
-
-		// Method 2: Simple MessageBox
-		if err := wtn.showMessageBox(content); err == nil {
-			wtn.logger.Info("✅ MessageBox notification displayed")
-			return
-		}
-
-		// Method 3: Command prompt popup
-		wtn.showCommandPromptAlert(content)
+		// Nếu thất bại, chỉ log để tránh hiện các dạng thông báo khác
+		wtn.logger.Debug("PowerShell balloon failed (no fallback shown): %v", err)
 	}()
 
 	return nil
@@ -140,6 +132,21 @@ Add-Type -AssemblyName System.Windows.Forms
 	cmd := exec.Command("powershell.exe", "-WindowStyle", "Hidden", "-Command", psScript)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 
+	return cmd.Start()
+}
+
+// showMsgBroadcast sử dụng msg.exe để broadcast popup đến tất cả sessions (best-effort)
+func (wtn *WindowsToastNotifier) showMsgBroadcast(content *NotificationContent) error {
+	title := strings.ReplaceAll(content.Title, "\"", `'`)
+	msg := content.Message
+	if len(msg) > 200 {
+		msg = msg[:200] + "..."
+	}
+	msg = strings.ReplaceAll(msg, "\r", " ")
+	msg = strings.ReplaceAll(msg, "\n", " ")
+	body := fmt.Sprintf("%s - %s", title, msg)
+	cmd := exec.Command("msg", "*", "/time:10", body)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	return cmd.Start()
 }
 

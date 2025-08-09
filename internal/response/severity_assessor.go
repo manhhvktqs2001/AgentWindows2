@@ -136,6 +136,19 @@ func (sa *SeverityAssessor) AssessSeverity(threat *models.ThreatInfo) int {
 		severity = 3 // Default medium severity
 	}
 
+	// Clamp severity for known benign/environmental detections (anti-debug/vm)
+	tn := strings.ToLower(threat.ThreatName)
+	if strings.Contains(tn, "vmdetect") ||
+		strings.Contains(tn, "anti_dbg") ||
+		strings.Contains(tn, "debuggercheck") ||
+		strings.Contains(tn, "debuggerexception") ||
+		strings.Contains(tn, "threadcontrol") ||
+		strings.Contains(tn, "seh__vectored") ||
+		strings.Contains(tn, "check_outputdebugstringa") {
+		// Cap to LOW to avoid auto-quarantine/emergency for environment rules
+		severity = 1
+	}
+
 	// Factor 1: Malware family analysis
 	familySeverity := sa.assessMalwareFamily(threat.ThreatName)
 	if familySeverity > severity {
