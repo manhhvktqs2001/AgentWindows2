@@ -10,19 +10,64 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"edr-agent-windows/internal/config"
 	"edr-agent-windows/internal/utils"
 )
 
+// ServerClient handles all communication with the server
 type ServerClient struct {
 	config     config.ServerConfig
 	httpClient *http.Client
 	logger     *utils.Logger
 	agentID    string
+
+	// Rate limiting for log messages
+	rateLimiter *LogRateLimiter
 }
 
+// LogRateLimiter manages rate limiting for log messages
+type LogRateLimiter struct {
+	lastLogTime map[string]time.Time
+	logCounts   map[string]int
+	mu          sync.Mutex
+}
+
+// NewLogRateLimiter creates a new log rate limiter
+func NewLogRateLimiter() *LogRateLimiter {
+	return &LogRateLimiter{
+		lastLogTime: make(map[string]time.Time),
+		logCounts:   make(map[string]int),
+	}
+}
+
+// ShouldLog determines if a log message should be displayed
+func (lr *LogRateLimiter) ShouldLog(key string, interval time.Duration, maxCount int) bool {
+	lr.mu.Lock()
+	defer lr.mu.Unlock()
+
+	now := time.Now()
+	lastTime, exists := lr.lastLogTime[key]
+
+	// Reset counter if interval has passed
+	if !exists || now.Sub(lastTime) >= interval {
+		lr.lastLogTime[key] = now
+		lr.logCounts[key] = 1
+		return true
+	}
+
+	// Check if we've exceeded max count within interval
+	if lr.logCounts[key] < maxCount {
+		lr.logCounts[key]++
+		return true
+	}
+
+	return false
+}
+
+// Request/Response types
 type HeartbeatData struct {
 	AgentID    string                 `json:"agent_id"`
 	Timestamp  time.Time              `json:"timestamp"`
@@ -31,9 +76,8 @@ type HeartbeatData struct {
 	Metrics    map[string]interface{} `json:"metrics"`
 }
 
-// AgentRegistrationRequest với authentication
 type AgentRegistrationRequest struct {
-	AuthToken    string                 `json:"auth_token"` // Pre-shared token
+	AuthToken    string                 `json:"auth_token"`
 	Hostname     string                 `json:"hostname"`
 	IPAddress    string                 `json:"ip_address"`
 	MACAddress   string                 `json:"mac_address"`
@@ -44,133 +88,151 @@ type AgentRegistrationRequest struct {
 	SystemInfo   map[string]interface{} `json:"system_info"`
 }
 
-// AgentRegistrationResponse từ server
 type AgentRegistrationResponse struct {
 	Success   bool   `json:"success"`
 	AgentID   string `json:"agent_id"`
 	APIKey    string `json:"api_key"`
 	Message   string `json:"message"`
-	ExpiresAt string `json:"expires_at,omitempty"` // Optional: API key expiry
+	ExpiresAt string `json:"expires_at,omitempty"`
 }
 
-type AgentRegistration struct {
-	Hostname     string                 `json:"hostname"`
-	IPAddress    string                 `json:"ip_address"`
-	MACAddress   string                 `json:"mac_address"`
-	OSType       string                 `json:"os_type"`
-	OSVersion    string                 `json:"os_version"`
-	Architecture string                 `json:"architecture"`
-	AgentVersion string                 `json:"agent_version"`
-	SystemInfo   map[string]interface{} `json:"system_info"`
-}
-
-// NewServerClient tạo Server Client mới
+// NewServerClient creates a new server client
 func NewServerClient(cfg *config.ServerConfig, logger *utils.Logger) *ServerClient {
-	// Tăng timeout cho HTTP client
+	// Create HTTP client with optimized settings
 	httpClient := &http.Client{
-		Timeout: time.Duration(cfg.Timeout*2) * time.Second, // Tăng timeout gấp đôi
+		Timeout: time.Duration(cfg.Timeout) * time.Second,
 		Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 10,
-			IdleConnTimeout:     90 * time.Second,
+			MaxIdleConns:        10,
+			MaxIdleConnsPerHost: 5,
+			IdleConnTimeout:     30 * time.Second,
 			TLSHandshakeTimeout: 10 * time.Second,
+			DisableCompression:  false,
 		},
 	}
 
 	return &ServerClient{
-		config:     *cfg,
-		logger:     logger,
-		httpClient: httpClient,
+		config:      *cfg,
+		logger:      logger,
+		httpClient:  httpClient,
+		rateLimiter: NewLogRateLimiter(),
 	}
 }
 
-// Register với authentication token
+// logRateLimited logs with rate limiting
+func (sc *ServerClient) logRateLimited(level, key string, format string, args ...interface{}) {
+	// Different intervals for different log types
+	interval := 30 * time.Second
+	maxCount := 3
+
+	switch key {
+	case "heartbeat_skip", "events_skip", "alert_skip":
+		interval = 5 * time.Minute
+		maxCount = 1
+	case "heartbeat_fail", "events_fail", "alert_fail":
+		interval = 1 * time.Minute
+		maxCount = 2
+	case "windows_file_error":
+		interval = 2 * time.Minute
+		maxCount = 1
+	}
+
+	if !sc.rateLimiter.ShouldLog(key, interval, maxCount) {
+		return
+	}
+
+	message := fmt.Sprintf(format, args...)
+	switch level {
+	case "DEBUG":
+		sc.logger.Debug(message)
+	case "INFO":
+		sc.logger.Info(message)
+	case "WARN":
+		sc.logger.Warn(message)
+	case "ERROR":
+		sc.logger.Error(message)
+	}
+}
+
+// Register registers the agent with the server
 func (sc *ServerClient) Register(registration AgentRegistrationRequest) (*AgentRegistrationResponse, error) {
 	url := sc.config.URL + "/api/v1/agents/register"
 
-	// Validate auth token
 	if registration.AuthToken == "" {
-		return nil, fmt.Errorf("authentication token is required for registration")
+		return nil, fmt.Errorf("authentication token is required")
 	}
 
 	data, err := json.Marshal(registration)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal registration data: %w", err)
+		return nil, fmt.Errorf("failed to marshal registration: %w", err)
 	}
 
 	sc.logger.Info("Attempting agent registration with server")
-	sc.logger.Debug("Registration payload size: %d bytes", len(data))
 
-	// Thực hiện request với retry
+	// Retry logic with exponential backoff
 	var resp *http.Response
-	for attempt := 1; attempt <= sc.config.RetryCount; attempt++ {
+	maxRetries := sc.config.RetryCount
+	if maxRetries <= 0 {
+		maxRetries = 3
+	}
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
 		resp, err = sc.postWithAuth(url, data, registration.AuthToken)
 		if err == nil {
 			break
 		}
 
-		if attempt < sc.config.RetryCount {
-			waitTime := time.Duration(attempt) * time.Second
-			sc.logger.Warn("Registration attempt %d failed, retrying in %v: %v", attempt, waitTime, err)
-			time.Sleep(waitTime)
+		if attempt < maxRetries {
+			backoff := time.Duration(attempt*attempt) * time.Second
+			sc.logger.Warn("Registration attempt %d/%d failed, retrying in %v", attempt, maxRetries, backoff)
+			time.Sleep(backoff)
 		}
 	}
 
 	if err != nil {
-		return nil, fmt.Errorf("failed to register after %d attempts: %w", sc.config.RetryCount, err)
+		return nil, fmt.Errorf("registration failed after %d attempts: %w", maxRetries, err)
 	}
 	defer resp.Body.Close()
 
-	// Đọc response body để logging chi tiết
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
 	var result AgentRegistrationResponse
 	if err := json.Unmarshal(bodyBytes, &result); err != nil {
-		return nil, fmt.Errorf("failed to parse registration response: %w", err)
+		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	// Xử lý các status code khác nhau
+	// Handle different status codes
 	switch resp.StatusCode {
-	case http.StatusCreated, http.StatusOK:
+	case http.StatusOK, http.StatusCreated:
 		if !result.Success {
 			return nil, fmt.Errorf("registration failed: %s", result.Message)
 		}
-
 		sc.agentID = result.AgentID
 		if result.APIKey != "" {
 			sc.config.APIKey = result.APIKey
-			sc.logger.Info("Received API key from server")
 		}
-
-		sc.logger.Info("Agent registration successful - ID: %s", result.AgentID)
+		sc.logger.Info("Agent registered successfully - ID: %s", result.AgentID)
 		return &result, nil
 
 	case http.StatusUnauthorized:
-		return nil, fmt.Errorf("authentication failed: invalid auth token")
-
+		return nil, fmt.Errorf("unauthorized: invalid auth token")
 	case http.StatusConflict:
 		return nil, fmt.Errorf("agent already registered: %s", result.Message)
-
-	case http.StatusBadRequest:
-		return nil, fmt.Errorf("invalid registration request: %s", result.Message)
-
 	default:
 		return nil, fmt.Errorf("registration failed with status %d: %s", resp.StatusCode, result.Message)
 	}
 }
 
+// SendHeartbeat sends a heartbeat to the server
 func (sc *ServerClient) SendHeartbeat(data HeartbeatData) error {
-	url := fmt.Sprintf("%s/api/v1/agents/heartbeat", sc.config.URL)
-
-	// If server URL empty or API key missing, skip quietly
 	if sc.config.URL == "" || sc.config.APIKey == "" {
-		sc.logger.Debug("Skipping heartbeat: server URL or API key not set")
+		sc.logRateLimited("DEBUG", "heartbeat_skip", "Skipping heartbeat: server not configured")
 		return nil
 	}
 
+	url := fmt.Sprintf("%s/api/v1/agents/heartbeat", sc.config.URL)
 	jsonData, err := json.Marshal(data)
 	if err != nil {
 		return err
@@ -178,44 +240,220 @@ func (sc *ServerClient) SendHeartbeat(data HeartbeatData) error {
 
 	resp, err := sc.post(url, jsonData)
 	if err != nil {
-		sc.logger.Warn("Heartbeat skipped (server unreachable): %v", err)
-		return nil
+		sc.logRateLimited("WARN", "heartbeat_fail", "Heartbeat failed: %v", err)
+		return nil // Don't propagate error to avoid breaking the agent
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		sc.logger.Warn("Heartbeat not accepted (status %d). Suppressing error.", resp.StatusCode)
+		sc.logRateLimited("WARN", "heartbeat_reject", "Heartbeat rejected: status %d", resp.StatusCode)
 		return nil
 	}
 
 	return nil
 }
 
+// SendEvents sends events to the server
 func (sc *ServerClient) SendEvents(events []interface{}) error {
-	url := sc.config.URL + "/api/v1/agents/events"
-
 	if sc.config.URL == "" || sc.config.APIKey == "" || sc.agentID == "" {
-		sc.logger.Debug("Skipping send events: server URL/API key/agentID not set")
+		sc.logRateLimited("DEBUG", "events_skip", "Skipping events: server not configured")
 		return nil
 	}
 
+	url := sc.config.URL + "/api/v1/agents/events"
 	jsonData, err := json.Marshal(events)
 	if err != nil {
 		sc.logger.Error("Failed to marshal events: %v", err)
 		return err
 	}
 
-	// Retry logic with exponential backoff using configured retry count
+	// Send with retry
+	err = sc.postWithRetry(url, jsonData, "events")
+	if err != nil {
+		sc.logRateLimited("WARN", "events_fail", "Failed to send events: %v", err)
+		return nil // Don't propagate error
+	}
+
+	sc.logRateLimited("INFO", "events_success", "Sent %d events to server", len(events))
+	return nil
+}
+
+// SendAlert sends an alert to the server
+func (sc *ServerClient) SendAlert(alertData map[string]interface{}) error {
+	if sc.config.URL == "" || sc.config.APIKey == "" || sc.agentID == "" {
+		sc.logRateLimited("DEBUG", "alert_skip", "Skipping alert: server not configured")
+		return nil
+	}
+
+	url := sc.config.URL + "/api/v1/agents/alerts"
+	jsonData, err := json.Marshal(alertData)
+	if err != nil {
+		sc.logger.Error("Failed to marshal alert: %v", err)
+		return err
+	}
+
+	// Send with retry
+	err = sc.postWithRetry(url, jsonData, "alert")
+	if err != nil {
+		sc.logRateLimited("WARN", "alert_fail", "Failed to send alert: %v", err)
+		return nil
+	}
+
+	sc.logRateLimited("INFO", "alert_success", "Alert sent successfully")
+	return nil
+}
+
+// UploadQuarantineFile uploads a quarantined file to the server
+func (sc *ServerClient) UploadQuarantineFile(agentID string, filePath string) error {
+	if sc.config.URL == "" || sc.config.APIKey == "" || agentID == "" {
+		sc.logRateLimited("DEBUG", "upload_skip", "Skipping upload: server not configured")
+		return nil
+	}
+
+	// Check file exists
+	fileInfo, err := os.Stat(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			sc.logger.Warn("File does not exist for upload: %s", filePath)
+			return nil
+		}
+		return fmt.Errorf("failed to stat file: %w", err)
+	}
+
+	// Skip directories and non-regular files (avoid Windows 'Incorrect function' on special files)
+	if fileInfo.IsDir() {
+		sc.logRateLimited("INFO", "upload_skip_dir", "Skipping upload of directory: %s", filePath)
+		return nil
+	}
+	if !fileInfo.Mode().IsRegular() {
+		sc.logRateLimited("INFO", "upload_skip_special", "Skipping upload of non-regular file: %s", filePath)
+		return nil
+	}
+
+	// Skip empty files
+	if fileInfo.Size() == 0 {
+		sc.logger.Warn("Skipping upload of empty file: %s", filePath)
+		return nil
+	}
+
+	sc.logger.Debug("Starting file upload: %s (%d bytes)", filePath, fileInfo.Size())
+
+	// Read file with optimized strategy
+	fileContent, err := sc.readFileOptimized(filePath, fileInfo.Size())
+	if err != nil {
+		sc.logger.Error("Failed to read file for upload: %v", err)
+		return fmt.Errorf("failed to read file: %w", err)
+	}
+
+	// Create multipart form
+	body, contentType, err := sc.createMultipartForm(agentID, filepath.Base(filePath), fileContent)
+	if err != nil {
+		return fmt.Errorf("failed to create multipart form: %w", err)
+	}
+
+	// Upload with retry
+	url := sc.config.URL + "/api/v1/public/quarantine/upload"
+	err = sc.uploadWithRetry(url, body, contentType)
+	if err != nil {
+		// Special handling for storage capacity errors
+		if strings.Contains(err.Error(), "minio") || strings.Contains(err.Error(), "storage") {
+			sc.logger.Warn("Upload skipped due to storage capacity issue")
+			return nil
+		}
+		return fmt.Errorf("upload failed: %w", err)
+	}
+
+	sc.logger.Info("✅ File uploaded successfully: %s", filepath.Base(filePath))
+	return nil
+}
+
+// readFileOptimized reads a file using the most appropriate strategy
+func (sc *ServerClient) readFileOptimized(filePath string, fileSize int64) ([]byte, error) {
+	// For small files, use simple read
+	if fileSize < 1024*1024 { // < 1MB
+		return os.ReadFile(filePath)
+	}
+
+	// For larger files, use chunked reading
+	return sc.readFileChunked(filePath, fileSize)
+}
+
+// readFileChunked reads a file in chunks to handle large files and Windows issues
+func (sc *ServerClient) readFileChunked(filePath string, fileSize int64) ([]byte, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	const chunkSize = 64 * 1024 // 64KB chunks
+	buffer := make([]byte, 0, fileSize)
+	chunk := make([]byte, chunkSize)
+	totalRead := int64(0)
+
+	for totalRead < fileSize {
+		n, err := file.Read(chunk)
+		if n > 0 {
+			buffer = append(buffer, chunk[:n]...)
+			totalRead += int64(n)
+		}
+
+		if err == io.EOF {
+			break
+		}
+
+		if err != nil {
+			// Handle Windows-specific errors
+			if strings.Contains(err.Error(), "Incorrect function") {
+				sc.logRateLimited("WARN", "windows_file_error", "Windows file read error, attempting recovery")
+				// Try to continue reading
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			return nil, fmt.Errorf("read error at byte %d: %w", totalRead, err)
+		}
+	}
+
+	return buffer, nil
+}
+
+// createMultipartForm creates a multipart form for file upload
+func (sc *ServerClient) createMultipartForm(agentID, fileName string, fileContent []byte) (*bytes.Buffer, string, error) {
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+
+	// Add agent_id field
+	if err := writer.WriteField("agent_id", agentID); err != nil {
+		return nil, "", err
+	}
+
+	// Add file field
+	part, err := writer.CreateFormFile("file", fileName)
+	if err != nil {
+		return nil, "", err
+	}
+
+	if _, err := part.Write(fileContent); err != nil {
+		return nil, "", err
+	}
+
+	if err := writer.Close(); err != nil {
+		return nil, "", err
+	}
+
+	return body, writer.FormDataContentType(), nil
+}
+
+// postWithRetry sends a POST request with retry logic
+func (sc *ServerClient) postWithRetry(url string, data []byte, operation string) error {
 	maxRetries := sc.config.RetryCount
 	if maxRetries <= 0 {
 		maxRetries = 3
 	}
-	backoff := time.Second
 
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		req, err := http.NewRequest("POST", url, bytes.NewBuffer(data))
 		if err != nil {
-			sc.logger.Error("Failed to create request: %v", err)
 			return err
 		}
 
@@ -225,32 +463,171 @@ func (sc *ServerClient) SendEvents(events []interface{}) error {
 
 		resp, err := sc.httpClient.Do(req)
 		if err != nil {
-			if attempt < maxRetries-1 {
-				sc.logger.Warn("Send events failed (attempt %d/%d), retrying in %v: %v",
-					attempt+1, maxRetries, backoff, err)
+			if attempt < maxRetries {
+				backoff := time.Duration(attempt*attempt) * time.Second
+				sc.logRateLimited("DEBUG", operation+"_retry",
+					"Retry %d/%d for %s in %v", attempt, maxRetries, operation, backoff)
 				time.Sleep(backoff)
-				backoff *= 2 // Exponential backoff
 				continue
 			}
-			sc.logger.Warn("Send events skipped (server unreachable after %d attempts): %v", maxRetries, err)
-			return nil
+			return err
 		}
 		defer resp.Body.Close()
 
-		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-			body, _ := io.ReadAll(resp.Body)
-			sc.logger.Warn("Send events not accepted: %d, response: %s (suppressed)", resp.StatusCode, string(body))
+		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
 			return nil
 		}
 
-		sc.logger.Info("Sent %d events to server", len(events))
-		return nil
+		// Don't retry on client errors
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			body, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("server rejected %s: %d - %s", operation, resp.StatusCode, string(body))
+		}
+
+		// Retry on server errors
+		if attempt < maxRetries {
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
 	}
 
-	return nil
+	return fmt.Errorf("%s failed after %d attempts", operation, maxRetries)
 }
 
+// uploadWithRetry uploads with retry logic
+func (sc *ServerClient) uploadWithRetry(url string, body *bytes.Buffer, contentType string) error {
+	maxRetries := 3
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		// Create new reader for each attempt
+		bodyReader := bytes.NewReader(body.Bytes())
+
+		req, err := http.NewRequest("POST", url, bodyReader)
+		if err != nil {
+			return err
+		}
+
+		req.Header.Set("Content-Type", contentType)
+		req.Header.Set("X-API-Key", sc.config.APIKey)
+		req.Header.Set("X-Agent-ID", sc.agentID)
+
+		resp, err := sc.httpClient.Do(req)
+		if err != nil {
+			if attempt < maxRetries {
+				time.Sleep(time.Duration(attempt) * time.Second)
+				continue
+			}
+			return err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+			return nil
+		}
+
+		respBody, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			return fmt.Errorf("upload rejected: %d - %s", resp.StatusCode, string(respBody))
+		}
+
+		if attempt < maxRetries {
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+	}
+
+	return fmt.Errorf("upload failed after %d attempts", maxRetries)
+}
+
+// Helper methods for basic HTTP operations
+func (sc *ServerClient) post(url string, data []byte) (*http.Response, error) {
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(data))
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", sc.config.APIKey)
+
+	return sc.httpClient.Do(req)
+}
+
+func (sc *ServerClient) postWithAuth(url string, data []byte, authToken string) (*http.Response, error) {
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(data))
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", authToken))
+	req.Header.Set("User-Agent", "EDR-Agent/1.0.0")
+
+	return sc.httpClient.Do(req)
+}
+
+// CheckAgentExistsByMAC checks if an agent exists by MAC address
+func (sc *ServerClient) CheckAgentExistsByMAC(macAddress string) (bool, string, string, error) {
+	url := fmt.Sprintf("%s/api/v1/agents/check-by-mac?mac=%s", sc.config.URL, macAddress)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return false, "", "", err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	if sc.config.AuthToken != "" {
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", sc.config.AuthToken))
+	}
+
+	// Retry logic
+	var resp *http.Response
+	maxRetries := 3
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		resp, err = sc.httpClient.Do(req)
+		if err == nil {
+			break
+		}
+		if attempt < maxRetries {
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+	}
+
+	if err != nil {
+		return false, "", "", fmt.Errorf("failed to check agent: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Exists  bool   `json:"exists"`
+		AgentID string `json:"agent_id,omitempty"`
+		APIKey  string `json:"api_key,omitempty"`
+		Message string `json:"message,omitempty"`
+	}
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return false, "", "", fmt.Errorf("failed to parse response: %w", err)
+		}
+		sc.logger.Info("MAC check result - Exists: %v", result.Exists)
+		return result.Exists, result.AgentID, result.APIKey, nil
+
+	case http.StatusNotFound:
+		return false, "", "", nil
+
+	case http.StatusUnauthorized:
+		return false, "", "", fmt.Errorf("unauthorized")
+
+	default:
+		return false, "", "", fmt.Errorf("server returned status %d", resp.StatusCode)
+	}
+}
+
+// GetTasks gets tasks from the server
 func (sc *ServerClient) GetTasks() ([]interface{}, error) {
+	if sc.config.URL == "" || sc.agentID == "" {
+		return nil, fmt.Errorf("server not configured")
+	}
+
 	url := fmt.Sprintf("%s/api/v1/agents/%s/tasks", sc.config.URL, sc.agentID)
 
 	resp, err := sc.httpClient.Get(url)
@@ -268,690 +645,21 @@ func (sc *ServerClient) GetTasks() ([]interface{}, error) {
 	return tasks, err
 }
 
-func (sc *ServerClient) post(url string, data []byte) (*http.Response, error) {
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(data))
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-API-Key", sc.config.APIKey)
-
-	return sc.httpClient.Do(req)
-}
-
-// postWithAuth gửi POST request với authentication token
-func (sc *ServerClient) postWithAuth(url string, data []byte, authToken string) (*http.Response, error) {
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(data))
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", authToken))
-	req.Header.Set("User-Agent", "EDR-Agent/1.0.0")
-
-	return sc.httpClient.Do(req)
-}
-
-// GetAPIKey returns the current API key
+// Getter and setter methods
 func (sc *ServerClient) GetAPIKey() string {
 	return sc.config.APIKey
 }
 
-// UpdateAPIKey updates the API key in the server client
 func (sc *ServerClient) UpdateAPIKey(newAPIKey string) {
 	sc.config.APIKey = newAPIKey
-	sc.logger.Info("Updated API key in server client: %s", newAPIKey)
+	sc.logger.Info("API key updated")
 }
 
-// SetAgentID sets the agent ID
 func (sc *ServerClient) SetAgentID(agentID string) {
 	sc.agentID = agentID
-	sc.logger.Info("Set agent ID: %s", agentID)
+	sc.logger.Info("Agent ID set: %s", agentID)
 }
 
-// GetAgentID returns the current agent ID
 func (sc *ServerClient) GetAgentID() string {
 	return sc.agentID
-}
-
-// CheckAgentExistsByMAC với auth token
-func (sc *ServerClient) CheckAgentExistsByMAC(macAddress string) (bool, string, string, error) {
-	url := fmt.Sprintf("%s/api/v1/agents/check-by-mac?mac=%s", sc.config.URL, macAddress)
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return false, "", "", err
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	// Sử dụng auth token để check (vì đây là operation sensitive)
-	if sc.config.AuthToken != "" {
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", sc.config.AuthToken))
-	}
-
-	var resp *http.Response
-	for attempt := 1; attempt <= sc.config.RetryCount; attempt++ {
-		resp, err = sc.httpClient.Do(req)
-		if err == nil {
-			break
-		}
-		if attempt < sc.config.RetryCount {
-			time.Sleep(time.Duration(attempt) * time.Second)
-		}
-	}
-
-	if err != nil {
-		return false, "", "", fmt.Errorf("failed to check agent existence: %w", err)
-	}
-	defer resp.Body.Close()
-
-	var result struct {
-		Exists  bool   `json:"exists"`
-		AgentID string `json:"agent_id,omitempty"`
-		APIKey  string `json:"api_key,omitempty"`
-		Message string `json:"message,omitempty"`
-		Status  string `json:"status,omitempty"`
-	}
-
-	switch resp.StatusCode {
-	case http.StatusOK:
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			return false, "", "", fmt.Errorf("failed to parse check response: %w", err)
-		}
-		sc.logger.Info("MAC check result - Exists: %v, Status: %s", result.Exists, result.Status)
-		return result.Exists, result.AgentID, result.APIKey, nil
-
-	case http.StatusNotFound:
-		// Agent không tồn tại
-		return false, "", "", nil
-
-	case http.StatusUnauthorized:
-		return false, "", "", fmt.Errorf("unauthorized: invalid auth token")
-
-	default:
-		json.NewDecoder(resp.Body).Decode(&result)
-		return false, "", "", fmt.Errorf("server returned status %d: %s", resp.StatusCode, result.Message)
-	}
-}
-
-// SendAlert sends an alert to the server
-func (sc *ServerClient) SendAlert(alertData map[string]interface{}) error {
-	url := sc.config.URL + "/api/v1/agents/alerts"
-
-	if sc.config.URL == "" || sc.config.APIKey == "" || sc.agentID == "" {
-		sc.logger.Debug("Skipping send alert: server URL/API key/agentID not set")
-		return nil
-	}
-
-	jsonData, err := json.Marshal(alertData)
-	if err != nil {
-		sc.logger.Error("Failed to marshal alert data: %v", err)
-		return err
-	}
-
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		sc.logger.Error("Failed to create alert request: %v", err)
-		return err
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-API-Key", sc.config.APIKey)
-	req.Header.Set("X-Agent-ID", sc.agentID)
-
-	resp, err := sc.httpClient.Do(req)
-	if err != nil {
-		sc.logger.Warn("Send alert skipped (server unreachable): %v", err)
-		return nil
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-			sc.logger.Warn("Send alert unauthorized (suppressed): %d, response: %s", resp.StatusCode, string(body))
-			return nil
-		}
-		sc.logger.Warn("Send alert not accepted (suppressed): %d, response: %s", resp.StatusCode, string(body))
-		return nil
-	}
-
-	sc.logger.Info("Alert sent to server successfully")
-	return nil
-}
-
-// isFileAccessible checks if a file can be accessed for reading
-func (sc *ServerClient) isFileAccessible(filePath string) bool {
-	// Try to open file with read access
-	file, err := os.OpenFile(filePath, os.O_RDONLY, 0)
-	if err != nil {
-		return false
-	}
-	defer file.Close()
-
-	// Try to get file info
-	_, err = file.Stat()
-	return err == nil
-}
-
-// waitForFileAccess waits for a file to become accessible
-func (sc *ServerClient) waitForFileAccess(filePath string, maxWait time.Duration) bool {
-	start := time.Now()
-	checkInterval := 100 * time.Millisecond
-
-	for time.Since(start) < maxWait {
-		if sc.isFileAccessible(filePath) {
-			return true
-		}
-		time.Sleep(checkInterval)
-	}
-	return false
-}
-
-func (sc *ServerClient) UploadQuarantineFile(agentID string, filePath string) error {
-	if sc.config.URL == "" || sc.config.APIKey == "" || agentID == "" {
-		sc.logger.Debug("Skipping upload quarantine file: server URL/API key/agentID not set")
-		return nil
-	}
-
-	// Check if file exists
-	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		sc.logger.Warn("File does not exist for upload: %s", filePath)
-		return fmt.Errorf("file does not exist: %s", filePath)
-	}
-
-	// Check if file is accessible
-	if !sc.isFileAccessible(filePath) {
-		sc.logger.Debug("File not immediately accessible, waiting for access: %s", filePath)
-
-		// Wait up to 10 seconds for file to become accessible
-		if !sc.waitForFileAccess(filePath, 10*time.Second) {
-			sc.logger.Warn("File not accessible after waiting: %s", filePath)
-			return fmt.Errorf("file not accessible for upload: %s", filePath)
-		}
-	}
-
-	sc.logger.Debug("Starting file upload for: %s", filePath)
-
-	// Try to read file content using multiple strategies
-	fileContent, err := sc.readFileWithMultipleStrategies(filePath)
-	if err != nil {
-		sc.logger.Error("Failed to read file content using all strategies: %v", err)
-		return fmt.Errorf("failed to read file content: %w", err)
-	}
-
-	// Check if we got any content
-	if len(fileContent) == 0 {
-		sc.logger.Warn("No content read from file, skipping upload: %s", filePath)
-		return fmt.Errorf("no content read from file: %s", filePath)
-	}
-
-	sc.logger.Debug("Successfully read %d bytes from file: %s", len(fileContent), filePath)
-
-	// Create a temporary file to use with http.PostForm
-	tempFile, err := os.CreateTemp("", "upload_*")
-	if err != nil {
-		sc.logger.Error("Failed to create temp file: %v", err)
-		return fmt.Errorf("failed to create temp file: %w", err)
-	}
-	defer os.Remove(tempFile.Name())
-	defer tempFile.Close()
-
-	// Write content to temp file
-	_, err = tempFile.Write(fileContent)
-	if err != nil {
-		sc.logger.Error("Failed to write to temp file: %v", err)
-		return fmt.Errorf("failed to write to temp file: %w", err)
-	}
-
-	// Reset file pointer to beginning
-	tempFile.Seek(0, 0)
-
-	// Create multipart form data using the temp file
-	var buffer bytes.Buffer
-	writer := multipart.NewWriter(&buffer)
-
-	// Add agent_id field
-	agentField, err := writer.CreateFormField("agent_id")
-	if err != nil {
-		sc.logger.Error("Failed to create agent_id field: %v", err)
-		return fmt.Errorf("failed to create form field: %w", err)
-	}
-	agentField.Write([]byte(agentID))
-	sc.logger.Debug("Added agent_id field: %s", agentID)
-
-	// Add file field
-	fileField, err := writer.CreateFormFile("file", filepath.Base(filePath))
-	if err != nil {
-		sc.logger.Error("Failed to create file field: %v", err)
-		return fmt.Errorf("failed to create file field: %w", err)
-	}
-
-	sc.logger.Debug("Created file field for: %s", filepath.Base(filePath))
-
-	// Copy from temp file to form field
-	bytesWritten, err := io.Copy(fileField, tempFile)
-	if err != nil {
-		sc.logger.Error("Failed to copy file content to form: %v", err)
-		return fmt.Errorf("failed to copy file content to form: %w", err)
-	}
-
-	sc.logger.Debug("Copied %d bytes to file field", bytesWritten)
-
-	// Close the writer to finalize the multipart data
-	writer.Close()
-	sc.logger.Debug("Multipart form data created, total size: %d bytes", buffer.Len())
-	sc.logger.Debug("Content-Type: %s", writer.FormDataContentType())
-
-	// Create request with the multipart data
-	url := sc.config.URL + "/api/v1/public/quarantine/upload"
-	req, err := http.NewRequest("POST", url, &buffer)
-	if err != nil {
-		sc.logger.Error("Failed to create upload request: %v", err)
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Set headers
-	req.Header.Set("Content-Type", writer.FormDataContentType())
-	req.Header.Set("X-API-Key", sc.config.APIKey)
-	req.Header.Set("X-Agent-ID", agentID)
-
-	sc.logger.Debug("Sending upload request to: %s", url)
-
-	// Send request
-	resp, err := sc.httpClient.Do(req)
-	if err != nil {
-		sc.logger.Warn("Upload quarantine file skipped (server unreachable): %v", err)
-		return fmt.Errorf("server unreachable: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Read response
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		sc.logger.Error("Failed to read response body: %v", err)
-		return fmt.Errorf("failed to read response: %w", err)
-	}
-
-	// Check response status with special handling for MinIO capacity
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		bodyStr := string(responseBody)
-		if resp.StatusCode == http.StatusInternalServerError && (strings.Contains(strings.ToLower(bodyStr), "minio") || strings.Contains(strings.ToLower(bodyStr), "minimum free drive threshold")) {
-			sc.logger.Warn("Upload skipped due to storage capacity (MinIO threshold). Please free space. Response: %s", bodyStr)
-			return nil
-		}
-		sc.logger.Warn("Upload quarantine file failed: %d, response: %s", resp.StatusCode, bodyStr)
-		return fmt.Errorf("upload failed with status %d: %s", resp.StatusCode, bodyStr)
-	}
-
-	// Parse response
-	var response struct {
-		QuarantineID string `json:"quarantine_id"`
-		Message      string `json:"message"`
-	}
-	if err := json.Unmarshal(responseBody, &response); err != nil {
-		sc.logger.Warn("Failed to parse upload response: %v", err)
-		// Don't return error, upload was successful
-	}
-
-	sc.logger.Info("✅ File uploaded to server successfully: %s (Quarantine ID: %s)", filepath.Base(filePath), response.QuarantineID)
-	return nil
-}
-
-// readFileWithMultipleStrategies attempts to read a file using multiple strategies
-// to handle Windows-specific file access issues
-func (sc *ServerClient) readFileWithMultipleStrategies(filePath string) ([]byte, error) {
-	// Strategy 1: Standard file reading with retry
-	if content, err := sc.readFileStandard(filePath); err == nil {
-		return content, nil
-	} else {
-		sc.logger.Debug("Standard file reading failed: %v", err)
-	}
-
-	// Strategy 2: Chunked reading with Windows error recovery
-	if content, err := sc.readFileChunked(filePath); err == nil {
-		return content, nil
-	} else {
-		sc.logger.Debug("Chunked file reading failed: %v", err)
-	}
-
-	// Strategy 3: Try to copy to temp file first, then read
-	if content, err := sc.readFileViaCopy(filePath); err == nil {
-		return content, nil
-	} else {
-		sc.logger.Debug("File reading via copy failed: %v", err)
-	}
-
-	return nil, fmt.Errorf("all file reading strategies failed for: %s", filePath)
-}
-
-// readFileStandard attempts standard file reading with retry logic
-func (sc *ServerClient) readFileStandard(filePath string) ([]byte, error) {
-	maxRetries := 3
-	var lastErr error
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		sc.logger.Debug("Standard file reading attempt %d/%d for: %s", attempt, maxRetries, filePath)
-
-		// Try to open file
-		file, err := os.OpenFile(filePath, os.O_RDONLY, 0)
-		if err != nil {
-			lastErr = err
-			sc.logger.Debug("Failed to open file (attempt %d): %v", attempt, err)
-			if attempt < maxRetries {
-				time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
-				continue
-			}
-			return nil, fmt.Errorf("failed to open file: %w", err)
-		}
-
-		// Get file info
-		fileInfo, err := file.Stat()
-		if err != nil {
-			file.Close()
-			lastErr = err
-			sc.logger.Debug("Failed to get file info (attempt %d): %v", attempt, err)
-			if attempt < maxRetries {
-				time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
-				continue
-			}
-			return nil, fmt.Errorf("failed to get file info: %w", err)
-		}
-
-		fileSize := fileInfo.Size()
-		if fileSize == 0 {
-			file.Close()
-			return []byte{}, nil
-		}
-
-		// Read file content
-		content := make([]byte, fileSize)
-		n, err := file.Read(content)
-		file.Close()
-
-		if err != nil && err != io.EOF {
-			lastErr = err
-			sc.logger.Debug("Failed to read file (attempt %d): %v", attempt, err)
-			if attempt < maxRetries {
-				time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
-				continue
-			}
-			return nil, fmt.Errorf("failed to read file: %w", err)
-		}
-
-		if int64(n) != fileSize {
-			sc.logger.Warn("Partial read: expected %d bytes, got %d bytes", fileSize, n)
-			content = content[:n]
-		}
-
-		sc.logger.Debug("Successfully read %d bytes using standard method", len(content))
-		return content, nil
-	}
-
-	return nil, fmt.Errorf("all standard reading attempts failed: %w", lastErr)
-}
-
-// readFileChunked attempts chunked file reading with Windows error recovery
-func (sc *ServerClient) readFileChunked(filePath string) ([]byte, error) {
-	sc.logger.Debug("Attempting chunked file reading for: %s", filePath)
-
-	// Get file info first
-	fileInfo, err := os.Stat(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get file info: %w", err)
-	}
-
-	fileSize := fileInfo.Size()
-	if fileSize == 0 {
-		return []byte{}, nil
-	}
-
-	// Try multiple file opening strategies
-	var file *os.File
-	openStrategies := []struct {
-		flags int
-		desc  string
-	}{
-		{os.O_RDONLY, "standard read-only"},
-		{os.O_RDONLY | os.O_SYNC, "read-only with sync"},
-	}
-
-	for _, strategy := range openStrategies {
-		file, err = os.OpenFile(filePath, strategy.flags, 0)
-		if err == nil {
-			sc.logger.Debug("Successfully opened file with strategy: %s", strategy.desc)
-			break
-		}
-		sc.logger.Debug("Failed to open file with strategy %s: %v", strategy.desc, err)
-	}
-
-	if file == nil {
-		return nil, fmt.Errorf("failed to open file with any strategy")
-	}
-	defer file.Close()
-
-	// Read file in chunks with aggressive error recovery
-	const chunkSize = 32 * 1024 // 32KB chunks
-	content := make([]byte, 0, fileSize)
-	totalRead := int64(0)
-	consecutiveErrors := 0
-	maxConsecutiveErrors := 3
-
-	for totalRead < fileSize {
-		// Calculate chunk size for this iteration
-		remaining := fileSize - totalRead
-		currentChunkSize := chunkSize
-		if remaining < int64(chunkSize) {
-			currentChunkSize = int(remaining)
-		}
-
-		// Read chunk
-		chunk := make([]byte, currentChunkSize)
-		n, err := file.Read(chunk)
-
-		if n > 0 {
-			content = append(content, chunk[:n]...)
-			totalRead += int64(n)
-			consecutiveErrors = 0 // Reset error counter on successful read
-			sc.logger.Debug("Read chunk: %d bytes, total: %d/%d", n, totalRead, fileSize)
-		}
-
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			consecutiveErrors++
-			sc.logger.Warn("Failed to read chunk at position %d (error %d/%d): %v", totalRead, consecutiveErrors, maxConsecutiveErrors, err)
-
-			// Check if this is a Windows-specific error
-			if strings.Contains(err.Error(), "Incorrect function") ||
-				strings.Contains(err.Error(), "Access is denied") ||
-				strings.Contains(err.Error(), "The process cannot access the file") ||
-				strings.Contains(err.Error(), "The file cannot be accessed by the system") {
-
-				sc.logger.Warn("Windows file access error detected, attempting recovery...")
-
-				// Try to recover by closing and reopening the file
-				file.Close()
-				time.Sleep(500 * time.Millisecond) // Increased wait time
-
-				// Try to reopen with different strategy
-				for _, strategy := range openStrategies {
-					file, err = os.OpenFile(filePath, strategy.flags, 0)
-					if err == nil {
-						sc.logger.Debug("Successfully reopened file with strategy: %s", strategy.desc)
-						break
-					}
-				}
-
-				if file == nil {
-					sc.logger.Error("Failed to reopen file after error")
-					return nil, fmt.Errorf("failed to reopen file after error")
-				}
-
-				// Seek to current position
-				if _, seekErr := file.Seek(totalRead, 0); seekErr != nil {
-					sc.logger.Error("Failed to seek to position %d: %v", totalRead, seekErr)
-					return nil, fmt.Errorf("failed to seek in file: %w", seekErr)
-				}
-
-				// Continue reading from this position
-				continue
-			}
-
-			// For other errors, check if we've had too many consecutive errors
-			if consecutiveErrors >= maxConsecutiveErrors {
-				sc.logger.Error("Too many consecutive errors (%d), giving up", consecutiveErrors)
-				if totalRead > 0 && len(content) > 0 {
-					sc.logger.Warn("Partial read successful (%d bytes), returning partial content", len(content))
-					return content, nil
-				}
-				return nil, fmt.Errorf("failed to read file after %d consecutive errors: %w", consecutiveErrors, err)
-			}
-
-			// Wait before retry for non-Windows errors
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-	}
-
-	return content, nil
-}
-
-// readFileViaCopy attempts to read file by first copying it to a temporary location
-func (sc *ServerClient) readFileViaCopy(filePath string) ([]byte, error) {
-	sc.logger.Debug("Attempting file reading via copy for: %s", filePath)
-
-	// Create temporary file
-	tempFile, err := os.CreateTemp("", "read_copy_*")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create temp file: %w", err)
-	}
-	defer os.Remove(tempFile.Name())
-	defer tempFile.Close()
-
-	// Try to copy the file
-	srcFile, err := os.OpenFile(filePath, os.O_RDONLY, 0)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open source file: %w", err)
-	}
-	defer srcFile.Close()
-
-	// Copy file content
-	_, err = io.Copy(tempFile, srcFile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to copy file: %w", err)
-	}
-
-	// Reset temp file pointer
-	tempFile.Seek(0, 0)
-
-	// Read from temp file
-	content, err := io.ReadAll(tempFile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read temp file: %w", err)
-	}
-
-	sc.logger.Debug("Successfully read %d bytes via copy method", len(content))
-	return content, nil
-}
-
-// isWindowsSpecialFile checks if a file might be a special Windows file type
-// that could cause "Incorrect function" errors
-func (sc *ServerClient) isWindowsSpecialFile(filePath string) bool {
-	// Check file extension for known problematic types
-	ext := strings.ToLower(filepath.Ext(filePath))
-	specialExtensions := []string{
-		".lnk",       // Shortcut files
-		".url",       // Internet shortcuts
-		".pif",       // Program information files
-		".scf",       // Shell command files
-		".desktop",   // Desktop entry files
-		".directory", // Directory entry files
-	}
-
-	for _, specialExt := range specialExtensions {
-		if ext == specialExt {
-			return true
-		}
-	}
-
-	// Check if file name contains special patterns
-	fileName := strings.ToLower(filepath.Base(filePath))
-	specialPatterns := []string{
-		"thumbs.db",
-		"desktop.ini",
-		"autorun.inf",
-		"ntuser.dat",
-		"ntuser.ini",
-		"ntuser.pol",
-	}
-
-	for _, pattern := range specialPatterns {
-		if strings.Contains(fileName, pattern) {
-			return true
-		}
-	}
-
-	return false
-}
-
-// readFileWindowsSpecific attempts Windows-specific file reading strategies
-func (sc *ServerClient) readFileWindowsSpecific(filePath string) ([]byte, error) {
-	sc.logger.Debug("Attempting Windows-specific file reading for: %s", filePath)
-
-	// Check if this might be a special Windows file
-	if sc.isWindowsSpecialFile(filePath) {
-		sc.logger.Debug("File appears to be a special Windows file type: %s", filePath)
-
-		// For special files, try to read with minimal processing
-		// Sometimes these files can be read if we don't try to get their size first
-		file, err := os.OpenFile(filePath, os.O_RDONLY, 0)
-		if err != nil {
-			return nil, fmt.Errorf("failed to open special Windows file: %w", err)
-		}
-		defer file.Close()
-
-		// Read without getting file size first
-		content, err := io.ReadAll(file)
-		if err == nil {
-			sc.logger.Debug("Successfully read special Windows file: %d bytes", len(content))
-			return content, nil
-		}
-
-		sc.logger.Debug("Failed to read special Windows file: %v", err)
-	}
-
-	// Try alternative file access patterns
-	accessPatterns := []struct {
-		flags int
-		desc  string
-	}{
-		{os.O_RDONLY, "standard read-only"},
-		{os.O_RDONLY | os.O_SYNC, "read-only with sync"},
-		{os.O_RDONLY | os.O_APPEND, "read-only with append"}, // Sometimes helps with locked files
-	}
-
-	for _, pattern := range accessPatterns {
-		file, err := os.OpenFile(filePath, pattern.flags, 0)
-		if err != nil {
-			sc.logger.Debug("Failed to open file with pattern %s: %v", pattern.desc, err)
-			continue
-		}
-
-		// Try to read the file
-		content, err := io.ReadAll(file)
-		file.Close()
-
-		if err == nil {
-			sc.logger.Debug("Successfully read file with pattern %s: %d bytes", pattern.desc, len(content))
-			return content, nil
-		}
-
-		sc.logger.Debug("Failed to read file with pattern %s: %v", pattern.desc, err)
-	}
-
-	return nil, fmt.Errorf("Windows-specific file reading strategies failed")
 }

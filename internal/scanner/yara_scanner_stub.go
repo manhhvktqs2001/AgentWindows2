@@ -236,7 +236,9 @@ func (ys *YaraScanner) showRealtimeNotification(filePath string, result *ScanRes
 	if ys.toastNotifier == nil {
 		ys.logger.Warn("Toast notifier not initialized for realtime alert (stub)")
 		// FIX: Fallback ngay lập tức nếu không có toast notifier
-		ys.showFallbackAlertStub(filePath, result)
+		// Only use UI notification fallback; avoid creating desktop files
+		ys.logger.Warn("Using UI fallback alert (no desktop file)")
+		ys.showUIFallbackStub(filePath, result)
 		return
 	}
 
@@ -281,9 +283,15 @@ func (ys *YaraScanner) showRealtimeNotification(filePath string, result *ScanRes
 
 	// FIX: Tạo notification content với error handling
 	// Title and message will be normalized in notifier, but we still provide a clear default including rule name
+	sev := 3
+	if result != nil {
+		if result.Severity > 0 {
+			sev = result.Severity
+		}
+	}
 	content := &response.NotificationContent{
 		Title:      fmt.Sprintf("YARA: %s", ruleName),
-		Severity:   result.Severity,
+		Severity:   sev,
 		Timestamp:  time.Now(),
 		ThreatInfo: threatInfo,
 	}
@@ -297,7 +305,7 @@ func (ys *YaraScanner) showRealtimeNotification(filePath string, result *ScanRes
 
 	timeStr := time.Now().Format("15:04:05")
 
-	switch result.Severity {
+	switch sev {
 	case 5: // Critical
 		content.Message = fmt.Sprintf("Rule: %s\nFile: %s\nThreat: %s\nTime: %s\nAction: Quarantine pending (stub mode)",
 			ruleName, fileName, threatType, timeStr)
@@ -361,86 +369,56 @@ func (ys *YaraScanner) showFallbackAlertStub(filePath string, result *ScanResult
 	fileName := filepath.Base(filePath)
 	timeStr := time.Now().Format("15:04:05")
 
-	// Fallback: In ra console với định dạng nổi bật
-	fmt.Printf("\n")
-	fmt.Printf("🚨🚨🚨 YARA ALERT (STUB FALLBACK) 🚨🚨🚨\n")
-	fmt.Printf("Rule: %s\n", ruleName)
-	fmt.Printf("File: %s\n", fileName)
-	fmt.Printf("Threat Type: %s\n", threatType)
-	fmt.Printf("Severity: %d\n", severity)
-	fmt.Printf("Time: %s\n", timeStr)
-	fmt.Printf("Mode: STUB (CGO disabled)\n")
-	fmt.Printf("🚨🚨🚨 END STUB FALLBACK ALERT 🚨🚨🚨\n")
-	fmt.Printf("\n")
-	os.Stdout.Sync()
+	// Fallback UI: show short-lived balloon via toast notifier if available
+	if ys.toastNotifier != nil {
+		content := &response.NotificationContent{
+			Title:     fmt.Sprintf("YARA: %s", ruleName),
+			Severity:  severity,
+			Timestamp: time.Now(),
+			ThreatInfo: &models.ThreatInfo{
+				ThreatName:  ruleName,
+				FilePath:    filePath,
+				Description: fmt.Sprintf("Fallback UI alert for %s (%s)", ruleName, threatType),
+				Severity:    severity,
+			},
+			Message: fmt.Sprintf("Rule: %s\nFile: %s\nTime: %s", ruleName, fileName, timeStr),
+		}
+		_ = ys.toastNotifier.SendNotification(content)
+		return
+	}
 
-	// FIX: Tạo file alert trên desktop nếu có thể
-	ys.createDesktopAlertStub(filePath, result)
+	// Console fallback as last resort (no file creation)
+	fmt.Printf("\n🚨 YARA ALERT: %s | %s | sev=%d | %s (stub)\n", ruleName, fileName, severity, timeStr)
+	os.Stdout.Sync()
 }
 
 // FIX: Thêm method tạo alert file trên desktop cho stub
-func (ys *YaraScanner) createDesktopAlertStub(filePath string, result *ScanResult) {
-	// Lấy desktop path
-	desktopPath := os.Getenv("USERPROFILE")
-	if desktopPath == "" {
+// Deprecated: no desktop file creation in stub mode
+func (ys *YaraScanner) createDesktopAlertStub(filePath string, result *ScanResult) {}
+
+// New: UI-only fallback (balloon/toast)
+func (ys *YaraScanner) showUIFallbackStub(filePath string, result *ScanResult) {
+	rule := "unknown"
+	sev := 3
+	if result != nil {
+		rule = result.RuleName
+		sev = result.Severity
+	}
+	if ys.toastNotifier == nil {
 		return
 	}
-	desktopPath = filepath.Join(desktopPath, "Desktop")
-
-	// Tạo alert file
-	alertFileName := fmt.Sprintf("EDR_YARA_Alert_STUB_%s.txt",
-		time.Now().Format("20060102_150405"))
-	alertFilePath := filepath.Join(desktopPath, alertFileName)
-
-	var ruleName, description string
-	var severity int
-	if result != nil {
-		ruleName = result.RuleName
-		description = result.Description
-		severity = result.Severity
-	} else {
-		ruleName = "unknown"
-		description = "YARA detection in stub mode"
-		severity = 3
+	content := &response.NotificationContent{
+		Title:     fmt.Sprintf("YARA: %s", rule),
+		Severity:  sev,
+		Timestamp: time.Now(),
+		ThreatInfo: &models.ThreatInfo{
+			ThreatName: rule,
+			FilePath:   filePath,
+			Severity:   sev,
+		},
+		Message: fmt.Sprintf("Rule: %s\nFile: %s", rule, filepath.Base(filePath)),
 	}
-
-	alertContent := fmt.Sprintf(`EDR AGENT - YARA THREAT DETECTED (STUB MODE)
-========================================
-
-🚨 YARA THREAT DETECTED
-
-Rule: %s
-File: %s
-Severity: %d
-Time: %s
-Detection: YARA Rule Match (Stub Mode)
-Mode: CGO Disabled
-
-Description:
-%s
-
-Note: This detection was made in stub mode because
-CGO is disabled. For full YARA functionality,
-please enable CGO in your build.
-
-========================================
-This file was created by EDR Agent.
-Please review the detected threat.
-You can delete this file after reviewing.
-`,
-		ruleName,
-		filepath.Base(filePath),
-		severity,
-		time.Now().Format("2006-01-02 15:04:05"),
-		description,
-	)
-
-	err := os.WriteFile(alertFilePath, []byte(alertContent), 0644)
-	if err == nil {
-		ys.logger.Info("📄 Desktop alert file created (stub): %s", alertFilePath)
-	} else {
-		ys.logger.Debug("Failed to create desktop alert file (stub): %v", err)
-	}
+	_ = ys.toastNotifier.SendNotification(content)
 }
 
 // FIX: shouldSuppressDetection với safe string handling

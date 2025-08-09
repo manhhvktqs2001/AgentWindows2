@@ -87,7 +87,7 @@ func (wtn *WindowsToastNotifier) SendNotification(content *NotificationContent) 
 	fmt.Printf("🚨🚨🚨 END ALERT 🚨🚨🚨\n\n")
 	os.Stdout.Sync()
 
-	// Try native toast first
+	// Prefer native Windows toast (bottom-right) then balloon; no msg fallback
 	if err := wtn.showNativeToast(content); err == nil {
 		wtn.logger.Info("✅ Native toast displayed")
 		return nil
@@ -95,7 +95,6 @@ func (wtn *WindowsToastNotifier) SendNotification(content *NotificationContent) 
 		wtn.logger.Debug("Native toast failed: %v", err)
 	}
 
-	// Fallback to bottom-right system tray balloon
 	if err := wtn.showSystemBalloon(content); err == nil {
 		wtn.logger.Info("✅ System balloon displayed")
 		return nil
@@ -103,9 +102,7 @@ func (wtn *WindowsToastNotifier) SendNotification(content *NotificationContent) 
 		wtn.logger.Debug("System balloon failed: %v", err)
 	}
 
-	// Last resort: simple msg broadcast (best-effort, no error check)
-	wtn.showSimpleNotification(content)
-	return fmt.Errorf("all notification methods failed")
+	return fmt.Errorf("failed to display notification via toast or balloon")
 }
 
 // showNativeToast shows Windows 10+ native toast notification
@@ -166,16 +163,25 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
 try {
-    $balloon = New-Object System.Windows.Forms.NotifyIcon
-    $balloon.Icon = [System.Drawing.SystemIcons]::Warning
-    $balloon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Warning
-    $balloon.BalloonTipTitle = "%s"
-    $balloon.BalloonTipText = "%s"
-    $balloon.Visible = $true
-    $balloon.ShowBalloonTip(3000)
-    Start-Sleep -Seconds 4
-    $balloon.Visible = $false
-    $balloon.Dispose()
+    $icon = New-Object System.Windows.Forms.NotifyIcon
+    $icon.Icon = [System.Drawing.SystemIcons]::Warning
+    $icon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Warning
+    $icon.BalloonTipTitle = "%s"
+    $icon.BalloonTipText = "%s"
+    $icon.Visible = $true
+
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 3500
+    $timer.Add_Tick({
+        $timer.Stop()
+        $icon.Visible = $false
+        $icon.Dispose()
+        [System.Windows.Forms.Application]::Exit()
+    })
+
+    $icon.ShowBalloonTip(3000)
+    $timer.Start()
+    [System.Windows.Forms.Application]::Run()
     exit 0
 } catch {
     exit 1
@@ -205,6 +211,7 @@ func (wtn *WindowsToastNotifier) runPowerShell(script string) error {
 	cmd := exec.Command("powershell.exe",
 		"-WindowStyle", "Hidden",
 		"-ExecutionPolicy", "Bypass",
+		"-Sta",
 		"-NoProfile",
 		"-Command", script)
 
