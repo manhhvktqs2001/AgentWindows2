@@ -114,7 +114,7 @@ response:
 
   severity_thresholds:
     show_user_alerts: 3    # Show notifications for Medium+ severity
-    auto_quarantine: 4     # Auto quarantine for High+ severity
+    auto_quarantine: 4     # Auto quarantine for High+ severity  
     block_execution: 5     # Block execution for Critical severity
 
   user_interaction:

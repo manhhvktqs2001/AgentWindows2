@@ -14,26 +14,26 @@ import (
 
 const (
 	// Process access rights
-	PROCESS_TERMINATE = 0x0001
+	PROCESS_TERMINATE         = 0x0001
 	PROCESS_QUERY_INFORMATION = 0x0400
-	PROCESS_SUSPEND_RESUME = 0x0800
-	
+	PROCESS_SUSPEND_RESUME    = 0x0800
+
 	// Process termination
 	PROCESS_TERMINATE_FORCE = 0x0001
-	
+
 	// Exit codes
 	STILL_ACTIVE = 259
 )
 
 var (
 	// Windows API functions
-	kernel32 = syscall.NewLazyDLL("kernel32.dll")
+	kernel32      = syscall.NewLazyDLL("kernel32.dll")
 	user32Process = syscall.NewLazyDLL("user32.dll")
-	
-	procOpenProcess = kernel32.NewProc("OpenProcess")
-	procTerminateProcess = kernel32.NewProc("TerminateProcess")
-	procGetExitCodeProcess = kernel32.NewProc("GetExitCodeProcess")
-	procEnumProcesses = kernel32.NewProc("EnumProcesses")
+
+	procOpenProcess              = kernel32.NewProc("OpenProcess")
+	procTerminateProcess         = kernel32.NewProc("TerminateProcess")
+	procGetExitCodeProcess       = kernel32.NewProc("GetExitCodeProcess")
+	procEnumProcesses            = kernel32.NewProc("EnumProcesses")
 	procGetProcessImageFileNameW = kernel32.NewProc("GetProcessImageFileNameW")
 	procGetWindowThreadProcessId = user32Process.NewProc("GetWindowThreadProcessId")
 )
@@ -112,9 +112,9 @@ func (wpc *WindowsProcessController) SuspendProcess(processID int) error {
 	// Suspend process using NtSuspendProcess
 	ntdll := syscall.NewLazyDLL("ntdll.dll")
 	procNtSuspendProcess := ntdll.NewProc("NtSuspendProcess")
-	
+
 	success, _, _ := procNtSuspendProcess.Call(uintptr(handle))
-	
+
 	if success != 0 {
 		return fmt.Errorf("failed to suspend process %d", processID)
 	}
@@ -137,9 +137,9 @@ func (wpc *WindowsProcessController) ResumeProcess(processID int) error {
 	// Resume process using NtResumeProcess
 	ntdll := syscall.NewLazyDLL("ntdll.dll")
 	procNtResumeProcess := ntdll.NewProc("NtResumeProcess")
-	
+
 	success, _, _ := procNtResumeProcess.Call(uintptr(handle))
-	
+
 	if success != 0 {
 		return fmt.Errorf("failed to resume process %d", processID)
 	}
@@ -174,10 +174,10 @@ func (wpc *WindowsProcessController) GetProcessInfo(processID int) (*ProcessInfo
 	isRunning := success != 0 && exitCode == STILL_ACTIVE
 
 	info := &ProcessInfo{
-		ProcessID:  processID,
-		ImageName:  fileName,
-		IsRunning:  isRunning,
-		ExitCode:   int(exitCode),
+		ProcessID: processID,
+		ImageName: fileName,
+		IsRunning: isRunning,
+		ExitCode:  int(exitCode),
 	}
 
 	return info, nil
@@ -201,7 +201,7 @@ func (wpc *WindowsProcessController) openProcess(processID int, desiredAccess ui
 // getProcessImageFileName gets the image file name of a process
 func (wpc *WindowsProcessController) getProcessImageFileName(handle syscall.Handle) (string, error) {
 	var fileName [syscall.MAX_PATH]uint16
-	
+
 	length, _, err := procGetProcessImageFileNameW.Call(
 		uintptr(handle),
 		uintptr(unsafe.Pointer(&fileName[0])),
@@ -220,11 +220,11 @@ func (wpc *WindowsProcessController) getChildProcesses(parentID int) ([]int, err
 	// This is a simplified implementation
 	// In a real system, you would enumerate all processes and check parent-child relationships
 	var children []int
-	
+
 	// For now, return empty list
 	// TODO: Implement proper child process enumeration
 	wpc.logger.Debug("Child process enumeration not implemented")
-	
+
 	return children, nil
 }
 
@@ -245,4 +245,4 @@ func (wpc *WindowsProcessController) Start() error {
 // Stop stops the Windows process controller
 func (wpc *WindowsProcessController) Stop() {
 	wpc.logger.Info("Windows Process Controller stopped")
-} 
+}
