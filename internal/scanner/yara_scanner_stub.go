@@ -16,7 +16,7 @@ import (
 
 	"edr-agent-windows/internal/config"
 	"edr-agent-windows/internal/models"
-	"edr-agent-windows/internal/response" // THÊM CHO REALTIME NOTIFICATION
+	"edr-agent-windows/internal/response"
 	"edr-agent-windows/internal/utils"
 )
 
@@ -26,75 +26,82 @@ type YaraScanner struct {
 	agentID         string
 	serverClient    interface{}
 	responseManager interface{}
-	recentAlerts    map[string]time.Time
-	recentMu        sync.Mutex
 
-	// THÊM: Direct notification components cho realtime alert
+	// Enhanced suppression system
+	recentAlerts     map[string]time.Time
+	suppressionCache map[string]int // Track suppression counts
+	recentMu         sync.Mutex
+
+	// Direct notification components
 	toastNotifier *response.WindowsToastNotifier
 	lastAlert     map[string]time.Time
 	alertMu       sync.Mutex
+
+	// Performance tracking
+	scanCount       int64
+	suppressedCount int64
+	alertCount      int64
 }
 
 type ScanResult struct {
-	Matched       bool      `json:"matched"`
-	RuleName      string    `json:"rule_name"`
-	RuleTags      []string  `json:"rule_tags"`
-	Severity      int       `json:"severity"`
-	FileHash      string    `json:"file_hash"`
-	ScanTime      int64     `json:"scan_time_ms"`
-	FilePath      string    `json:"file_path"`
-	FileSize      int64     `json:"file_size"`
-	ScanTimestamp time.Time `json:"scan_timestamp"`
-	Description   string    `json:"description"`
+	Matched           bool      `json:"matched"`
+	RuleName          string    `json:"rule_name"`
+	RuleTags          []string  `json:"rule_tags"`
+	Severity          int       `json:"severity"`
+	FileHash          string    `json:"file_hash"`
+	ScanTime          int64     `json:"scan_time_ms"`
+	FilePath          string    `json:"file_path"`
+	FileSize          int64     `json:"file_size"`
+	ScanTimestamp     time.Time `json:"scan_timestamp"`
+	Description       string    `json:"description"`
+	Suppressed        bool      `json:"suppressed"`
+	SuppressionReason string    `json:"suppression_reason,omitempty"`
 }
 
 func NewYaraScanner(cfg *config.YaraConfig, logger *utils.Logger) *YaraScanner {
 	logger.Warn("YARA Scanner: Running in stub mode (CGO disabled)")
 	scanner := &YaraScanner{
-		config:       cfg,
-		logger:       logger,
-		recentAlerts: make(map[string]time.Time),
-		lastAlert:    make(map[string]time.Time),
+		config:           cfg,
+		logger:           logger,
+		recentAlerts:     make(map[string]time.Time),
+		suppressionCache: make(map[string]int),
+		lastAlert:        make(map[string]time.Time),
 	}
 
-	// THÊM: Initialize direct toast notifier cho realtime alerts
+	// Initialize notification system
 	if cfg.Enabled {
-		// Tạo default response config cho notification
 		responseConfig := &config.ResponseConfig{
 			NotificationSettings: config.NotificationSettings{
 				ToastEnabled:        true,
 				SystemTrayEnabled:   true,
 				DesktopAlertEnabled: true,
-				SoundEnabled:        true,
-				TimeoutSeconds:      10,
+				SoundEnabled:        false, // Reduce noise
+				TimeoutSeconds:      5,     // Shorter timeout
 			},
 		}
 
-		// Khởi tạo toast notifier trực tiếp
 		scanner.toastNotifier = response.NewWindowsToastNotifier(responseConfig, logger)
 		if err := scanner.toastNotifier.Start(); err != nil {
 			logger.Warn("Failed to start toast notifier in YARA scanner (stub): %v", err)
+			scanner.toastNotifier = nil
 		} else {
-			logger.Info("✅ YARA Scanner (Stub): Realtime notification system ready")
+			logger.Info("✅ YARA Scanner (Stub): Notification system ready")
 		}
 	}
 
 	return scanner
 }
 
-// SetAgentID sets the agent ID for alert creation
 func (ys *YaraScanner) SetAgentID(agentID string) {
 	ys.agentID = agentID
 	ys.logger.Debug("YARA Scanner Stub: Agent ID set to %s", agentID)
 }
 
-// SetServerClient sets the server client for sending alerts
 func (ys *YaraScanner) SetServerClient(serverClient interface{}) {
 	ys.serverClient = serverClient
 	ys.logger.Debug("YARA Scanner Stub: Server client configured")
 }
 
-// SetResponseManager sets the response manager for handling threats
 func (ys *YaraScanner) SetResponseManager(responseManager interface{}) {
 	ys.responseManager = responseManager
 	ys.logger.Debug("YARA Scanner Stub: Response manager configured")
@@ -106,9 +113,24 @@ func (ys *YaraScanner) LoadRules() error {
 }
 
 func (ys *YaraScanner) ScanFile(filePath string) (*ScanResult, error) {
+	ys.scanCount++
 	ys.logger.Debug("YARA Scanner Stub: Scan requested for: %s", filePath)
 
-	// Try external yara64.exe if available and rules path exists
+	// Enhanced suppression logic BEFORE scanning
+	if ys.shouldSuppressBeforeScan(filePath) {
+		ys.suppressedCount++
+		return &ScanResult{
+			Matched:           false,
+			FilePath:          filePath,
+			ScanTime:          time.Now().UnixMilli(),
+			ScanTimestamp:     time.Now(),
+			Description:       "suppressed before scan",
+			Suppressed:        true,
+			SuppressionReason: "development_path",
+		}, nil
+	}
+
+	// Try external yara64.exe if available
 	if ys.config != nil && ys.config.Enabled && ys.config.RulesPath != "" {
 		if result, used, err := ys.scanWithExternalYara(filePath); used {
 			if err != nil {
@@ -120,40 +142,41 @@ func (ys *YaraScanner) ScanFile(filePath string) (*ScanResult, error) {
 					Description:   fmt.Sprintf("External YARA scan error: %v", err),
 				}, nil
 			}
-			if result != nil && result.Matched {
-				// Suppress noisy/benign detections on system/Edge/PowerShell paths
-				if ys.shouldSuppressDetection(filePath, result.RuleName) {
-					ys.logger.Debug("Suppressed YARA detection (external): %s -> %s", filePath, result.RuleName)
-					return &ScanResult{Matched: false, FilePath: filePath, ScanTime: time.Now().UnixMilli(), ScanTimestamp: time.Now(), Description: "suppressed benign match"}, nil
-				}
 
-				if ys.shouldSuppress(filePath, result.RuleName, 60*time.Second) {
-					ys.logger.Debug("Suppressed duplicate YARA alert (external): %s | %s", filePath, result.RuleName)
+			if result != nil && result.Matched {
+				// Enhanced suppression logic
+				if suppressed, reason := ys.shouldSuppressDetection(filePath, result.RuleName); suppressed {
+					ys.suppressedCount++
+					result.Suppressed = true
+					result.SuppressionReason = reason
+					ys.logger.Debug("Suppressed YARA detection (%s): %s -> %s", reason, filePath, result.RuleName)
 					return result, nil
 				}
-				// Announce to console
-				fmt.Fprintf(os.Stdout, "\n🚨🚨🚨 YARA THREAT DETECTED! (external) 🚨🚨🚨\n")
-				fmt.Fprintf(os.Stdout, "File: %s\n", filePath)
-				fmt.Fprintf(os.Stdout, "Rule: %s\n", result.RuleName)
-				fmt.Fprintf(os.Stdout, "Severity: %d\n", result.Severity)
-				fmt.Fprintf(os.Stdout, "Tags: %v\n", result.RuleTags)
-				fmt.Fprintf(os.Stdout, "Description: %s\n", result.Description)
-				fmt.Fprintf(os.Stdout, "🚨🚨🚨 END ALERT 🚨🚨🚨\n\n")
-				os.Stdout.Sync()
 
-				// *** QUAN TRỌNG: REALTIME NOTIFICATION NGAY LẬP TỨC ***
-				go ys.showRealtimeNotification(filePath, result)
+				// Advanced deduplication
+				if ys.shouldSuppressDuplicate(filePath, result.RuleName, 2*time.Minute) {
+					ys.suppressedCount++
+					result.Suppressed = true
+					result.SuppressionReason = "duplicate_recent"
+					ys.logger.Debug("Suppressed duplicate YARA alert: %s | %s", filePath, result.RuleName)
+					return result, nil
+				}
 
-				// Trigger threat handling like the CGO implementation
+				// Alert processing
+				ys.alertCount++
+				ys.announceDetection(filePath, result)
+				ys.showRealtimeNotification(filePath, result)
+
 				if fi, statErr := os.Stat(filePath); statErr == nil {
 					ys.handleThreatDetection(filePath, result, fi)
 				}
+
 				return result, nil
 			}
 		}
 	}
 
-	// Fallback: EICAR pattern check for demo when external YARA not available
+	// Fallback: EICAR pattern check
 	content, err := os.ReadFile(filePath)
 	if err != nil {
 		return &ScanResult{
@@ -165,10 +188,8 @@ func (ys *YaraScanner) ScanFile(filePath string) (*ScanResult, error) {
 		}, nil
 	}
 
-	contentStr := string(content)
-
 	// Check for EICAR pattern
-	if strings.Contains(contentStr, "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*") {
+	if strings.Contains(string(content), "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*") {
 		result := &ScanResult{
 			Matched:       true,
 			FilePath:      filePath,
@@ -182,37 +203,18 @@ func (ys *YaraScanner) ScanFile(filePath string) (*ScanResult, error) {
 			Description:   "EICAR test file detected by stub scanner",
 		}
 
-		if ys.shouldSuppress(filePath, result.RuleName, 60*time.Second) {
-			ys.logger.Debug("Suppressed duplicate YARA alert (EICAR): %s | %s", filePath, result.RuleName)
+		if ys.shouldSuppressDuplicate(filePath, result.RuleName, 60*time.Second) {
+			ys.suppressedCount++
+			result.Suppressed = true
+			result.SuppressionReason = "duplicate_recent"
+			ys.logger.Debug("Suppressed duplicate EICAR alert: %s", filePath)
 			return result, nil
 		}
 
-		// Print alert directly to terminal - Force flush to ensure immediate display
-		fmt.Fprintf(os.Stdout, "\n🚨🚨🚨 YARA THREAT DETECTED! 🚨🚨🚨\n")
-		fmt.Fprintf(os.Stdout, "File: %s\n", filePath)
-		fmt.Fprintf(os.Stdout, "Total Matches: 1\n")
-		fmt.Fprintf(os.Stdout, "\nMatch 1:\n")
-		fmt.Fprintf(os.Stdout, "  Rule: EICAR_Test_Stub\n")
-		fmt.Fprintf(os.Stdout, "  Tags: [test eicar stub]\n")
-		fmt.Fprintf(os.Stdout, "  Namespace: stub\n")
-		fmt.Fprintf(os.Stdout, "\nSelected Rule: EICAR_Test_Stub\n")
-		fmt.Fprintf(os.Stdout, "Severity: 5\n")
-		fmt.Fprintf(os.Stdout, "Tags: [test eicar stub]\n")
-		fmt.Fprintf(os.Stdout, "Description: EICAR test file detected by stub scanner\n")
-		fmt.Fprintf(os.Stdout, "File Hash: stub_hash\n")
-		fmt.Fprintf(os.Stdout, "File Size: %d bytes\n", len(content))
-		fmt.Fprintf(os.Stdout, "Scan Time: 0ms\n")
-		fmt.Fprintf(os.Stdout, "🚨🚨🚨 END ALERT 🚨🚨🚨\n\n")
+		ys.alertCount++
+		ys.announceDetection(filePath, result)
+		ys.showRealtimeNotification(filePath, result)
 
-		// Force flush to ensure immediate display
-		os.Stdout.Sync()
-
-		ys.logger.Warn("🚨 YARA THREAT DETECTED (STUB): %s -> Rule: EICAR_Test_Stub, Severity: 5", filePath)
-
-		// *** QUAN TRỌNG: REALTIME NOTIFICATION NGAY LẬP TỨC ***
-		go ys.showRealtimeNotification(filePath, result)
-
-		// Trigger threat handling like the CGO implementation
 		if fi, statErr := os.Stat(filePath); statErr == nil {
 			ys.handleThreatDetection(filePath, result, fi)
 		}
@@ -220,7 +222,6 @@ func (ys *YaraScanner) ScanFile(filePath string) (*ScanResult, error) {
 		return result, nil
 	}
 
-	// Return negative result for stub
 	return &ScanResult{
 		Matched:       false,
 		FilePath:      filePath,
@@ -230,32 +231,186 @@ func (ys *YaraScanner) ScanFile(filePath string) (*ScanResult, error) {
 	}, nil
 }
 
-// *** FIX: REALTIME NOTIFICATION CHO STUB - CLEAN VERSION ***
+// Enhanced suppression logic - check before scanning
+func (ys *YaraScanner) shouldSuppressBeforeScan(filePath string) bool {
+	if filePath == "" {
+		return true
+	}
+
+	lowerPath := strings.ToLower(filePath)
+
+	// Development/source code paths that should never be scanned
+	developmentPaths := []string{
+		"\\agentwindows\\",
+		"\\internal\\",
+		"\\pkg\\",
+		"\\src\\",
+		"\\vendor\\",
+		"\\node_modules\\",
+		"\\.git\\",
+		"\\.vs\\",
+		"\\.vscode\\",
+		"\\go\\src\\",
+		"\\go\\pkg\\",
+		"\\temp\\go-build",
+		"\\appdata\\local\\temp\\go-build",
+		"\\users\\manh\\desktop\\agentwindows\\",
+		"\\cursor\\user\\workspacestorage\\",
+		"workspacestorage",
+		"globalstorage",
+		"anysphere.cursor",
+	}
+
+	for _, devPath := range developmentPaths {
+		if strings.Contains(lowerPath, devPath) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// Enhanced detection suppression logic
+func (ys *YaraScanner) shouldSuppressDetection(filePath, ruleName string) (bool, string) {
+	if filePath == "" || ruleName == "" {
+		return false, ""
+	}
+
+	lowerPath := strings.ToLower(filePath)
+	lowerRule := strings.ToLower(ruleName)
+
+	// Environmental/anti-debug rules on system paths
+	environmentalRules := []string{
+		"debuggercheck", "debuggerexception", "vmdetect", "anti_dbg",
+		"threadcontrol", "seh__vectored", "check_outputdebugstringa",
+		"queryinfo", "win_hook", "disable_antivirus", "disable_dep",
+		"setconsole", "setconsolectrl", "powershell", "capabilities",
+		"antisandbox", "antivm", "antidebug", "antiemulatue", "antianalysis",
+	}
+
+	isEnvironmentalRule := false
+	for _, envRule := range environmentalRules {
+		if strings.Contains(lowerRule, envRule) {
+			isEnvironmentalRule = true
+			break
+		}
+	}
+
+	// System and development paths
+	systemPaths := []string{
+		"\\windows\\system32\\", "\\windows\\syswow64\\", "\\program files\\",
+		"\\program files (x86)\\", "edgewebview", "microsoft\\edge",
+		"windowspowershell", "\\quarantine\\", "\\agentwindows\\",
+		"\\internal\\", "\\users\\manh\\desktop\\agentwindows\\",
+	}
+
+	isSystemPath := false
+	for _, sysPath := range systemPaths {
+		if strings.Contains(lowerPath, sysPath) {
+			isSystemPath = true
+			break
+		}
+	}
+
+	// Suppress environmental rules on system/dev paths
+	if isEnvironmentalRule && isSystemPath {
+		return true, "environmental_system_path"
+	}
+
+	// Suppress PowerShell rule on development paths specifically
+	if strings.Contains(lowerRule, "powershell") &&
+		(strings.Contains(lowerPath, "\\agentwindows\\") ||
+			strings.Contains(lowerPath, "\\internal\\") ||
+			strings.Contains(lowerPath, "\\users\\manh\\desktop\\agentwindows\\")) {
+		return true, "powershell_development_path"
+	}
+
+	return false, ""
+}
+
+// Enhanced duplicate suppression with escalating timeouts
+func (ys *YaraScanner) shouldSuppressDuplicate(filePath, rule string, window time.Duration) bool {
+	key := filePath + "|" + rule
+
+	ys.recentMu.Lock()
+	defer ys.recentMu.Unlock()
+
+	now := time.Now()
+
+	// Check if we've seen this recently
+	if lastTime, exists := ys.recentAlerts[key]; exists {
+		timeSince := now.Sub(lastTime)
+
+		// Escalating suppression window based on count
+		count := ys.suppressionCache[key]
+		escalatedWindow := window
+
+		switch {
+		case count >= 10:
+			escalatedWindow = 30 * time.Minute // Heavy suppression
+		case count >= 5:
+			escalatedWindow = 10 * time.Minute // Medium suppression
+		case count >= 2:
+			escalatedWindow = 5 * time.Minute // Light suppression
+		}
+
+		if timeSince < escalatedWindow {
+			ys.suppressionCache[key]++
+			return true
+		}
+	}
+
+	// Update tracking
+	ys.recentAlerts[key] = now
+	ys.suppressionCache[key]++
+
+	// Cleanup old entries periodically
+	if len(ys.recentAlerts) > 1000 {
+		cutoff := now.Add(-1 * time.Hour)
+		for k, v := range ys.recentAlerts {
+			if v.Before(cutoff) {
+				delete(ys.recentAlerts, k)
+				delete(ys.suppressionCache, k)
+			}
+		}
+	}
+
+	return false
+}
+
+// Announce detection to console
+func (ys *YaraScanner) announceDetection(filePath string, result *ScanResult) {
+	fmt.Fprintf(os.Stdout, "\n🚨🚨🚨 YARA THREAT DETECTED! 🚨🚨🚨\n")
+	fmt.Fprintf(os.Stdout, "File: %s\n", filePath)
+	fmt.Fprintf(os.Stdout, "Rule: %s\n", result.RuleName)
+	fmt.Fprintf(os.Stdout, "Severity: %d\n", result.Severity)
+	fmt.Fprintf(os.Stdout, "Tags: %v\n", result.RuleTags)
+	fmt.Fprintf(os.Stdout, "Description: %s\n", result.Description)
+	fmt.Fprintf(os.Stdout, "🚨🚨🚨 END ALERT 🚨🚨🚨\n\n")
+	os.Stdout.Sync()
+}
+
+// Improved realtime notification with better error handling
 func (ys *YaraScanner) showRealtimeNotification(filePath string, result *ScanResult) {
-	// FIX: Kiểm tra toast notifier trước khi sử dụng
 	if ys.toastNotifier == nil {
-		ys.logger.Warn("Toast notifier not initialized for realtime alert (stub)")
-		// FIX: Fallback ngay lập tức nếu không có toast notifier
-		// Only use UI notification fallback; avoid creating desktop files
-		ys.logger.Warn("Using UI fallback alert (no desktop file)")
-		ys.showUIFallbackStub(filePath, result)
+		ys.logger.Debug("Toast notifier not available, skipping notification")
 		return
 	}
 
-	// Check duplicate alert (dedup trong 30 giây)
+	// Advanced deduplication for notifications
 	key := filePath + "|" + result.RuleName
 	ys.alertMu.Lock()
 	if lastTime, exists := ys.lastAlert[key]; exists {
 		if time.Since(lastTime) < 30*time.Second {
 			ys.alertMu.Unlock()
-			ys.logger.Debug("Suppressed duplicate YARA alert (stub): %s", key)
+			ys.logger.Debug("Suppressed duplicate notification: %s", key)
 			return
 		}
 	}
 	ys.lastAlert[key] = time.Now()
 	ys.alertMu.Unlock()
 
-	// FIX: Xử lý ThreatInfo an toàn cho stub
+	// Build notification content safely
 	var threatInfo *models.ThreatInfo
 	if result != nil {
 		threatInfo = &models.ThreatInfo{
@@ -266,32 +421,24 @@ func (ys *YaraScanner) showRealtimeNotification(filePath string, result *ScanRes
 		}
 	}
 
-	// FIX: Format message dựa trên severity với safe string handling
-	var fileName string
-	if filePath != "" {
-		fileName = filepath.Base(filePath)
-	} else {
+	fileName := filepath.Base(filePath)
+	if fileName == "" {
 		fileName = "unknown file"
 	}
 
-	var ruleName string
+	ruleName := "unknown rule"
 	if result != nil && result.RuleName != "" {
 		ruleName = result.RuleName
-	} else {
-		ruleName = "unknown rule"
 	}
 
-	// FIX: Tạo notification content với error handling
-	// Title and message will be normalized in notifier, but we still provide a clear default including rule name
-	sev := 3
-	if result != nil {
-		if result.Severity > 0 {
-			sev = result.Severity
-		}
+	severity := 3
+	if result != nil && result.Severity > 0 {
+		severity = result.Severity
 	}
+
 	content := &response.NotificationContent{
 		Title:      fmt.Sprintf("YARA: %s", ruleName),
-		Severity:   sev,
+		Severity:   severity,
 		Timestamp:  time.Now(),
 		ThreatInfo: threatInfo,
 	}
@@ -305,171 +452,93 @@ func (ys *YaraScanner) showRealtimeNotification(filePath string, result *ScanRes
 
 	timeStr := time.Now().Format("15:04:05")
 
-	switch sev {
+	switch severity {
 	case 5: // Critical
-		content.Message = fmt.Sprintf("Rule: %s\nFile: %s\nThreat: %s\nTime: %s\nAction: Quarantine pending (stub mode)",
+		content.Message = fmt.Sprintf("🔴 CRITICAL: %s\nFile: %s\nType: %s\nTime: %s\n\n⚠️ Review required",
 			ruleName, fileName, threatType, timeStr)
-
 	case 4: // High
-		content.Message = fmt.Sprintf("Rule: %s\nFile: %s\nThreat: %s\nTime: %s\nAction: Review detection (stub mode)",
+		content.Message = fmt.Sprintf("🟠 HIGH: %s\nFile: %s\nType: %s\nTime: %s\n\n⚠️ Review recommended",
 			ruleName, fileName, threatType, timeStr)
-
 	default: // Medium/Low
-		content.Message = fmt.Sprintf("Rule: %s\nFile: %s\nThreat: %s\nTime: %s\nNote: Stub mode (CGO disabled)",
+		content.Message = fmt.Sprintf("🟡 ALERT: %s\nFile: %s\nType: %s\nTime: %s",
 			ruleName, fileName, threatType, timeStr)
 	}
 
-	// FIX: Hiển thị notification với retry và error handling cho stub
 	ys.logger.Info("🚨 DISPLAYING REALTIME YARA ALERT (STUB): %s", ruleName)
 
-	// FIX: Chạy trong goroutine riêng để không block
+	// Send notification with timeout protection
 	go func() {
-		// Single attempt; notifier internally tries WPF → Balloon → Toast
-		if err := ys.toastNotifier.SendNotification(content); err != nil {
-			ys.logger.Error("All notification attempts failed (stub): %v", err)
-			ys.showFallbackAlertStub(filePath, result)
-			return
+		defer func() {
+			if r := recover(); r != nil {
+				ys.logger.Error("Panic in notification system: %v", r)
+			}
+		}()
+
+		done := make(chan error, 1)
+		go func() {
+			done <- ys.toastNotifier.SendNotification(content)
+		}()
+
+		select {
+		case err := <-done:
+			if err != nil {
+				ys.logger.Error("Notification failed: %v", err)
+				ys.showFallbackAlert(filePath, result)
+			} else {
+				ys.logger.Info("✅ Realtime YARA notification displayed successfully")
+			}
+		case <-time.After(8 * time.Second):
+			ys.logger.Error("Notification timeout, using fallback")
+			ys.showFallbackAlert(filePath, result)
 		}
-		ys.logger.Info("✅ Realtime YARA notification displayed successfully (stub)")
 	}()
 }
 
-// FIX: Thêm fallback alert method cho stub
-func (ys *YaraScanner) showFallbackAlertStub(filePath string, result *ScanResult) {
-	var ruleName, threatType string
+// Fallback alert for notification failures
+func (ys *YaraScanner) showFallbackAlert(filePath string, result *ScanResult) {
+	var ruleName string
 	var severity int
 
 	if result != nil {
 		ruleName = result.RuleName
-		if len(result.RuleTags) > 0 {
-			threatType = ys.getThreatType(result.RuleTags)
-		} else {
-			threatType = "unknown"
-		}
 		severity = result.Severity
 	} else {
 		ruleName = "unknown"
-		threatType = "unknown"
 		severity = 3
 	}
 
 	fileName := filepath.Base(filePath)
 	timeStr := time.Now().Format("15:04:05")
 
-	// Fallback UI: show short-lived balloon via toast notifier if available
-	if ys.toastNotifier != nil {
-		content := &response.NotificationContent{
-			Title:     fmt.Sprintf("YARA: %s", ruleName),
-			Severity:  severity,
-			Timestamp: time.Now(),
-			ThreatInfo: &models.ThreatInfo{
-				ThreatName:  ruleName,
-				FilePath:    filePath,
-				Description: fmt.Sprintf("Fallback UI alert for %s (%s)", ruleName, threatType),
-				Severity:    severity,
-			},
-			Message: fmt.Sprintf("Rule: %s\nFile: %s\nTime: %s", ruleName, fileName, timeStr),
-		}
-		_ = ys.toastNotifier.SendNotification(content)
-		return
-	}
-
-	// Console fallback as last resort (no file creation)
-	fmt.Printf("\n🚨 YARA ALERT: %s | %s | sev=%d | %s (stub)\n", ruleName, fileName, severity, timeStr)
+	// Console fallback
+	fmt.Printf("\n🚨 YARA ALERT: %s | %s | sev=%d | %s\n", ruleName, fileName, severity, timeStr)
 	os.Stdout.Sync()
 }
 
-// FIX: Thêm method tạo alert file trên desktop cho stub
-// Deprecated: no desktop file creation in stub mode
-func (ys *YaraScanner) createDesktopAlertStub(filePath string, result *ScanResult) {}
-
-// New: UI-only fallback (balloon/toast)
-func (ys *YaraScanner) showUIFallbackStub(filePath string, result *ScanResult) {
-	rule := "unknown"
-	sev := 3
-	if result != nil {
-		rule = result.RuleName
-		sev = result.Severity
-	}
-	if ys.toastNotifier == nil {
-		return
-	}
-	content := &response.NotificationContent{
-		Title:     fmt.Sprintf("YARA: %s", rule),
-		Severity:  sev,
-		Timestamp: time.Now(),
-		ThreatInfo: &models.ThreatInfo{
-			ThreatName: rule,
-			FilePath:   filePath,
-			Severity:   sev,
-		},
-		Message: fmt.Sprintf("Rule: %s\nFile: %s", rule, filepath.Base(filePath)),
-	}
-	_ = ys.toastNotifier.SendNotification(content)
-}
-
-// FIX: shouldSuppressDetection với safe string handling
-func (ys *YaraScanner) shouldSuppressDetection(filePath, ruleName string) bool {
-	// FIX: Kiểm tra empty strings
-	if filePath == "" || ruleName == "" {
-		return false
-	}
-
-	lowerPath := strings.ToLower(filePath)
-	lowerRule := strings.ToLower(ruleName)
-
-	// Common noisy rule names
-	isNoisyRule := strings.Contains(lowerRule, "debuggercheck") ||
-		strings.Contains(lowerRule, "vmdetect") ||
-		strings.Contains(lowerRule, "anti_dbg") ||
-		strings.Contains(lowerRule, "threadcontrol") ||
-		strings.Contains(lowerRule, "seh__vectored") ||
-		strings.Contains(lowerRule, "powershell") ||
-		strings.Contains(lowerRule, "check_outputdebugstringa")
-
-	// Common benign paths
-	isBenignPath := strings.Contains(lowerPath, "\\windows\\") ||
-		strings.Contains(lowerPath, "edgewebview") ||
-		strings.Contains(lowerPath, "microsoft\\edge") ||
-		strings.Contains(lowerPath, "windowspowershell") ||
-		strings.Contains(lowerPath, "\\windows\\system32\\openssh\\") ||
-		strings.Contains(lowerPath, "\\cursor\\user\\workspacestorage\\") ||
-		strings.Contains(lowerPath, "workspacestorage") ||
-		strings.Contains(lowerPath, "globalstorage") ||
-		strings.Contains(lowerPath, "anysphere.cursor-retrieval") ||
-		strings.Contains(lowerPath, "\\quarantine\\") ||
-		strings.Contains(lowerPath, "\\.git\\")
-
-	return isNoisyRule && isBenignPath
-}
-
-// scanWithExternalYara attempts to scan the file using external yara64.exe with rules in config.RulesPath
+// Enhanced external YARA scanning with better error handling
 func (ys *YaraScanner) scanWithExternalYara(filePath string) (*ScanResult, bool, error) {
 	yaraExe, err := exec.LookPath("yara64.exe")
 	if err != nil {
-		// Not available
 		return nil, false, nil
 	}
 
-	// Validate rules path
 	rulesPath := ys.config.RulesPath
 	if rulesPath == "" {
 		return nil, true, fmt.Errorf("rules_path is empty")
 	}
 
-	// Build allowed categories set from config
+	// Build allowed categories
 	allowed := make(map[string]struct{})
 	for _, c := range ys.config.Categories {
 		allowed[strings.ToLower(c)] = struct{}{}
 	}
-	// If categories empty, use a reduced default to avoid noise
 	if len(allowed) == 0 {
 		for _, c := range []string{"malware", "maldocs", "webshells"} {
 			allowed[c] = struct{}{}
 		}
 	}
 
-	// Collect .yar/.yara files under rulesPath filtered by allowed categories
+	// Collect rule files
 	ruleFiles := make([]string, 0, 64)
 	_ = filepath.Walk(rulesPath, func(path string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil {
@@ -499,11 +568,12 @@ func (ys *YaraScanner) scanWithExternalYara(filePath string) (*ScanResult, bool,
 		}
 		return nil
 	})
+
 	if len(ruleFiles) == 0 {
-		return nil, true, fmt.Errorf("no allowed rule files found under %s", rulesPath)
+		return nil, true, fmt.Errorf("no allowed rule files found")
 	}
 
-	// Respect scan timeout
+	// Scan with timeout
 	timeoutSec := 30
 	if ys.config.ScanTimeout > 0 {
 		timeoutSec = ys.config.ScanTimeout
@@ -517,20 +587,18 @@ func (ys *YaraScanner) scanWithExternalYara(filePath string) (*ScanResult, bool,
 		if err != nil {
 			continue
 		}
-		stderr, _ := cmd.StderrPipe()
+
 		if err := cmd.Start(); err != nil {
 			continue
 		}
 
-		scannerOut := bufio.NewScanner(stdout)
+		scanner := bufio.NewScanner(stdout)
 		var matchedRule string
-		for scannerOut.Scan() {
-			line := strings.TrimSpace(scannerOut.Text())
-			// Expected: "RULE_NAME FILEPATH" or with -s includes strings after colon
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
 			if line == "" {
 				continue
 			}
-			// Take first token as rule name
 			parts := strings.Fields(line)
 			if len(parts) > 0 {
 				matchedRule = parts[0]
@@ -538,36 +606,38 @@ func (ys *YaraScanner) scanWithExternalYara(filePath string) (*ScanResult, bool,
 			}
 		}
 		_ = cmd.Wait()
-		// Drain stderr (optional)
-		if stderr != nil {
-			_ = bufio.NewScanner(stderr).Err()
-		}
 
 		if matchedRule != "" {
-			// Found a match
-			sev := ys.getRuleSeverityStub(matchedRule)
-			res := &ScanResult{
+			severity := ys.getRuleSeverityStub(matchedRule)
+			result := &ScanResult{
 				Matched:       true,
 				FilePath:      filePath,
 				RuleName:      matchedRule,
 				RuleTags:      []string{"external"},
-				Severity:      sev,
+				Severity:      severity,
 				FileHash:      "",
 				ScanTime:      time.Now().UnixMilli(),
 				ScanTimestamp: time.Now(),
 				Description:   fmt.Sprintf("Matched by external YARA rule: %s", filepath.Base(ruleFile)),
 			}
-			return res, true, nil
+			return result, true, nil
 		}
 	}
 
-	return &ScanResult{Matched: false, FilePath: filePath, ScanTime: time.Now().UnixMilli(), ScanTimestamp: time.Now(), Description: "No match by external YARA"}, true, nil
+	return &ScanResult{
+		Matched:       false,
+		FilePath:      filePath,
+		ScanTime:      time.Now().UnixMilli(),
+		ScanTimestamp: time.Now(),
+		Description:   "No match by external YARA",
+	}, true, nil
 }
 
-// getRuleSeverityStub mirrors severity mapping logic for common rule names in stub mode
+// Enhanced severity mapping
 func (ys *YaraScanner) getRuleSeverityStub(ruleName string) int {
 	rn := strings.ToLower(ruleName)
-	// De-emphasize noisy/benign environment detections
+
+	// Environmental/anti-debug rules get very low severity
 	if strings.Contains(rn, "debuggercheck") ||
 		strings.Contains(rn, "debuggerexception") ||
 		strings.Contains(rn, "queryinfo") ||
@@ -576,27 +646,55 @@ func (ys *YaraScanner) getRuleSeverityStub(ruleName string) int {
 		strings.Contains(rn, "threadcontrol") ||
 		strings.Contains(rn, "seh__vectored") ||
 		strings.Contains(rn, "check_outputdebugstringa") ||
-		strings.Contains(rn, "powershell") {
+		strings.Contains(rn, "powershell") ||
+		strings.Contains(rn, "capabilities") ||
+		strings.Contains(rn, "antisandbox") ||
+		strings.Contains(rn, "antivm") ||
+		strings.Contains(rn, "antidebug") {
 		return 1
 	}
-	if strings.Contains(rn, "ransomware") || strings.Contains(rn, "backdoor") || strings.Contains(rn, "rootkit") || strings.Contains(rn, "eicar") || strings.Contains(rn, "exploit") {
+
+	// Critical threats
+	if strings.Contains(rn, "ransomware") ||
+		strings.Contains(rn, "backdoor") ||
+		strings.Contains(rn, "rootkit") ||
+		strings.Contains(rn, "eicar") ||
+		strings.Contains(rn, "exploit") {
 		return 5
 	}
-	if strings.Contains(rn, "trojan") || strings.Contains(rn, "keylogger") || strings.Contains(rn, "spyware") || strings.Contains(rn, "worm") || strings.Contains(rn, "rat") || strings.Contains(rn, "webshell") || strings.Contains(rn, "wshell") {
+
+	// High severity threats
+	if strings.Contains(rn, "trojan") ||
+		strings.Contains(rn, "keylogger") ||
+		strings.Contains(rn, "spyware") ||
+		strings.Contains(rn, "worm") ||
+		strings.Contains(rn, "rat") ||
+		strings.Contains(rn, "webshell") ||
+		strings.Contains(rn, "wshell") {
 		return 4
 	}
-	if strings.Contains(rn, "adware") || strings.Contains(rn, "pup") || strings.Contains(rn, "suspicious") || strings.Contains(rn, "malware") || strings.Contains(rn, "malw") {
+
+	// Medium severity
+	if strings.Contains(rn, "adware") ||
+		strings.Contains(rn, "pup") ||
+		strings.Contains(rn, "suspicious") ||
+		strings.Contains(rn, "malware") ||
+		strings.Contains(rn, "malw") {
 		return 3
 	}
-	if strings.Contains(rn, "toolkit") || strings.Contains(rn, "packer") || strings.Contains(rn, "crypto") || strings.Contains(rn, "capabilities") {
+
+	// Low severity
+	if strings.Contains(rn, "toolkit") ||
+		strings.Contains(rn, "packer") ||
+		strings.Contains(rn, "crypto") {
 		return 2
 	}
-	return 3
+
+	return 3 // Default medium
 }
 
-// handleThreatDetection processes a detected threat (stub parity)
+// Handle threat detection with enhanced error handling
 func (ys *YaraScanner) handleThreatDetection(filePath string, result *ScanResult, fileInfo os.FileInfo) {
-	// Build ThreatInfo
 	threat := &models.ThreatInfo{
 		ThreatType:     ys.getThreatType(result.RuleTags),
 		ThreatName:     result.RuleName,
@@ -611,45 +709,33 @@ func (ys *YaraScanner) handleThreatDetection(filePath string, result *ScanResult
 		Timestamp:      time.Now(),
 	}
 
-	// Send alert to server if configured
+	// Send alert to server
 	ys.createAndSendAlert(filePath, result, fileInfo)
 
-	// Send to Response Manager if available
+	// Send to Response Manager
 	if ys.responseManager != nil {
 		if rm, ok := ys.responseManager.(interface {
 			HandleThreat(threat *models.ThreatInfo) error
 		}); ok {
 			if err := rm.HandleThreat(threat); err != nil {
-				ys.logger.Error("Failed to handle threat via Response Manager (stub): %v", err)
+				ys.logger.Error("Failed to handle threat via Response Manager: %v", err)
 			} else {
-				ys.logger.Info("Threat sent to Response Manager for processing (stub)")
+				ys.logger.Info("Threat sent to Response Manager for processing")
 			}
-		} else {
-			ys.logger.Warn("Response Manager does not support HandleThreat method (stub)")
 		}
-	} else {
-		ys.logger.Warn("Response Manager not configured - threat not processed (stub)")
 	}
 }
 
-// createAndSendAlert builds alert data and sends to the server (stub parity)
+// Create and send alert with enhanced validation
 func (ys *YaraScanner) createAndSendAlert(filePath string, result *ScanResult, fileInfo os.FileInfo) {
 	if ys.agentID == "" || ys.serverClient == nil {
-		ys.logger.Warn("Cannot send alert: agent ID or server client not set (stub)")
+		ys.logger.Debug("Cannot send alert: agent ID or server client not set")
 		return
 	}
 
-	// Đảm bảo rule_name không rỗng
 	ruleName := result.RuleName
 	if ruleName == "" {
 		ruleName = "unknown_rule"
-		ys.logger.Warn("Empty rule name, using 'unknown_rule'")
-	}
-
-	// Đảm bảo agent_id không rỗng
-	if ys.agentID == "" {
-		ys.logger.Warn("Cannot send alert: agent ID not set")
-		return
 	}
 
 	alertData := map[string]interface{}{
@@ -668,39 +754,22 @@ func (ys *YaraScanner) createAndSendAlert(filePath string, result *ScanResult, f
 		"threat_type":    ys.getThreatType(result.RuleTags),
 		"rule_tags":      result.RuleTags,
 		"scan_time_ms":   result.ScanTime,
+		"suppressed":     result.Suppressed,
 	}
 
 	if sendAlert, ok := ys.serverClient.(interface {
 		SendAlert(data map[string]interface{}) error
 	}); ok {
 		if err := sendAlert.SendAlert(alertData); err != nil {
-			ys.logger.Error("Failed to send YARA alert to server (stub): %v", err)
+			ys.logger.Error("Failed to send YARA alert to server: %v", err)
 		} else {
-			ys.logger.Info("✅ YARA alert sent to server successfully for file (stub): %s", filePath)
+			ys.logger.Info("✅ YARA alert sent to server successfully for file: %s", filePath)
 		}
-	} else {
-		ys.logger.Warn("Server client does not support SendAlert method (stub)")
 	}
 }
 
-func (ys *YaraScanner) ReloadRules() error {
-	ys.logger.Info("YARA Scanner Stub: ReloadRules called (no-op)")
-	return nil
-}
-
-func (ys *YaraScanner) GetRulesInfo() map[string]interface{} {
-	return map[string]interface{}{
-		"enabled":      false,
-		"rules_path":   ys.config.RulesPath,
-		"rules_loaded": false,
-		"status":       "stub_mode",
-		"message":      "YARA scanning requires CGO",
-	}
-}
-
-// FIX: getThreatType với safe handling cho empty tags
+// Enhanced threat type detection
 func (ys *YaraScanner) getThreatType(tags []string) string {
-	// FIX: Kiểm tra empty tags
 	if len(tags) == 0 {
 		return "malware"
 	}
@@ -712,7 +781,6 @@ func (ys *YaraScanner) getThreatType(tags []string) string {
 		}
 	}
 
-	// FIX: Kiểm tra nếu không có valid tags
 	if len(lowerTags) == 0 {
 		return "malware"
 	}
@@ -739,37 +807,41 @@ func (ys *YaraScanner) getThreatType(tags []string) string {
 		return "trojan"
 	case has("rootkit"):
 		return "rootkit"
+	case has("backdoor"):
+		return "backdoor"
+	case has("webshell"):
+		return "webshell"
 	default:
 		return "malware"
 	}
 }
 
-// shouldSuppress returns true if an alert for the same file and rule occurred within window
-func (ys *YaraScanner) shouldSuppress(filePath, rule string, window time.Duration) bool {
-	key := filePath + "|" + rule
-	ys.recentMu.Lock()
-	defer ys.recentMu.Unlock()
-	if last, ok := ys.recentAlerts[key]; ok {
-		if time.Since(last) < window {
-			return true
-		}
-	}
-	ys.recentAlerts[key] = time.Now()
-	return false
+func (ys *YaraScanner) ReloadRules() error {
+	ys.logger.Info("YARA Scanner Stub: ReloadRules called (no-op)")
+	return nil
 }
 
-// Cleanup cleans up resources (stub)
+func (ys *YaraScanner) GetRulesInfo() map[string]interface{} {
+	return map[string]interface{}{
+		"enabled":          ys.config.Enabled,
+		"rules_path":       ys.config.RulesPath,
+		"rules_loaded":     false,
+		"status":           "stub_mode",
+		"message":          "YARA scanning requires CGO",
+		"scan_count":       ys.scanCount,
+		"alert_count":      ys.alertCount,
+		"suppressed_count": ys.suppressedCount,
+	}
+}
+
 func (ys *YaraScanner) Cleanup() {
 	ys.logger.Info("YARA scanner cleanup completed (stub)")
-
-	// Cleanup toast notifier
 	if ys.toastNotifier != nil {
 		ys.toastNotifier.Stop()
-		ys.logger.Info("YARA scanner notification system stopped (stub)")
+		ys.logger.Info("YARA scanner notification system stopped")
 	}
 }
 
-// GetMatchedRulesCount returns 0 for stub
 func (ys *YaraScanner) GetMatchedRulesCount() int {
 	return 0
 }

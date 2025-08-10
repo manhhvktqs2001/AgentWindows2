@@ -2,16 +2,16 @@ server:
   url: "http://192.168.20.85:5000"
   api_key: "f93ac1d1d7b64f07bd32c81e6ab8423e4cb7631f2051c9d8a2d340c5be3a4a9e"
   auth_token: "edr_system_auth_2025"
-  timeout: 30
-  retry_count: 3
+  timeout: 45        # Increased timeout to prevent server communication issues
+  retry_count: 2     # Reduced retries to avoid log spam
   tls_verify: false
 
 agent:
   id: ""
   name: "edr-agent-windows"
-  heartbeat_interval: 120  # Increased to reduce server traffic
-  event_batch_size: 50     # Reduced to send smaller batches more frequently
-  max_queue_size: 5000     # Reduced to prevent excessive memory usage
+  heartbeat_interval: 180    # Increased to reduce server traffic
+  event_batch_size: 100      # Increased batch size for efficiency
+  max_queue_size: 2000       # Reduced to prevent memory issues
 
 monitoring:
   file_system:
@@ -23,7 +23,7 @@ monitoring:
       - "C:\\Windows\\System32"
     recursive: true
     real_time_scan: true
-    max_file_size: "50MB"   # Reduced to prevent scanning very large files
+    max_file_size: "50MB"
     exclude_extensions:
       - ".tmp"
       - ".log"
@@ -33,12 +33,29 @@ monitoring:
       - ".sqlite"
       - ".etl"
       - ".evtx"
+      - ".go"           # Exclude Go source files
+      - ".js"
+      - ".ts"
+      - ".json"
+      - ".yaml"
+      - ".yml"
+      - ".md"
+      - ".txt"
+    exclude_paths:      # New: exclude specific paths
+      - "C:\\Users\\Manh\\Desktop\\AgentWindows"
+      - "C:\\Users\\*\\AppData\\Local\\Temp\\go-build"
+      - "C:\\Windows\\Temp"
+      - "*\\node_modules"
+      - "*\\.git"
+      - "*\\.vs"
+      - "*\\.vscode"
+      - "*\\cursor\\user\\workspacestorage"
 
   processes:
     enabled: true
     scan_executables: true
-    monitor_injections: true
-    track_network_connections: true
+    monitor_injections: false    # Disabled to reduce noise
+    track_network_connections: false  # Disabled to reduce noise
     monitor_cmdline: true
     exclude_names:
       - "explorer.exe"
@@ -51,20 +68,27 @@ monitoring:
       - "services.exe"
       - "wininit.exe"
       - "smss.exe"
+      - "SearchIndexer.exe"
+      - "SearchProtocolHost.exe"
+      - "RuntimeBroker.exe"
+      - "ApplicationFrameHost.exe"
 
   network:
-    enabled: true
-    monitor_dns: true
+    enabled: false     # Disabled to reduce system load and noise
+    monitor_dns: false
     block_malicious_ips: false
     capture_packets: false
-    monitor_tcp: true
+    monitor_tcp: false
     monitor_udp: false
-    scan_interval: 60       # Reduced frequency
+    scan_interval: 120
     exclude_ports:
       - 135
       - 445
       - 5985
       - 3389
+      - 80
+      - 443
+      - 53
     suspicious_ports:
       - 22
       - 23
@@ -74,40 +98,45 @@ monitoring:
       - 1337
 
   registry:
-    enabled: true
-    monitor_autostart: true
-    track_security_settings: true
-    scan_interval: 60       # Reduced frequency
+    enabled: false     # Disabled to reduce noise
+    monitor_autostart: false
+    track_security_settings: false
+    scan_interval: 300
     paths:
       - "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"
       - "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce"
       - "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"
 
   memory:
-    enabled: false          # Disabled to reduce noise
-    scan_interval: 600
-    threat_threshold: 0.7   # Increased threshold
-    max_processes: 20       # Reduced scope
+    enabled: false     # Disabled to reduce system impact
+    scan_interval: 900
+    threat_threshold: 0.8
+    max_processes: 10
 
   behavior:
-    enabled: false          # Disabled to reduce noise
-    analysis_interval: 120
-    threat_threshold: 0.8   # Increased threshold
-    data_retention: 12      # Reduced retention
+    enabled: false     # Disabled to reduce noise and system impact
+    analysis_interval: 300
+    threat_threshold: 0.9
+    data_retention: 6
 
 yara:
   enabled: true
   auto_update: false
   update_interval: "24h"
   rules_source: https://github.com/Yara-Rules/rules/archive/master.zip
-  categories:              # Reduced to essential categories
+  categories:              # Focused on essential categories only
     - malware
     - maldocs
     - webshells
-  max_scan_threads: 2      # Reduced to lower system impact
-  scan_timeout: 15         # Reduced timeout
+  max_scan_threads: 1      # Reduced to minimize system impact
+  scan_timeout: 20         # Increased timeout for complex rules
   rules_path: yara-rules
-  max_file_size: "50MB"    # Reduced max file size
+  max_file_size: "100MB"   # Increased for better coverage
+  
+  # Enhanced suppression settings
+  suppress_environmental: true      # New: suppress environmental detections
+  suppress_development_paths: true  # New: suppress detections in dev paths
+  escalating_suppression: true      # New: escalating duplicate suppression
 
 response:
   notification_settings:
@@ -115,11 +144,11 @@ response:
     system_tray_enabled: true
     desktop_alert_enabled: true
     sound_enabled: false     # Disabled to reduce noise
-    timeout_seconds: 5       # Reduced timeout
+    timeout_seconds: 3       # Reduced timeout for faster dismissal
 
   severity_thresholds:
-    show_user_alerts: 3      # Only show medium+ alerts
-    auto_quarantine: 4       # Only quarantine high+ severity
+    show_user_alerts: 4      # Only show high severity alerts
+    auto_quarantine: 5       # Only quarantine critical threats
     block_execution: 5       # Only block critical threats
 
   user_interaction:
@@ -132,8 +161,63 @@ response:
     custom_messages: false
     language: "en"
 
+  # Enhanced notification settings
+  notification_retry_count: 2       # New: retry failed notifications
+  notification_timeout: 8           # New: notification display timeout
+  duplicate_suppression: 120        # New: suppress duplicates for 2 minutes
+  escalating_suppression: true      # New: escalating suppression
+
 logging:
-  level: "info"            # Reduced from debug to info
-  format: "text"
+  level: "info"            # Keep info level for important events
+  format: "text"           # Text format is more readable
   file_path: "agent.log"
-  max_size: "10MB"
+  max_size: "50MB"         # Increased log size
+  max_files: 3             # New: keep 3 log files
+  compress: true           # New: compress old logs
+
+# New: Performance tuning section
+performance:
+  max_memory_usage: "512MB"        # Memory limit
+  cpu_limit_percent: 20            # CPU usage limit
+  scan_queue_size: 100             # Scan queue limit
+  event_queue_size: 1000           # Event queue limit
+  cleanup_interval: 900            # Cleanup every 15 minutes
+  
+# New: Enhanced suppression rules
+suppression:
+  rules:
+    - type: "path_contains"
+      values: 
+        - "\\AgentWindows\\"
+        - "\\internal\\"
+        - "\\go\\src\\"
+        - "\\node_modules\\"
+        - "\\.git\\"
+        - "\\cursor\\user\\workspacestorage\\"
+      reason: "development_path"
+      
+    - type: "rule_name_contains"
+      values:
+        - "powershell"
+        - "debuggercheck"
+        - "vmdetect"
+        - "anti_dbg"
+        - "capabilities"
+      paths:
+        - "C:\\Windows\\"
+        - "C:\\Program Files\\"
+        - "*\\AgentWindows\\*"
+      reason: "environmental_system_path"
+      
+    - type: "file_extension"
+      values:
+        - ".go"
+        - ".js"
+        - ".ts"
+        - ".json"
+        - ".yaml"
+        - ".yml"
+        - ".md"
+        - ".txt"
+        - ".log"
+      reason: "source_code_file"
