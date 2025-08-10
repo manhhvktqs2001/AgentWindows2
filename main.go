@@ -1,35 +1,32 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
 
 	"edr-agent-windows/internal/agent"
 	"edr-agent-windows/internal/config"
+	"edr-agent-windows/internal/models"
 	"edr-agent-windows/internal/response"
+	"edr-agent-windows/internal/scanner"
 	"edr-agent-windows/internal/service"
 	"edr-agent-windows/internal/utils"
 
-	"io"
-	"net/http"
-	"sort"
-
-	"encoding/json"
-	"net"
-
 	"golang.org/x/sys/windows"
-
-	"edr-agent-windows/internal/models"
-	"edr-agent-windows/internal/scanner"
 )
 
 var (
@@ -116,6 +113,9 @@ func main() {
 		console          = flag.Bool("console", false, "Run in console mode (not as service)")
 		testNotification = flag.Bool("test-notification", false, "Test notification system")
 		testAlert        = flag.Bool("test-alert", false, "Test security alert notification")
+		testEnhanced     = flag.Bool("test-enhanced", false, "Test enhanced notification system")
+		testToast        = flag.String("test-toast", "", "Test toast notification with custom message")
+		testAudio        = flag.Bool("test-audio", false, "Test audio alert patterns")
 	)
 	flag.Parse()
 
@@ -206,6 +206,22 @@ func main() {
 	// Test security alert
 	if *testAlert {
 		testSecurityAlert(*configPath)
+		return
+	}
+
+	// Enhanced notification tests
+	if *testEnhanced {
+		testEnhancedNotifications(*configPath)
+		return
+	}
+
+	if *testToast != "" {
+		testCustomToast(*testToast, *configPath)
+		return
+	}
+
+	if *testAudio {
+		testAudioPatterns()
 		return
 	}
 

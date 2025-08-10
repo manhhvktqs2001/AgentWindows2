@@ -1,3 +1,4 @@
+// internal/response/action_engine.go
 package response
 
 import (
@@ -473,17 +474,14 @@ func (qm *QuarantineManager) RestoreFile(filePath string) error {
 	return fmt.Errorf("file restore not implemented yet")
 }
 
-// Placeholder controllers
+// Legacy ProcessController and NetworkController interfaces for backward compatibility
 type ProcessController struct {
 	config *config.ResponseConfig
 	logger *utils.Logger
 }
 
 func NewProcessController(cfg *config.ResponseConfig, logger *utils.Logger) *ProcessController {
-	return &ProcessController{
-		config: cfg,
-		logger: logger,
-	}
+	return &ProcessController{config: cfg, logger: logger}
 }
 
 func (pc *ProcessController) Start() error {
@@ -506,10 +504,7 @@ type NetworkController struct {
 }
 
 func NewNetworkController(cfg *config.ResponseConfig, logger *utils.Logger) *NetworkController {
-	return &NetworkController{
-		config: cfg,
-		logger: logger,
-	}
+	return &NetworkController{config: cfg, logger: logger}
 }
 
 func (nc *NetworkController) Start() error {
