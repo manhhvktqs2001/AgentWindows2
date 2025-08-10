@@ -324,26 +324,13 @@ func (ys *YaraScanner) showRealtimeNotification(filePath string, result *ScanRes
 
 	// FIX: Chạy trong goroutine riêng để không block
 	go func() {
-		maxRetries := 3
-		for attempt := 1; attempt <= maxRetries; attempt++ {
-			err := ys.toastNotifier.SendNotification(content)
-			if err == nil {
-				ys.logger.Info("✅ Realtime YARA notification displayed successfully (stub, attempt %d)", attempt)
-				return
-			}
-
-			ys.logger.Warn("Failed to send realtime YARA notification (stub, attempt %d/%d): %v",
-				attempt, maxRetries, err)
-
-			if attempt < maxRetries {
-				// Wait before retry
-				time.Sleep(time.Duration(attempt) * time.Second)
-			}
+		// Single attempt; notifier internally tries WPF → Balloon → Toast
+		if err := ys.toastNotifier.SendNotification(content); err != nil {
+			ys.logger.Error("All notification attempts failed (stub): %v", err)
+			ys.showFallbackAlertStub(filePath, result)
+			return
 		}
-
-		// FIX: Fallback notification nếu tất cả attempts thất bại
-		ys.logger.Error("All notification attempts failed (stub), using fallback alert")
-		ys.showFallbackAlertStub(filePath, result)
+		ys.logger.Info("✅ Realtime YARA notification displayed successfully (stub)")
 	}()
 }
 

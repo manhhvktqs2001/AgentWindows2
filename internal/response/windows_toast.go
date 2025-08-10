@@ -43,7 +43,7 @@ func (wtn *WindowsToastNotifier) Stop() {
 
 // SendNotification displays native Windows notification
 func (wtn *WindowsToastNotifier) SendNotification(content *NotificationContent) error {
-	// Normalize/augment title and message to include rule name and details
+	// Normalize/augment title and message to match the desired balloon style
 	title := strings.TrimSpace(content.Title)
 	message := strings.TrimSpace(content.Message)
 	if content.ThreatInfo != nil {
@@ -51,20 +51,14 @@ func (wtn *WindowsToastNotifier) SendNotification(content *NotificationContent) 
 		filePath := wtn.cleanString(content.ThreatInfo.FilePath)
 		description := wtn.cleanString(content.ThreatInfo.Description)
 
-		lowerTitle := strings.ToLower(title)
-		if title == "" || strings.Contains(lowerTitle, "yara threat detected") || strings.Contains(lowerTitle, "security alert") {
-			title = fmt.Sprintf("YARA: %s", rule)
-		}
+		// Force title format: EDR Security Alert - <rule>
+		title = fmt.Sprintf("EDR Security Alert - %s", rule)
 
-		if message == "" {
-			// Concise detail for the popup; long text will be trimmed by toast/balloon methods
-			base := fmt.Sprintf("Rule: %s\nFile: %s", rule, filePath)
-			if description != "" {
-				message = base + "\n" + description
-			} else {
-				message = base
-			}
-		}
+		// Force message format: lines matching screenshot style
+		sevText := wtn.getSeverityText(content.Severity)
+		message = fmt.Sprintf("A Security Threat Detected\nThreat: %s\nSeverity: %s", rule, sevText)
+		_ = filePath
+		_ = description
 	}
 
 	// Apply back after cleaning
@@ -87,12 +81,12 @@ func (wtn *WindowsToastNotifier) SendNotification(content *NotificationContent) 
 	fmt.Printf("🚨🚨🚨 END ALERT 🚨🚨🚨\n\n")
 	os.Stdout.Sync()
 
-	// Prefer native Windows toast (bottom-right) then balloon; no msg fallback
-	if err := wtn.showNativeToast(content); err == nil {
-		wtn.logger.Info("✅ Native toast displayed")
+	// Prefer WPF corner popup (bottom-right), then system tray balloon (3s), then native toast
+	if err := wtn.showWpfCornerPopup(content); err == nil {
+		wtn.logger.Info("✅ WPF corner popup displayed")
 		return nil
 	} else {
-		wtn.logger.Debug("Native toast failed: %v", err)
+		wtn.logger.Debug("WPF corner popup failed: %v", err)
 	}
 
 	if err := wtn.showSystemBalloon(content); err == nil {
@@ -102,7 +96,84 @@ func (wtn *WindowsToastNotifier) SendNotification(content *NotificationContent) 
 		wtn.logger.Debug("System balloon failed: %v", err)
 	}
 
-	return fmt.Errorf("failed to display notification via toast or balloon")
+	if err := wtn.showNativeToast(content); err == nil {
+		wtn.logger.Info("✅ Native toast displayed")
+		return nil
+	} else {
+		wtn.logger.Debug("Native toast failed: %v", err)
+	}
+
+	return fmt.Errorf("failed to display notification via wpf, balloon, or toast")
+}
+
+// showWpfCornerPopup shows a lightweight WPF window at bottom-right for ~3s
+func (wtn *WindowsToastNotifier) showWpfCornerPopup(content *NotificationContent) error {
+	title := wtn.cleanString(content.Title)
+	message := wtn.cleanString(content.Message)
+
+	if len(message) > 180 {
+		message = message[:180] + "..."
+	}
+
+	psScript := fmt.Sprintf(`
+Add-Type -AssemblyName PresentationFramework
+Add-Type -AssemblyName PresentationCore
+Add-Type -AssemblyName WindowsBase
+
+try {
+    $screen = [System.Windows.SystemParameters]::WorkArea
+    $width = 380
+    $height = 110
+
+    $window = New-Object System.Windows.Window
+    $window.Width = $width
+    $window.Height = $height
+    $window.WindowStyle = 'None'
+    $window.ResizeMode = 'NoResize'
+    $window.Topmost = $true
+    $window.AllowsTransparency = $true
+    $window.Background = [System.Windows.Media.SolidColorBrush]([System.Windows.Media.Color]::FromArgb(230, 30, 30, 30))
+    $window.Left = $screen.Right - $width - 12
+    $window.Top  = $screen.Bottom - $height - 12
+
+    $grid = New-Object System.Windows.Controls.Grid
+    $grid.Margin = '12'
+
+    $grid.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition))
+    $grid.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition))
+
+    $titleBlock = New-Object System.Windows.Controls.TextBlock
+    $titleBlock.Text = '%s'
+    $titleBlock.FontSize = 16
+    $titleBlock.FontWeight = 'Bold'
+    $titleBlock.Foreground = [System.Windows.Media.Brushes]::Orange
+    [System.Windows.Controls.Grid]::SetRow($titleBlock, 0)
+    $grid.Children.Add($titleBlock) | Out-Null
+
+    $msgBlock = New-Object System.Windows.Controls.TextBlock
+    $msgBlock.Text = '%s'
+    $msgBlock.Margin = '0,6,0,0'
+    $msgBlock.TextWrapping = 'Wrap'
+    $msgBlock.Foreground = [System.Windows.Media.Brushes]::White
+    [System.Windows.Controls.Grid]::SetRow($msgBlock, 1)
+    $grid.Children.Add($msgBlock) | Out-Null
+
+    $window.Content = $grid
+
+    $timer = New-Object System.Windows.Threading.DispatcherTimer
+    $timer.Interval = [TimeSpan]::FromMilliseconds(3200)
+    $timer.Add_Tick({ $timer.Stop(); $window.Close() })
+
+    $window.Add_ContentRendered({ $timer.Start() })
+    $window.Show()
+    [System.Windows.Threading.Dispatcher]::Run()
+    exit 0
+} catch {
+    exit 1
+}
+`, title, message)
+
+	return wtn.runPowerShell(psScript)
 }
 
 // showNativeToast shows Windows 10+ native toast notification

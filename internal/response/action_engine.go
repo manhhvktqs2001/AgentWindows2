@@ -130,10 +130,14 @@ func (ae *ActionEngine) QuarantineFile(filePath string) error {
 			if err != nil {
 				ae.logger.Error("Failed to upload file to server after retries: %v", err)
 			} else {
-				ae.logger.Info("✅ File uploaded to server successfully: %s", filepath.Base(quarantinePath))
-				// Clean up local file after successful upload
+				if fi, statErr := os.Stat(quarantinePath); statErr == nil && fi.Mode().IsRegular() {
+					ae.logger.Info("✅ File uploaded to server successfully: %s", filepath.Base(quarantinePath))
+				} else {
+					ae.logger.Info("✅ Upload completed for quarantine entry: %s", filepath.Base(quarantinePath))
+				}
+				// Clean up local artifact after successful upload
 				if remErr := ae.quarantineManager.cleanupLocalQuarantine(quarantinePath); remErr != nil {
-					ae.logger.Warn("Failed to cleanup local quarantine: %v", remErr)
+					ae.logger.Debug("Cleanup note: %v", remErr)
 				}
 			}
 		}
