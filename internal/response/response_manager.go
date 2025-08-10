@@ -527,13 +527,9 @@ func (rm *ResponseManager) cleanup() {
 		}
 	}
 
-	// Reset suppression counts periodically
-	suppressionCutoff := time.Now().Add(-24 * time.Hour)
-	for key := range rm.suppressedThreats {
-		// Reset counts for old entries
-		if time.Since(cutoff) > 24*time.Hour {
-			delete(rm.suppressedThreats, key)
-		}
+	// Reset suppression counts periodically (clear all to prevent growth)
+	if len(rm.suppressedThreats) > 0 {
+		rm.suppressedThreats = make(map[string]int)
 	}
 
 	rm.logger.Debug("Cleanup completed - Active threats: %d, Processed tracking: %d",
