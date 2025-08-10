@@ -14,27 +14,24 @@ import (
 	"edr-agent-windows/internal/utils"
 )
 
-// ActionEngine thực hiện các hành động tự động
 type ActionEngine struct {
 	config *config.ResponseConfig
 	logger *utils.Logger
 
-	// Server communication
 	serverClient *communication.ServerClient
 
-	// Action components
 	quarantineManager *QuarantineManager
 	processController *WindowsProcessController
 	networkController *WindowsNetworkController
 
-	// State
+	// Enhanced state tracking
 	quarantinedFiles    map[string]bool
 	terminatedProcesses map[int]bool
 	blockedConnections  map[string]bool
+	failedOperations    map[string]int
 	mu                  sync.RWMutex
 }
 
-// NewActionEngine tạo Action Engine mới
 func NewActionEngine(cfg *config.ResponseConfig, logger *utils.Logger, serverClient *communication.ServerClient) *ActionEngine {
 	ae := &ActionEngine{
 		config:              cfg,
@@ -43,9 +40,9 @@ func NewActionEngine(cfg *config.ResponseConfig, logger *utils.Logger, serverCli
 		quarantinedFiles:    make(map[string]bool),
 		terminatedProcesses: make(map[int]bool),
 		blockedConnections:  make(map[string]bool),
+		failedOperations:    make(map[string]int),
 	}
 
-	// Initialize action components
 	ae.quarantineManager = NewQuarantineManager(cfg, logger)
 	ae.processController = NewWindowsProcessController(cfg, logger)
 	ae.networkController = NewWindowsNetworkController(cfg, logger)
@@ -53,58 +50,99 @@ func NewActionEngine(cfg *config.ResponseConfig, logger *utils.Logger, serverCli
 	return ae
 }
 
-// QuarantineFile cách ly file với improved error handling
 func (ae *ActionEngine) QuarantineFile(filePath string) error {
 	ae.mu.Lock()
 	defer ae.mu.Unlock()
 
-	ae.logger.Info("Quarantining file: %s", filePath)
-
-	// Validate input
+	// Enhanced validation
 	if filePath == "" {
-		ae.logger.Warn("Empty file path provided for quarantine")
+		ae.logger.Debug("Empty file path provided for quarantine")
 		return nil
 	}
 
-	// Normalize path
 	normalizedPath := filepath.Clean(filePath)
 
-	// Check if file exists
-	if _, err := os.Stat(normalizedPath); os.IsNotExist(err) {
-		ae.logger.Warn("File does not exist, skipping quarantine: %s", normalizedPath)
+	// Check if file exists and is accessible
+	fileInfo, err := os.Stat(normalizedPath)
+	if os.IsNotExist(err) {
+		ae.logger.Debug("File does not exist, skipping quarantine: %s", normalizedPath)
+		return nil
+	}
+	if err != nil {
+		ae.logger.Warn("Cannot access file for quarantine: %s - %v", normalizedPath, err)
 		return nil
 	}
 
-	// Check if already quarantined
+	// Enhanced system file protection
+	if ae.quarantineManager.isProtectedSystemPath(normalizedPath) {
+		ae.logger.Warn("Refusing to quarantine protected system file: %s", normalizedPath)
+		return nil
+	}
+
+	// Skip if already quarantined
 	if ae.quarantinedFiles[normalizedPath] {
 		ae.logger.Debug("File already quarantined: %s", normalizedPath)
 		return nil
 	}
 
-	// Skip protected system files
-	if ae.quarantineManager.isProtectedSystemPath(normalizedPath) {
-		ae.logger.Warn("Skipping quarantine for protected system file: %s", normalizedPath)
+	// Check for repeated failures
+	if failCount := ae.failedOperations[normalizedPath]; failCount >= 3 {
+		ae.logger.Warn("Skipping quarantine due to repeated failures: %s", normalizedPath)
 		return nil
 	}
 
-	// Perform quarantine
+	// Skip directories and special files
+	if fileInfo.IsDir() {
+		ae.logger.Debug("Skipping quarantine of directory: %s", normalizedPath)
+		return nil
+	}
+
+	// Skip very large files
+	if fileInfo.Size() > 500*1024*1024 { // 500MB
+		ae.logger.Warn("Skipping quarantine of large file (%d bytes): %s", fileInfo.Size(), normalizedPath)
+		return nil
+	}
+
+	ae.logger.Info("Quarantining file: %s", normalizedPath)
+
+	// Perform quarantine with enhanced error handling
 	quarantinePath, err := ae.quarantineManager.QuarantineFile(normalizedPath)
 	if err != nil {
-		ae.logger.Error("Failed to quarantine file locally: %v", err)
+		ae.failedOperations[normalizedPath]++
+		ae.logger.Error("Failed to quarantine file: %s - %v", normalizedPath, err)
 		return fmt.Errorf("failed to quarantine file: %w", err)
 	}
 
-	// Mark as quarantined
+	// Mark as successfully quarantined
 	ae.quarantinedFiles[normalizedPath] = true
-	ae.logger.Info("File quarantined locally successfully: %s", normalizedPath)
+	delete(ae.failedOperations, normalizedPath) // Clear failure count on success
+	ae.logger.Info("File quarantined successfully: %s", normalizedPath)
 
-	// Upload to server (async)
-	go func() {
-		if ae.serverClient != nil && quarantinePath != "" {
+	// Upload to server asynchronously with better error handling
+	if ae.serverClient != nil && quarantinePath != "" {
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					ae.logger.Error("Panic during file upload: %v", r)
+				}
+			}()
+
 			agentID := ae.serverClient.GetAgentID()
-			if agentID != "" {
+			if agentID == "" {
+				ae.logger.Debug("Agent ID not set, skipping upload")
+				return
+			}
+
+			// Upload with retry and timeout
+			maxRetries := 3
+			for attempt := 1; attempt <= maxRetries; attempt++ {
 				if err := ae.serverClient.UploadQuarantineFile(agentID, quarantinePath); err != nil {
-					ae.logger.Error("Failed to upload file to server: %v", err)
+					ae.logger.Warn("Upload attempt %d/%d failed: %v", attempt, maxRetries, err)
+					if attempt < maxRetries {
+						time.Sleep(time.Duration(attempt) * time.Second)
+						continue
+					}
+					ae.logger.Error("Failed to upload file after %d attempts: %v", maxRetries, err)
 				} else {
 					ae.logger.Info("✅ File uploaded to server successfully: %s", filepath.Base(quarantinePath))
 					// Clean up local file after successful upload
@@ -113,15 +151,15 @@ func (ae *ActionEngine) QuarantineFile(filePath string) error {
 					} else {
 						ae.logger.Info("🧹 Deleted local quarantine file after upload: %s", quarantinePath)
 					}
+					break
 				}
 			}
-		}
-	}()
+		}()
+	}
 
 	return nil
 }
 
-// RestoreFile phục hồi file từ quarantine
 func (ae *ActionEngine) RestoreFile(filePath string) error {
 	ae.mu.Lock()
 	defer ae.mu.Unlock()
@@ -142,10 +180,9 @@ func (ae *ActionEngine) RestoreFile(filePath string) error {
 	return nil
 }
 
-// TerminateProcesses chấm dứt process
 func (ae *ActionEngine) TerminateProcesses(processID int) error {
-	if processID <= 0 {
-		ae.logger.Debug("Skip terminate: invalid PID %d", processID)
+	if processID <= 0 || processID == os.Getpid() {
+		ae.logger.Debug("Skip terminate: invalid or self PID %d", processID)
 		return nil
 	}
 
@@ -161,6 +198,7 @@ func (ae *ActionEngine) TerminateProcesses(processID int) error {
 
 	err := ae.processController.TerminateProcesses(processID)
 	if err != nil {
+		ae.logger.Warn("Failed to terminate process %d: %v", processID, err)
 		return fmt.Errorf("failed to terminate process: %w", err)
 	}
 
@@ -169,7 +207,6 @@ func (ae *ActionEngine) TerminateProcesses(processID int) error {
 	return nil
 }
 
-// BlockNetworkConnections chặn kết nối mạng
 func (ae *ActionEngine) BlockNetworkConnections(processID int) error {
 	if processID <= 0 {
 		ae.logger.Debug("Skip block network: invalid PID %d", processID)
@@ -190,6 +227,7 @@ func (ae *ActionEngine) BlockNetworkConnections(processID int) error {
 
 	err := ae.networkController.BlockNetworkConnections(processID)
 	if err != nil {
+		ae.logger.Warn("Failed to block network connections for process %d: %v", processID, err)
 		return fmt.Errorf("failed to block network connections: %w", err)
 	}
 
@@ -198,7 +236,6 @@ func (ae *ActionEngine) BlockNetworkConnections(processID int) error {
 	return nil
 }
 
-// Start khởi động Action Engine
 func (ae *ActionEngine) Start() error {
 	ae.logger.Info("Starting Action Engine...")
 
@@ -218,7 +255,6 @@ func (ae *ActionEngine) Start() error {
 	return nil
 }
 
-// Stop dừng Action Engine
 func (ae *ActionEngine) Stop() {
 	ae.logger.Info("Stopping Action Engine...")
 
@@ -229,7 +265,7 @@ func (ae *ActionEngine) Stop() {
 	ae.logger.Info("Action Engine stopped")
 }
 
-// QuarantineManager quản lý việc cách ly file
+// Enhanced QuarantineManager
 type QuarantineManager struct {
 	config        *config.ResponseConfig
 	logger        *utils.Logger
@@ -263,66 +299,71 @@ func (qm *QuarantineManager) Stop() {
 	qm.logger.Info("Quarantine Manager stopped")
 }
 
-// QuarantineFile thực hiện cách ly file
 func (qm *QuarantineManager) QuarantineFile(filePath string) (string, error) {
 	qm.mu.Lock()
 	defer qm.mu.Unlock()
 
-	// Skip self-quarantine
+	// Enhanced self-quarantine detection
 	if strings.Contains(strings.ToLower(filePath), strings.ToLower(qm.quarantineDir)) {
 		qm.logger.Debug("Skipping self-quarantine path: %s", filePath)
 		return "", nil
 	}
 
-	// Check if file exists
-	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		qm.logger.Warn("File does not exist, skipping quarantine: %s", filePath)
+	// Enhanced file existence check
+	fileInfo, err := os.Stat(filePath)
+	if os.IsNotExist(err) {
+		qm.logger.Debug("File does not exist, skipping quarantine: %s", filePath)
 		return "", nil
 	}
+	if err != nil {
+		return "", fmt.Errorf("cannot access file: %w", err)
+	}
 
-	// Skip protected paths
+	// Enhanced protection checks
 	if qm.isProtectedSystemPath(filePath) {
-		qm.logger.Warn("Protected system path detected, skipping quarantine: %s", filePath)
-		return "", nil
+		qm.logger.Warn("Protected system path detected, refusing quarantine: %s", filePath)
+		return "", fmt.Errorf("cannot quarantine protected system file")
 	}
 
-	// Create quarantine file path
+	// Check if file is in use
+	if qm.isFileInUse(filePath) {
+		qm.logger.Warn("File appears to be in use, skipping quarantine: %s", filePath)
+		return "", fmt.Errorf("file is in use")
+	}
+
+	// Create unique quarantine file path
 	fileName := filepath.Base(filePath)
-	quarantinePath := filepath.Join(qm.quarantineDir, fmt.Sprintf("%s_%d", fileName, time.Now().Unix()))
+	timestamp := time.Now().Unix()
+	quarantinePath := filepath.Join(qm.quarantineDir, fmt.Sprintf("%s_%d", fileName, timestamp))
 
-	// Try to move file first (most efficient)
-	if err := os.Rename(filePath, quarantinePath); err == nil {
-		if qm.verifyQuarantinedFile(quarantinePath) {
-			qm.logger.Info("File quarantined (moved): %s -> %s", filePath, quarantinePath)
-			return quarantinePath, nil
-		} else {
-			// Move succeeded but file is empty, restore and try copy
-			qm.logger.Warn("Moved file is empty, restoring and trying copy method")
-			if restoreErr := os.Rename(quarantinePath, filePath); restoreErr != nil {
-				qm.logger.Error("Failed to restore file after empty move: %v", restoreErr)
-			}
-		}
+	// Try copy first (safer than move for critical files)
+	if err := qm.copyFileSecure(filePath, quarantinePath); err != nil {
+		qm.logger.Warn("Failed to copy file to quarantine: %v", err)
+		return "", fmt.Errorf("failed to copy file: %w", err)
 	}
 
-	// Try to copy file
-	if err := qm.copyFile(filePath, quarantinePath); err == nil {
-		qm.logger.Info("File quarantined (copied): %s -> %s", filePath, quarantinePath)
-		return quarantinePath, nil
+	// Verify the copy was successful
+	if !qm.verifyQuarantinedFile(quarantinePath, fileInfo.Size()) {
+		os.Remove(quarantinePath) // Clean up failed copy
+		return "", fmt.Errorf("quarantine copy verification failed")
 	}
 
-	// Handle directories
-	if stat, err := os.Stat(filePath); err == nil && stat.IsDir() {
-		if err := qm.quarantineDirectory(filePath); err == nil {
-			qm.logger.Info("Directory quarantined (contents copied): %s", filePath)
-			return "", nil
-		}
-	}
-
-	return "", fmt.Errorf("failed to quarantine file: %s", filePath)
+	qm.logger.Info("File quarantined (copied): %s -> %s", filePath, quarantinePath)
+	return quarantinePath, nil
 }
 
-// copyFile sao chép file
-func (qm *QuarantineManager) copyFile(src, dst string) error {
+func (qm *QuarantineManager) isFileInUse(filePath string) bool {
+	// Try to open file exclusively to check if it's in use
+	file, err := os.OpenFile(filePath, os.O_RDWR, 0)
+	if err != nil {
+		// If we can't open it exclusively, it might be in use
+		return strings.Contains(strings.ToLower(err.Error()), "being used")
+	}
+	file.Close()
+	return false
+}
+
+func (qm *QuarantineManager) copyFileSecure(src, dst string) error {
 	sourceFile, err := os.Open(src)
 	if err != nil {
 		return err
@@ -335,138 +376,104 @@ func (qm *QuarantineManager) copyFile(src, dst string) error {
 	}
 	defer destFile.Close()
 
-	_, err = io.Copy(destFile, sourceFile)
-	return err
+	// Copy with buffer for better performance
+	buffer := make([]byte, 64*1024) // 64KB buffer
+	_, err = io.CopyBuffer(destFile, sourceFile, buffer)
+	if err != nil {
+		os.Remove(dst) // Clean up on failure
+		return err
+	}
+
+	// Ensure data is written to disk
+	return destFile.Sync()
 }
 
-// verifyQuarantinedFile kiểm tra file đã được quarantine
-func (qm *QuarantineManager) verifyQuarantinedFile(quarantinePath string) bool {
-	if _, err := os.Stat(quarantinePath); os.IsNotExist(err) {
-		qm.logger.Warn("Quarantined file does not exist: %s", quarantinePath)
+func (qm *QuarantineManager) verifyQuarantinedFile(quarantinePath string, expectedSize int64) bool {
+	fileInfo, err := os.Stat(quarantinePath)
+	if err != nil {
+		qm.logger.Warn("Quarantined file verification failed - file missing: %s", quarantinePath)
 		return false
 	}
 
-	if fileInfo, err := os.Stat(quarantinePath); err == nil {
-		if fileInfo.Size() == 0 {
-			qm.logger.Warn("Quarantined file is empty: %s", quarantinePath)
-			return false
+	if fileInfo.Size() == 0 {
+		qm.logger.Warn("Quarantined file verification failed - file empty: %s", quarantinePath)
+		return false
+	}
+
+	if fileInfo.Size() != expectedSize {
+		qm.logger.Warn("Quarantined file verification failed - size mismatch: %s (expected %d, got %d)",
+			quarantinePath, expectedSize, fileInfo.Size())
+		return false
+	}
+
+	return true
+}
+
+func (qm *QuarantineManager) isProtectedSystemPath(filePath string) bool {
+	lower := strings.ToLower(filePath)
+
+	// Critical Windows system files and directories
+	criticalPaths := []string{
+		`c:\windows\system32\ntoskrnl.exe`,
+		`c:\windows\system32\hal.dll`,
+		`c:\windows\system32\kernel32.dll`,
+		`c:\windows\system32\ntdll.dll`,
+		`c:\windows\system32\user32.dll`,
+		`c:\windows\system32\gdi32.dll`,
+		`c:\windows\system32\winlogon.exe`,
+		`c:\windows\system32\lsass.exe`,
+		`c:\windows\system32\csrss.exe`,
+		`c:\windows\system32\wininit.exe`,
+		`c:\windows\system32\services.exe`,
+		`c:\windows\system32\smss.exe`,
+		`c:\windows\explorer.exe`,
+		`c:\hiberfil.sys`,
+		`c:\pagefile.sys`,
+		`c:\swapfile.sys`,
+	}
+
+	// Protected directories
+	protectedDirs := []string{
+		`c:\windows\system32\config\`,
+		`c:\windows\system32\drivers\`,
+		`c:\windows\winsxs\`,
+		`c:\windows\boot\`,
+		`c:\windows\security\`,
+		`c:\windows\servicing\`,
+		`c:\windows\system32\sru\`,
+		`c:\$recycle.bin\`,
+		`c:\recovery\`,
+		`c:\system volume information\`,
+	}
+
+	// Check critical files
+	for _, path := range criticalPaths {
+		if lower == path {
+			return true
 		}
+	}
+
+	// Check protected directories
+	for _, dir := range protectedDirs {
+		if strings.HasPrefix(lower, dir) {
+			return true
+		}
+	}
+
+	// Check if it's our own executable
+	if strings.Contains(lower, "edr-agent") {
 		return true
 	}
 
 	return false
 }
 
-// quarantineDirectory cách ly thư mục
-func (qm *QuarantineManager) quarantineDirectory(dirPath string) error {
-	dirName := filepath.Base(dirPath)
-	quarantineDir := filepath.Join(qm.quarantineDir, fmt.Sprintf("%s_contents_%d", dirName, time.Now().Unix()))
-
-	if err := os.MkdirAll(quarantineDir, 0755); err != nil {
-		return fmt.Errorf("failed to create quarantine directory: %w", err)
-	}
-
-	successCount := 0
-	totalCount := 0
-
-	walkErrTotal := filepath.Walk(dirPath, func(src string, info os.FileInfo, walkErr error) error {
-		if walkErr != nil {
-			return nil
-		}
-
-		totalCount++
-
-		if src == dirPath {
-			return nil
-		}
-
-		rel, err := filepath.Rel(dirPath, src)
-		if err != nil {
-			return nil
-		}
-
-		dst := filepath.Join(quarantineDir, rel)
-
-		if info.IsDir() {
-			if err := os.MkdirAll(dst, 0755); err != nil {
-				qm.logger.Debug("Failed to create destination directory: %s", dst)
-			}
-			return nil
-		}
-
-		if err := qm.copyFile(src, dst); err != nil {
-			qm.logger.Debug("Failed to quarantine file: %s -> %s: %v", src, dst, err)
-			return nil
-		}
-
-		successCount++
-		return nil
-	})
-
-	if walkErrTotal != nil {
-		qm.logger.Debug("Directory walk encountered errors: %v", walkErrTotal)
-	}
-	qm.logger.Info("Directory quarantine completed: %d/%d files successfully quarantined from %s", successCount, totalCount, dirPath)
-
-	if successCount == 0 {
-		if err := os.RemoveAll(quarantineDir); err != nil {
-			qm.logger.Debug("Failed to remove empty quarantine directory: %v", err)
-		}
-		return fmt.Errorf("no files could be quarantined from directory: %s", dirPath)
-	}
-
-	return nil
-}
-
-// isProtectedSystemPath kiểm tra đường dẫn hệ thống được bảo vệ
-func (qm *QuarantineManager) isProtectedSystemPath(filePath string) bool {
-	lower := strings.ToLower(filePath)
-	protectedPrefixes := []string{
-		`c:\windows\system32\config\`,
-		`c:\windows\system32\drivers\`,
-		`c:\windows\winsxs\`,
-		`c:\windows\syswow64\`,
-		`c:\windows\servicing\`,
-		`c:\windows\security\`,
-		`c:\windows\boot\`,
-		`c:\windows\system32\sru\`,
-		`c:\$recycle.bin\`,
-	}
-
-	protectedFiles := []string{
-		`c:\windows\system32\ntoskrnl.exe`,
-		`c:\windows\system32\winlogon.exe`,
-		`c:\windows\system32\lsass.exe`,
-		`c:\windows\system32\csrss.exe`,
-		`c:\windows\system32\wininit.exe`,
-		`c:\windows\system32\services.exe`,
-		`c:\hiberfil.sys`,
-		`c:\pagefile.sys`,
-		`c:\swapfile.sys`,
-	}
-
-	for _, p := range protectedPrefixes {
-		if strings.HasPrefix(lower, p) {
-			return true
-		}
-	}
-
-	for _, f := range protectedFiles {
-		if lower == f {
-			return true
-		}
-	}
-
-	return false
-}
-
-// RestoreFile phục hồi file từ quarantine
 func (qm *QuarantineManager) RestoreFile(filePath string) error {
 	qm.logger.Info("File restore requested: %s", filePath)
 	return fmt.Errorf("file restore not implemented yet")
 }
 
-// ProcessController và NetworkController giữ nguyên như cũ
+// Placeholder controllers
 type ProcessController struct {
 	config *config.ResponseConfig
 	logger *utils.Logger

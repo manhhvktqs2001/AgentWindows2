@@ -8,36 +8,34 @@ import (
 	"edr-agent-windows/internal/utils"
 )
 
-// SeverityAssessor đánh giá mức độ nghiêm trọng của threat
 type SeverityAssessor struct {
 	config *config.ResponseConfig
 	logger *utils.Logger
 
-	// Severity mapping rules
-	malwareFamilies map[string]int
-	threatTypes     map[string]int
-	fileExtensions  map[string]int
-	processNames    map[string]int
+	// Enhanced mapping rules
+	malwareFamilies    map[string]int
+	threatTypes        map[string]int
+	fileExtensions     map[string]int
+	processNames       map[string]int
+	environmentalRules map[string]bool
+	systemPaths        []string
 }
 
-// NewSeverityAssessor tạo Severity Assessor mới
 func NewSeverityAssessor(cfg *config.ResponseConfig, logger *utils.Logger) *SeverityAssessor {
 	sa := &SeverityAssessor{
-		config:          cfg,
-		logger:          logger,
-		malwareFamilies: make(map[string]int),
-		threatTypes:     make(map[string]int),
-		fileExtensions:  make(map[string]int),
-		processNames:    make(map[string]int),
+		config:             cfg,
+		logger:             logger,
+		malwareFamilies:    make(map[string]int),
+		threatTypes:        make(map[string]int),
+		fileExtensions:     make(map[string]int),
+		processNames:       make(map[string]int),
+		environmentalRules: make(map[string]bool),
 	}
 
-	// Initialize severity mappings
 	sa.initializeSeverityMappings()
-
 	return sa
 }
 
-// initializeSeverityMappings khởi tạo các mapping severity
 func (sa *SeverityAssessor) initializeSeverityMappings() {
 	// Malware families severity mapping
 	sa.malwareFamilies = map[string]int{
@@ -124,30 +122,70 @@ func (sa *SeverityAssessor) initializeSeverityMappings() {
 		"tracert.exe":    1,
 		"nslookup.exe":   1,
 	}
+
+	// Environmental/anti-debug rules that should be de-emphasized
+	sa.environmentalRules = map[string]bool{
+		"debuggercheck":            true,
+		"debuggerexception":        true,
+		"debuggerhiding":           true,
+		"vmdetect":                 true,
+		"anti_dbg":                 true,
+		"threadcontrol":            true,
+		"seh__vectored":            true,
+		"check_outputdebugstringa": true,
+		"queryinfo":                true,
+		"win_hook":                 true,
+		"disable_antivirus":        true,
+		"disable_dep":              true,
+		"setconsole":               true,
+		"setconsolectrl":           true,
+		"powershell":               true,
+		"capabilities":             true,
+		"antisandbox":              true,
+		"antivm":                   true,
+		"antidebug":                true,
+		"antiemulatue":             true,
+		"antianalysis":             true,
+	}
+
+	// System paths that commonly trigger environmental detections
+	sa.systemPaths = []string{
+		"\\windows\\system32\\",
+		"\\windows\\syswow64\\",
+		"\\windows\\winsxs\\",
+		"\\program files\\",
+		"\\program files (x86)\\",
+		"\\programdata\\microsoft\\",
+		"edgewebview",
+		"microsoft\\edge",
+		"windowspowershell",
+		"\\quarantine\\",
+		"\\.git\\",
+		"\\node_modules\\",
+		"cursor\\user\\workspacestorage",
+		"globalstorage",
+		"anysphere.cursor",
+	}
 }
 
-// AssessSeverity đánh giá mức độ nghiêm trọng của threat
 func (sa *SeverityAssessor) AssessSeverity(threat *models.ThreatInfo) int {
 	sa.logger.Debug("Assessing severity for threat: %s", threat.ThreatName)
 
-	// Start with base severity from threat info
+	// Start with base severity
 	severity := threat.Severity
 	if severity == 0 {
 		severity = 3 // Default medium severity
 	}
 
-	// Clamp severity for known benign/environmental detections (anti-debug/vm)
-	tn := strings.ToLower(threat.ThreatName)
-	if strings.Contains(tn, "vmdetect") ||
-		strings.Contains(tn, "anti_dbg") ||
-		strings.Contains(tn, "debuggercheck") ||
-		strings.Contains(tn, "debuggerexception") ||
-		strings.Contains(tn, "threadcontrol") ||
-		strings.Contains(tn, "seh__vectored") ||
-		strings.Contains(tn, "check_outputdebugstringa") {
-		// Cap to LOW to avoid auto-quarantine/emergency for environment rules
+	// CRITICAL: Apply environmental rule suppression FIRST
+	if sa.isEnvironmentalDetection(threat) {
+		// Environmental detections on system paths get very low severity
 		severity = 1
+		sa.logger.Debug("Environmental detection on system path, setting severity to 1: %s", threat.ThreatName)
+		return severity
 	}
+
+	// Apply other assessment factors only for non-environmental detections
 
 	// Factor 1: Malware family analysis
 	familySeverity := sa.assessMalwareFamily(threat.ThreatName)
@@ -182,6 +220,14 @@ func (sa *SeverityAssessor) AssessSeverity(threat *models.ThreatInfo) int {
 		severity = mitreSeverity
 	}
 
+	// Final adjustment for system paths (reduce by 1 level)
+	if sa.isSystemPath(threat.FilePath) {
+		if severity > 1 {
+			severity--
+		}
+		sa.logger.Debug("System path detected, reducing severity by 1: %s", threat.FilePath)
+	}
+
 	// Ensure severity is within valid range (1-5)
 	if severity < 1 {
 		severity = 1
@@ -193,7 +239,38 @@ func (sa *SeverityAssessor) AssessSeverity(threat *models.ThreatInfo) int {
 	return severity
 }
 
-// assessMalwareFamily đánh giá severity dựa trên malware family
+func (sa *SeverityAssessor) isEnvironmentalDetection(threat *models.ThreatInfo) bool {
+	threatNameLower := strings.ToLower(threat.ThreatName)
+
+	// Check if rule name matches environmental patterns
+	for envRule := range sa.environmentalRules {
+		if strings.Contains(threatNameLower, envRule) {
+			// Check if it's on a system path
+			if sa.isSystemPath(threat.FilePath) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func (sa *SeverityAssessor) isSystemPath(filePath string) bool {
+	if filePath == "" {
+		return false
+	}
+
+	lowerPath := strings.ToLower(filePath)
+
+	for _, sysPath := range sa.systemPaths {
+		if strings.Contains(lowerPath, strings.ToLower(sysPath)) {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (sa *SeverityAssessor) assessMalwareFamily(threatName string) int {
 	threatNameLower := strings.ToLower(threatName)
 
@@ -207,7 +284,6 @@ func (sa *SeverityAssessor) assessMalwareFamily(threatName string) int {
 	return 3 // Default medium severity
 }
 
-// assessThreatType đánh giá severity dựa trên threat type
 func (sa *SeverityAssessor) assessThreatType(threatType string) int {
 	if severity, exists := sa.threatTypes[strings.ToLower(threatType)]; exists {
 		sa.logger.Debug("Threat type match: %s -> severity %d", threatType, severity)
@@ -217,9 +293,11 @@ func (sa *SeverityAssessor) assessThreatType(threatType string) int {
 	return 3 // Default medium severity
 }
 
-// assessFileExtension đánh giá severity dựa trên file extension
 func (sa *SeverityAssessor) assessFileExtension(filePath string) int {
-	// Extract file extension
+	if filePath == "" {
+		return 2
+	}
+
 	lastDot := strings.LastIndex(filePath, ".")
 	if lastDot == -1 {
 		return 2 // No extension, low severity
@@ -235,8 +313,11 @@ func (sa *SeverityAssessor) assessFileExtension(filePath string) int {
 	return 2 // Unknown extension, low severity
 }
 
-// assessProcessName đánh giá severity dựa trên process name
 func (sa *SeverityAssessor) assessProcessName(processName string) int {
+	if processName == "" {
+		return 2
+	}
+
 	processNameLower := strings.ToLower(processName)
 
 	if severity, exists := sa.processNames[processNameLower]; exists {
@@ -247,7 +328,6 @@ func (sa *SeverityAssessor) assessProcessName(processName string) int {
 	return 2 // Unknown process, low severity
 }
 
-// assessMITRETechnique đánh giá severity dựa trên MITRE technique
 func (sa *SeverityAssessor) assessMITRETechnique(technique string) int {
 	if technique == "" {
 		return 3 // No MITRE technique, medium severity
@@ -255,32 +335,27 @@ func (sa *SeverityAssessor) assessMITRETechnique(technique string) int {
 
 	techniqueLower := strings.ToLower(technique)
 
-	// High severity MITRE techniques
-	highSeverityTechniques := []string{
+	// Critical severity MITRE techniques
+	criticalSeverityTechniques := []string{
+		"t1059", // Command and Scripting Interpreter
 		"t1055", // Process Injection
 		"t1053", // Scheduled Task/Job
+		"t1031", // Modify System Image
+		"t1027", // Obfuscated Files or Information
+		"t1003", // OS Credential Dumping
+		"t1000", // Data Encrypted
+	}
+
+	// High severity MITRE techniques
+	highSeverityTechniques := []string{
 		"t1050", // New Service
 		"t1037", // Boot or Logon Initialization Scripts
 		"t1036", // Masquerading
-		"t1027", // Obfuscated Files or Information
 		"t1021", // Remote Services
 		"t1018", // Remote System Discovery
 		"t1016", // System Network Configuration Discovery
 		"t1012", // Query Registry
-		"t1003", // OS Credential Dumping
 		"t1001", // Data Obfuscation
-	}
-
-	// Critical severity MITRE techniques
-	criticalSeverityTechniques := []string{
-		"t1059", // Command and Scripting Interpreter
-		"t1053", // Scheduled Task/Job
-		"t1031", // Modify System Image
-		"t1027", // Obfuscated Files or Information
-		"t1018", // Remote System Discovery
-		"t1003", // OS Credential Dumping
-		"t1001", // Data Obfuscation
-		"t1000", // Data Encrypted
 	}
 
 	for _, tech := range criticalSeverityTechniques {
@@ -300,7 +375,6 @@ func (sa *SeverityAssessor) assessMITRETechnique(technique string) int {
 	return 3 // Default medium severity for MITRE techniques
 }
 
-// adjustByConfidence điều chỉnh severity dựa trên confidence score
 func (sa *SeverityAssessor) adjustByConfidence(severity int, confidence float64) int {
 	if confidence >= 0.9 {
 		// High confidence: increase severity by 1
@@ -317,11 +391,10 @@ func (sa *SeverityAssessor) adjustByConfidence(severity int, confidence float64)
 	return severity
 }
 
-// GetSeverityDescription trả về mô tả severity level
 func (sa *SeverityAssessor) GetSeverityDescription(severity int) string {
 	switch severity {
 	case 1:
-		return "Low - Suspicious activity detected"
+		return "Low - Environmental/Informational detection"
 	case 2:
 		return "Low-Medium - Potentially unwanted behavior"
 	case 3:
@@ -335,10 +408,11 @@ func (sa *SeverityAssessor) GetSeverityDescription(severity int) string {
 	}
 }
 
-// GetSeverityColor trả về màu sắc cho severity level
 func (sa *SeverityAssessor) GetSeverityColor(severity int) string {
 	switch severity {
-	case 1, 2:
+	case 1:
+		return "lightgray"
+	case 2:
 		return "yellow"
 	case 3:
 		return "orange"
@@ -351,11 +425,12 @@ func (sa *SeverityAssessor) GetSeverityColor(severity int) string {
 	}
 }
 
-// GetRecommendedAction trả về hành động được khuyến nghị
 func (sa *SeverityAssessor) GetRecommendedAction(severity int) string {
 	switch severity {
-	case 1, 2:
-		return "Monitor and log for analysis"
+	case 1:
+		return "Monitor only - likely false positive"
+	case 2:
+		return "Log and analyze - low priority"
 	case 3:
 		return "Prompt user for decision"
 	case 4:
@@ -365,4 +440,20 @@ func (sa *SeverityAssessor) GetRecommendedAction(severity int) string {
 	default:
 		return "Unknown action"
 	}
+}
+
+// GetEnvironmentalRules returns the list of environmental rules
+func (sa *SeverityAssessor) GetEnvironmentalRules() map[string]bool {
+	return sa.environmentalRules
+}
+
+// IsEnvironmentalRule checks if a rule name is environmental
+func (sa *SeverityAssessor) IsEnvironmentalRule(ruleName string) bool {
+	ruleNameLower := strings.ToLower(ruleName)
+	for envRule := range sa.environmentalRules {
+		if strings.Contains(ruleNameLower, envRule) {
+			return true
+		}
+	}
+	return false
 }

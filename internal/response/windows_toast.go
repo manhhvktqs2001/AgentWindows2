@@ -1,6 +1,3 @@
-// File: internal/response/windows_toast.go
-// SIMPLE: Windows Native Toast Notification - Bottom Right Corner
-
 package response
 
 import (
@@ -16,13 +13,15 @@ import (
 	"edr-agent-windows/internal/utils"
 )
 
-// WindowsToastNotifier displays native Windows notifications
 type WindowsToastNotifier struct {
-	config *config.ResponseConfig
-	logger *utils.Logger
+	config             *config.ResponseConfig
+	logger             *utils.Logger
+	notificationCount  int
+	failureCount       int
+	lastNotification   time.Time
+	disableNotifications bool
 }
 
-// NewWindowsToastNotifier creates a new Windows toast notifier
 func NewWindowsToastNotifier(cfg *config.ResponseConfig, logger *utils.Logger) *WindowsToastNotifier {
 	return &WindowsToastNotifier{
 		config: cfg,
@@ -30,89 +29,159 @@ func NewWindowsToastNotifier(cfg *config.ResponseConfig, logger *utils.Logger) *
 	}
 }
 
-// Start initializes the Windows toast notifier
 func (wtn *WindowsToastNotifier) Start() error {
-	wtn.logger.Info("Starting Windows Native Toast Notification System...")
+	wtn.logger.Debug("Starting Windows Toast Notification System...")
+	
+	// Test if PowerShell is available
+	if !wtn.isPowerShellAvailable() {
+		wtn.logger.Warn("PowerShell not available, notifications may be limited")
+	}
+	
 	return nil
 }
 
-// Stop stops the Windows toast notifier
 func (wtn *WindowsToastNotifier) Stop() {
-	wtn.logger.Info("Windows Toast Notification system stopped")
+	wtn.logger.Debug("Windows Toast Notification system stopped")
 }
 
-// SendNotification displays native Windows notification
 func (wtn *WindowsToastNotifier) SendNotification(content *NotificationContent) error {
-	// Normalize/augment title and message to match the desired balloon style
-	title := strings.TrimSpace(content.Title)
-	message := strings.TrimSpace(content.Message)
+	// Rate limiting
+	if wtn.disableNotifications {
+		wtn.logger.Debug("Notifications disabled due to repeated failures")
+		return fmt.Errorf("notifications disabled")
+	}
+
+	// Prevent spam
+	if time.Since(wtn.lastNotification) < 2*time.Second {
+		wtn.logger.Debug("Rate limiting notification")
+		return nil
+	}
+
+	wtn.lastNotification = time.Now()
+	wtn.notificationCount++
+
+	// Clean and validate content
+	title := wtn.cleanString(content.Title)
+	message := wtn.cleanString(content.Message)
+	
+	if title == "" {
+		title = "EDR Security Alert"
+	}
+	
+	if message == "" {
+		message = "Security event detected"
+	}
+
+	// Enhance content based on threat info
 	if content.ThreatInfo != nil {
 		rule := wtn.cleanString(content.ThreatInfo.ThreatName)
-		filePath := wtn.cleanString(content.ThreatInfo.FilePath)
-		description := wtn.cleanString(content.ThreatInfo.Description)
-
-		// Force title format: EDR Security Alert - <rule>
-		title = fmt.Sprintf("EDR Security Alert - %s", rule)
-
-		// Force message format: lines matching screenshot style
-		sevText := wtn.getSeverityText(content.Severity)
-		message = fmt.Sprintf("A Security Threat Detected\nThreat: %s\nSeverity: %s", rule, sevText)
-		_ = filePath
-		_ = description
-	}
-
-	// Apply back after cleaning
-	content.Title = wtn.cleanString(title)
-	content.Message = wtn.cleanString(message)
-
-	wtn.logger.Info("🚨 DISPLAYING SECURITY ALERT: %s", content.Title)
-
-	// Print to console immediately
-	fmt.Printf("\n🚨🚨🚨 SECURITY ALERT 🚨🚨🚨\n")
-	fmt.Printf("Title: %s\n", content.Title)
-	fmt.Printf("Severity: %s\n", wtn.getSeverityText(content.Severity))
-	if content.ThreatInfo != nil {
-		fmt.Printf("Rule: %s\n", content.ThreatInfo.ThreatName)
-		if content.ThreatInfo.FilePath != "" {
-			fmt.Printf("File: %s\n", content.ThreatInfo.FilePath)
+		if rule != "" {
+			title = fmt.Sprintf("EDR Security Alert - %s", rule)
 		}
+		
+		sevText := wtn.getSeverityText(content.Severity)
+		message = fmt.Sprintf("Threat: %s\nSeverity: %s\nTime: %s", 
+			rule, sevText, time.Now().Format("15:04:05"))
 	}
-	fmt.Printf("Time: %s\n", time.Now().Format("15:04:05"))
-	fmt.Printf("🚨🚨🚨 END ALERT 🚨🚨🚨\n\n")
-	os.Stdout.Sync()
 
-	// Prefer WPF corner popup (bottom-right), then system tray balloon (3s), then native toast
-	if err := wtn.showWpfCornerPopup(content); err == nil {
-		wtn.logger.Info("✅ WPF corner popup displayed")
+	// Apply length limits
+	if len(title) > 100 {
+		title = title[:100] + "..."
+	}
+	if len(message) > 200 {
+		message = message[:200] + "..."
+	}
+
+	wtn.logger.Info("🚨 DISPLAYING SECURITY ALERT: %s", title)
+
+	// Console output for immediate visibility
+	wtn.showConsoleAlert(title, message, content.Severity)
+
+	// Try notification methods in order of preference
+	var lastErr error
+	
+	// Method 1: Try WPF corner popup (most visible)
+	if err := wtn.showWpfCornerPopupSafe(title, message, content.Severity); err == nil {
+		wtn.logger.Debug("✅ WPF corner popup displayed")
+		wtn.resetFailureCount()
 		return nil
 	} else {
+		lastErr = err
 		wtn.logger.Debug("WPF corner popup failed: %v", err)
 	}
 
-	if err := wtn.showSystemBalloon(content); err == nil {
-		wtn.logger.Info("✅ System balloon displayed")
+	// Method 2: Try system balloon
+	if err := wtn.showSystemBalloonSafe(title, message); err == nil {
+		wtn.logger.Debug("✅ System balloon displayed")
+		wtn.resetFailureCount()
 		return nil
 	} else {
+		lastErr = err
 		wtn.logger.Debug("System balloon failed: %v", err)
 	}
 
-	if err := wtn.showNativeToast(content); err == nil {
-		wtn.logger.Info("✅ Native toast displayed")
+	// Method 3: Try native toast
+	if err := wtn.showNativeToastSafe(title, message); err == nil {
+		wtn.logger.Debug("✅ Native toast displayed")
+		wtn.resetFailureCount()
 		return nil
 	} else {
+		lastErr = err
 		wtn.logger.Debug("Native toast failed: %v", err)
 	}
 
+	// Method 4: Try simple message box
+	if err := wtn.showMessageBoxSafe(title, message); err == nil {
+		wtn.logger.Debug("✅ Message box displayed")
+		wtn.resetFailureCount()
+		return nil
+	} else {
+		lastErr = err
+		wtn.logger.Debug("Message box failed: %v", err)
+	}
+
+	// All methods failed
+	wtn.handleNotificationFailure(lastErr)
 	return fmt.Errorf("failed to display notification via wpf, balloon, or toast")
 }
 
-// showWpfCornerPopup shows a lightweight WPF window at bottom-right for ~3s
-func (wtn *WindowsToastNotifier) showWpfCornerPopup(content *NotificationContent) error {
-	title := wtn.cleanString(content.Title)
-	message := wtn.cleanString(content.Message)
+func (wtn *WindowsToastNotifier) showConsoleAlert(title, message string, severity int) {
+	icon := "🔔"
+	switch severity {
+	case 5:
+		icon = "🚨"
+	case 4:
+		icon = "🟠"
+	case 3:
+		icon = "🟡"
+	}
 
-	if len(message) > 180 {
-		message = message[:180] + "..."
+	fmt.Printf("\n%s %s %s\n", icon, icon, icon)
+	fmt.Printf("Title: %s\n", title)
+	fmt.Printf("Message: %s\n", message)
+	fmt.Printf("Time: %s\n", time.Now().Format("15:04:05"))
+	fmt.Printf("%s %s %s\n\n", icon, icon, icon)
+	os.Stdout.Sync()
+}
+
+func (wtn *WindowsToastNotifier) showWpfCornerPopupSafe(title, message string, severity int) error {
+	if !wtn.isPowerShellAvailable() {
+		return fmt.Errorf("PowerShell not available")
+	}
+
+	// Determine colors based on severity
+	bgColor := "30, 30, 30"
+	titleColor := "Orange"
+	switch severity {
+	case 5:
+		bgColor = "60, 20, 20"
+		titleColor = "Red"
+	case 4:
+		bgColor = "60, 40, 20"
+		titleColor = "Orange"
+	case 3:
+		bgColor = "40, 40, 20"
+		titleColor = "Yellow"
 	}
 
 	psScript := fmt.Sprintf(`
@@ -123,7 +192,7 @@ Add-Type -AssemblyName WindowsBase
 try {
     $screen = [System.Windows.SystemParameters]::WorkArea
     $width = 380
-    $height = 110
+    $height = 120
 
     $window = New-Object System.Windows.Window
     $window.Width = $width
@@ -132,101 +201,70 @@ try {
     $window.ResizeMode = 'NoResize'
     $window.Topmost = $true
     $window.AllowsTransparency = $true
-    $window.Background = [System.Windows.Media.SolidColorBrush]([System.Windows.Media.Color]::FromArgb(230, 30, 30, 30))
-    $window.Left = $screen.Right - $width - 12
-    $window.Top  = $screen.Bottom - $height - 12
+    $window.Background = [System.Windows.Media.SolidColorBrush]([System.Windows.Media.Color]::FromArgb(240, %s))
+    $window.Left = $screen.Right - $width - 15
+    $window.Top  = $screen.Bottom - $height - 15
+
+    $border = New-Object System.Windows.Controls.Border
+    $border.BorderBrush = [System.Windows.Media.Brushes]::%s
+    $border.BorderThickness = 2
+    $border.CornerRadius = 5
+    $border.Margin = '5'
 
     $grid = New-Object System.Windows.Controls.Grid
-    $grid.Margin = '12'
-
+    $grid.Margin = '10'
     $grid.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition))
     $grid.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition))
 
     $titleBlock = New-Object System.Windows.Controls.TextBlock
     $titleBlock.Text = '%s'
-    $titleBlock.FontSize = 16
+    $titleBlock.FontSize = 14
     $titleBlock.FontWeight = 'Bold'
-    $titleBlock.Foreground = [System.Windows.Media.Brushes]::Orange
+    $titleBlock.Foreground = [System.Windows.Media.Brushes]::%s
+    $titleBlock.TextWrapping = 'Wrap'
     [System.Windows.Controls.Grid]::SetRow($titleBlock, 0)
     $grid.Children.Add($titleBlock) | Out-Null
 
     $msgBlock = New-Object System.Windows.Controls.TextBlock
     $msgBlock.Text = '%s'
-    $msgBlock.Margin = '0,6,0,0'
+    $msgBlock.Margin = '0,5,0,0'
+    $msgBlock.FontSize = 11
     $msgBlock.TextWrapping = 'Wrap'
-    $msgBlock.Foreground = [System.Windows.Media.Brushes]::White
+    $msgBlock.Foreground = [System.Windows.Media.Brushes]::LightGray
     [System.Windows.Controls.Grid]::SetRow($msgBlock, 1)
     $grid.Children.Add($msgBlock) | Out-Null
 
-    $window.Content = $grid
+    $border.Child = $grid
+    $window.Content = $border
 
     $timer = New-Object System.Windows.Threading.DispatcherTimer
-    $timer.Interval = [TimeSpan]::FromMilliseconds(3200)
-    $timer.Add_Tick({ $timer.Stop(); $window.Close() })
+    $timer.Interval = [TimeSpan]::FromMilliseconds(4000)
+    $timer.Add_Tick({ 
+        $timer.Stop()
+        $window.Close()
+    })
 
-    $window.Add_ContentRendered({ $timer.Start() })
-    $window.Show()
-    [System.Windows.Threading.Dispatcher]::Run()
+    $window.Add_ContentRendered({ 
+        $timer.Start()
+    })
+    
+    $window.Add_MouseLeftButtonDown({
+        $window.Close()
+    })
+
+    $window.ShowDialog() | Out-Null
     exit 0
 } catch {
     exit 1
 }
-`, title, message)
+`, bgColor, titleColor, title, titleColor, message)
 
-	return wtn.runPowerShell(psScript)
+	return wtn.runPowerShellSafe(psScript, 8*time.Second)
 }
 
-// showNativeToast shows Windows 10+ native toast notification
-func (wtn *WindowsToastNotifier) showNativeToast(content *NotificationContent) error {
-	title := wtn.cleanString(content.Title)
-	message := wtn.cleanString(content.Message)
-
-	// Keep message short for toast
-	if len(message) > 80 {
-		message = message[:80] + "..."
-	}
-
-	// Use PowerShell to show Windows 10 toast
-	psScript := fmt.Sprintf(`
-$null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
-$null = [Windows.UI.Notifications.ToastNotification, Windows.UI.Notifications, ContentType = WindowsRuntime]
-$null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
-
-$template = @"
-<toast duration="short">
-    <visual>
-        <binding template="ToastGeneric">
-            <text>%s</text>
-            <text>%s</text>
-        </binding>
-    </visual>
-    <audio silent="false"/>
-</toast>
-"@
-
-try {
-    $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
-    $xml.LoadXml($template)
-    $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
-    $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("EDR Security Agent")
-    $notifier.Show($toast)
-    exit 0
-} catch {
-    exit 1
-}
-`, title, message)
-
-	return wtn.runPowerShell(psScript)
-}
-
-// showSystemBalloon shows system tray balloon notification
-func (wtn *WindowsToastNotifier) showSystemBalloon(content *NotificationContent) error {
-	title := wtn.cleanString(content.Title)
-	message := wtn.cleanString(content.Message)
-
-	// Keep message short for balloon
-	if len(message) > 120 {
-		message = message[:120] + "..."
+func (wtn *WindowsToastNotifier) showSystemBalloonSafe(title, message string) error {
+	if !wtn.isPowerShellAvailable() {
+		return fmt.Errorf("PowerShell not available")
 	}
 
 	psScript := fmt.Sprintf(`
@@ -237,12 +275,12 @@ try {
     $icon = New-Object System.Windows.Forms.NotifyIcon
     $icon.Icon = [System.Drawing.SystemIcons]::Warning
     $icon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Warning
-    $icon.BalloonTipTitle = "%s"
-    $icon.BalloonTipText = "%s"
+    $icon.BalloonTipTitle = '%s'
+    $icon.BalloonTipText = '%s'
     $icon.Visible = $true
 
     $timer = New-Object System.Windows.Forms.Timer
-    $timer.Interval = 3500
+    $timer.Interval = 4000
     $timer.Add_Tick({
         $timer.Stop()
         $icon.Visible = $false
@@ -259,36 +297,52 @@ try {
 }
 `, title, message)
 
-	return wtn.runPowerShell(psScript)
+	return wtn.runPowerShellSafe(psScript, 6*time.Second)
 }
 
-// showSimpleNotification shows a simple notification using msg command
-func (wtn *WindowsToastNotifier) showSimpleNotification(content *NotificationContent) {
-	title := wtn.cleanString(content.Title)
-	message := wtn.cleanString(content.Message)
-
-	// Keep message very short
-	if len(message) > 100 {
-		message = message[:100] + "..."
+func (wtn *WindowsToastNotifier) showNativeToastSafe(title, message string) error {
+	if !wtn.isPowerShellAvailable() {
+		return fmt.Errorf("PowerShell not available")
 	}
 
-	// Use Windows msg command as last resort
-	cmd := exec.Command("msg", "*", fmt.Sprintf("%s\n\n%s", title, message))
-	cmd.Run()
+	psScript := fmt.Sprintf(`
+try {
+    $null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+    $null = [Windows.UI.Notifications.ToastNotification, Windows.UI.Notifications, ContentType = WindowsRuntime]
+    $null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
+
+    $template = @"
+<toast duration="short">
+    <visual>
+        <binding template="ToastGeneric">
+            <text>%s</text>
+            <text>%s</text>
+        </binding>
+    </visual>
+    <audio silent="false"/>
+</toast>
+"@
+
+    $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+    $xml.LoadXml($template)
+    $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
+    $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("EDR Security Agent")
+    $notifier.Show($toast)
+    Start-Sleep -Seconds 1
+    exit 0
+} catch {
+    exit 1
+}
+`, title, message)
+
+	return wtn.runPowerShellSafe(psScript, 5*time.Second)
 }
 
-// runPowerShell executes PowerShell script with timeout
-func (wtn *WindowsToastNotifier) runPowerShell(script string) error {
-	cmd := exec.Command("powershell.exe",
-		"-WindowStyle", "Hidden",
-		"-ExecutionPolicy", "Bypass",
-		"-Sta",
-		"-NoProfile",
-		"-Command", script)
-
+func (wtn *WindowsToastNotifier) showMessageBoxSafe(title, message string) error {
+	// Use Windows API directly for message box
+	cmd := exec.Command("cmd", "/C", "echo.", "&&", "msg", "*", fmt.Sprintf("%s\n\n%s", title, message))
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-
-	// Run with timeout
+	
 	done := make(chan error, 1)
 	go func() {
 		done <- cmd.Run()
@@ -297,7 +351,7 @@ func (wtn *WindowsToastNotifier) runPowerShell(script string) error {
 	select {
 	case err := <-done:
 		return err
-	case <-time.After(5 * time.Second):
+	case <-time.After(3 * time.Second):
 		if cmd.Process != nil {
 			cmd.Process.Kill()
 		}
@@ -305,11 +359,475 @@ func (wtn *WindowsToastNotifier) runPowerShell(script string) error {
 	}
 }
 
-// cleanString cleans string for safe use in PowerShell
+func (wtn *WindowsToastNotifier) runPowerShellSafe(script string, timeout time.Duration) error {
+	cmd := exec.Command("powershell.exe",
+		"-WindowStyle", "Hidden",
+		"-ExecutionPolicy", "Bypass",
+		"-Sta",
+		"-NoProfile",
+		"-NonInteractive",
+		"-Command", script)
+
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Run()
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+		return fmt.Errorf("timeout")
+	}
+}
+
+func (wtn *WindowsToastNotifier) isPowerShellAvailable() bool {
+	cmd := exec.Command("powershell.exe", "-Command", "exit 0")
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	err := cmd.Run()
+	return err == nil
+}
+
+func (wtn *WindowsToastNotifier) handleNotificationFailure(err error) {
+	wtn.failureCount++
+	wtn.logger.Warn("Notification failure %d: %v", wtn.failureCount, err)
+	
+	// Disable notifications after too many failures
+	if wtn.failureCount >= 10 {
+		wtn.disableNotifications = true
+		wtn.logger.Error("Disabling notifications due to repeated failures")
+	}
+}
+
+func (wtn *WindowsToastNotifier) resetFailureCount() {
+	if wtn.failureCount > 0 {
+		wtn.failureCount = 0
+		wtn.disableNotifications = false
+	}
+}
+
 func (wtn *WindowsToastNotifier) cleanString(input string) string {
-	// Remove problematic characters
+	// Remove problematic characters for PowerShell
 	input = strings.ReplaceAll(input, `"`, `'`)
-	input = strings.ReplaceAll(input, `$`, `USD`)
+	input = strings.ReplaceAll(input, `package response
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+	"syscall"
+	"time"
+
+	"edr-agent-windows/internal/config"
+	"edr-agent-windows/internal/models"
+	"edr-agent-windows/internal/utils"
+)
+
+type WindowsToastNotifier struct {
+	config             *config.ResponseConfig
+	logger             *utils.Logger
+	notificationCount  int
+	failureCount       int
+	lastNotification   time.Time
+	disableNotifications bool
+}
+
+func NewWindowsToastNotifier(cfg *config.ResponseConfig, logger *utils.Logger) *WindowsToastNotifier {
+	return &WindowsToastNotifier{
+		config: cfg,
+		logger: logger,
+	}
+}
+
+func (wtn *WindowsToastNotifier) Start() error {
+	wtn.logger.Debug("Starting Windows Toast Notification System...")
+	
+	// Test if PowerShell is available
+	if !wtn.isPowerShellAvailable() {
+		wtn.logger.Warn("PowerShell not available, notifications may be limited")
+	}
+	
+	return nil
+}
+
+func (wtn *WindowsToastNotifier) Stop() {
+	wtn.logger.Debug("Windows Toast Notification system stopped")
+}
+
+func (wtn *WindowsToastNotifier) SendNotification(content *NotificationContent) error {
+	// Rate limiting
+	if wtn.disableNotifications {
+		wtn.logger.Debug("Notifications disabled due to repeated failures")
+		return fmt.Errorf("notifications disabled")
+	}
+
+	// Prevent spam
+	if time.Since(wtn.lastNotification) < 2*time.Second {
+		wtn.logger.Debug("Rate limiting notification")
+		return nil
+	}
+
+	wtn.lastNotification = time.Now()
+	wtn.notificationCount++
+
+	// Clean and validate content
+	title := wtn.cleanString(content.Title)
+	message := wtn.cleanString(content.Message)
+	
+	if title == "" {
+		title = "EDR Security Alert"
+	}
+	
+	if message == "" {
+		message = "Security event detected"
+	}
+
+	// Enhance content based on threat info
+	if content.ThreatInfo != nil {
+		rule := wtn.cleanString(content.ThreatInfo.ThreatName)
+		if rule != "" {
+			title = fmt.Sprintf("EDR Security Alert - %s", rule)
+		}
+		
+		sevText := wtn.getSeverityText(content.Severity)
+		message = fmt.Sprintf("Threat: %s\nSeverity: %s\nTime: %s", 
+			rule, sevText, time.Now().Format("15:04:05"))
+	}
+
+	// Apply length limits
+	if len(title) > 100 {
+		title = title[:100] + "..."
+	}
+	if len(message) > 200 {
+		message = message[:200] + "..."
+	}
+
+	wtn.logger.Info("🚨 DISPLAYING SECURITY ALERT: %s", title)
+
+	// Console output for immediate visibility
+	wtn.showConsoleAlert(title, message, content.Severity)
+
+	// Try notification methods in order of preference
+	var lastErr error
+	
+	// Method 1: Try WPF corner popup (most visible)
+	if err := wtn.showWpfCornerPopupSafe(title, message, content.Severity); err == nil {
+		wtn.logger.Debug("✅ WPF corner popup displayed")
+		wtn.resetFailureCount()
+		return nil
+	} else {
+		lastErr = err
+		wtn.logger.Debug("WPF corner popup failed: %v", err)
+	}
+
+	// Method 2: Try system balloon
+	if err := wtn.showSystemBalloonSafe(title, message); err == nil {
+		wtn.logger.Debug("✅ System balloon displayed")
+		wtn.resetFailureCount()
+		return nil
+	} else {
+		lastErr = err
+		wtn.logger.Debug("System balloon failed: %v", err)
+	}
+
+	// Method 3: Try native toast
+	if err := wtn.showNativeToastSafe(title, message); err == nil {
+		wtn.logger.Debug("✅ Native toast displayed")
+		wtn.resetFailureCount()
+		return nil
+	} else {
+		lastErr = err
+		wtn.logger.Debug("Native toast failed: %v", err)
+	}
+
+	// Method 4: Try simple message box
+	if err := wtn.showMessageBoxSafe(title, message); err == nil {
+		wtn.logger.Debug("✅ Message box displayed")
+		wtn.resetFailureCount()
+		return nil
+	} else {
+		lastErr = err
+		wtn.logger.Debug("Message box failed: %v", err)
+	}
+
+	// All methods failed
+	wtn.handleNotificationFailure(lastErr)
+	return fmt.Errorf("failed to display notification via wpf, balloon, or toast")
+}
+
+func (wtn *WindowsToastNotifier) showConsoleAlert(title, message string, severity int) {
+	icon := "🔔"
+	switch severity {
+	case 5:
+		icon = "🚨"
+	case 4:
+		icon = "🟠"
+	case 3:
+		icon = "🟡"
+	}
+
+	fmt.Printf("\n%s %s %s\n", icon, icon, icon)
+	fmt.Printf("Title: %s\n", title)
+	fmt.Printf("Message: %s\n", message)
+	fmt.Printf("Time: %s\n", time.Now().Format("15:04:05"))
+	fmt.Printf("%s %s %s\n\n", icon, icon, icon)
+	os.Stdout.Sync()
+}
+
+func (wtn *WindowsToastNotifier) showWpfCornerPopupSafe(title, message string, severity int) error {
+	if !wtn.isPowerShellAvailable() {
+		return fmt.Errorf("PowerShell not available")
+	}
+
+	// Determine colors based on severity
+	bgColor := "30, 30, 30"
+	titleColor := "Orange"
+	switch severity {
+	case 5:
+		bgColor = "60, 20, 20"
+		titleColor = "Red"
+	case 4:
+		bgColor = "60, 40, 20"
+		titleColor = "Orange"
+	case 3:
+		bgColor = "40, 40, 20"
+		titleColor = "Yellow"
+	}
+
+	psScript := fmt.Sprintf(`
+Add-Type -AssemblyName PresentationFramework
+Add-Type -AssemblyName PresentationCore
+Add-Type -AssemblyName WindowsBase
+
+try {
+    $screen = [System.Windows.SystemParameters]::WorkArea
+    $width = 380
+    $height = 120
+
+    $window = New-Object System.Windows.Window
+    $window.Width = $width
+    $window.Height = $height
+    $window.WindowStyle = 'None'
+    $window.ResizeMode = 'NoResize'
+    $window.Topmost = $true
+    $window.AllowsTransparency = $true
+    $window.Background = [System.Windows.Media.SolidColorBrush]([System.Windows.Media.Color]::FromArgb(240, %s))
+    $window.Left = $screen.Right - $width - 15
+    $window.Top  = $screen.Bottom - $height - 15
+
+    $border = New-Object System.Windows.Controls.Border
+    $border.BorderBrush = [System.Windows.Media.Brushes]::%s
+    $border.BorderThickness = 2
+    $border.CornerRadius = 5
+    $border.Margin = '5'
+
+    $grid = New-Object System.Windows.Controls.Grid
+    $grid.Margin = '10'
+    $grid.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition))
+    $grid.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition))
+
+    $titleBlock = New-Object System.Windows.Controls.TextBlock
+    $titleBlock.Text = '%s'
+    $titleBlock.FontSize = 14
+    $titleBlock.FontWeight = 'Bold'
+    $titleBlock.Foreground = [System.Windows.Media.Brushes]::%s
+    $titleBlock.TextWrapping = 'Wrap'
+    [System.Windows.Controls.Grid]::SetRow($titleBlock, 0)
+    $grid.Children.Add($titleBlock) | Out-Null
+
+    $msgBlock = New-Object System.Windows.Controls.TextBlock
+    $msgBlock.Text = '%s'
+    $msgBlock.Margin = '0,5,0,0'
+    $msgBlock.FontSize = 11
+    $msgBlock.TextWrapping = 'Wrap'
+    $msgBlock.Foreground = [System.Windows.Media.Brushes]::LightGray
+    [System.Windows.Controls.Grid]::SetRow($msgBlock, 1)
+    $grid.Children.Add($msgBlock) | Out-Null
+
+    $border.Child = $grid
+    $window.Content = $border
+
+    $timer = New-Object System.Windows.Threading.DispatcherTimer
+    $timer.Interval = [TimeSpan]::FromMilliseconds(4000)
+    $timer.Add_Tick({ 
+        $timer.Stop()
+        $window.Close()
+    })
+
+    $window.Add_ContentRendered({ 
+        $timer.Start()
+    })
+    
+    $window.Add_MouseLeftButtonDown({
+        $window.Close()
+    })
+
+    $window.ShowDialog() | Out-Null
+    exit 0
+} catch {
+    exit 1
+}
+`, bgColor, titleColor, title, titleColor, message)
+
+	return wtn.runPowerShellSafe(psScript, 8*time.Second)
+}
+
+func (wtn *WindowsToastNotifier) showSystemBalloonSafe(title, message string) error {
+	if !wtn.isPowerShellAvailable() {
+		return fmt.Errorf("PowerShell not available")
+	}
+
+	psScript := fmt.Sprintf(`
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+try {
+    $icon = New-Object System.Windows.Forms.NotifyIcon
+    $icon.Icon = [System.Drawing.SystemIcons]::Warning
+    $icon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Warning
+    $icon.BalloonTipTitle = '%s'
+    $icon.BalloonTipText = '%s'
+    $icon.Visible = $true
+
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 4000
+    $timer.Add_Tick({
+        $timer.Stop()
+        $icon.Visible = $false
+        $icon.Dispose()
+        [System.Windows.Forms.Application]::Exit()
+    })
+
+    $icon.ShowBalloonTip(3000)
+    $timer.Start()
+    [System.Windows.Forms.Application]::Run()
+    exit 0
+} catch {
+    exit 1
+}
+`, title, message)
+
+	return wtn.runPowerShellSafe(psScript, 6*time.Second)
+}
+
+func (wtn *WindowsToastNotifier) showNativeToastSafe(title, message string) error {
+	if !wtn.isPowerShellAvailable() {
+		return fmt.Errorf("PowerShell not available")
+	}
+
+	psScript := fmt.Sprintf(`
+try {
+    $null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+    $null = [Windows.UI.Notifications.ToastNotification, Windows.UI.Notifications, ContentType = WindowsRuntime]
+    $null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
+
+    $template = @"
+<toast duration="short">
+    <visual>
+        <binding template="ToastGeneric">
+            <text>%s</text>
+            <text>%s</text>
+        </binding>
+    </visual>
+    <audio silent="false"/>
+</toast>
+"@
+
+    $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+    $xml.LoadXml($template)
+    $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
+    $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("EDR Security Agent")
+    $notifier.Show($toast)
+    Start-Sleep -Seconds 1
+    exit 0
+} catch {
+    exit 1
+}
+`, title, message)
+
+	return wtn.runPowerShellSafe(psScript, 5*time.Second)
+}
+
+func (wtn *WindowsToastNotifier) showMessageBoxSafe(title, message string) error {
+	// Use Windows API directly for message box
+	cmd := exec.Command("cmd", "/C", "echo.", "&&", "msg", "*", fmt.Sprintf("%s\n\n%s", title, message))
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Run()
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(3 * time.Second):
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+		return fmt.Errorf("timeout")
+	}
+}
+
+func (wtn *WindowsToastNotifier) runPowerShellSafe(script string, timeout time.Duration) error {
+	cmd := exec.Command("powershell.exe",
+		"-WindowStyle", "Hidden",
+		"-ExecutionPolicy", "Bypass",
+		"-Sta",
+		"-NoProfile",
+		"-NonInteractive",
+		"-Command", script)
+
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Run()
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+		return fmt.Errorf("timeout")
+	}
+}
+
+func (wtn *WindowsToastNotifier) isPowerShellAvailable() bool {
+	cmd := exec.Command("powershell.exe", "-Command", "exit 0")
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	err := cmd.Run()
+	return err == nil
+}
+
+func (wtn *WindowsToastNotifier) handleNotificationFailure(err error) {
+	wtn.failureCount++
+	wtn.logger.Warn("Notification failure %d: %v", wtn.failureCount, err)
+	
+	// Disable notifications after too many failures
+	if wtn.failureCount >= 10 {
+		wtn.disableNotifications = true
+		wtn.logger.Error("Disabling notifications due to repeated failures")
+	}
+}
+
+func (wtn *WindowsToastNotifier) resetFailureCount() {
+	if wtn.failureCount > 0 {
+		wtn.failureCount = 0
+		wtn.disableNotifications = false
+	}
+}
+
+, `USD`)
 	input = strings.ReplaceAll(input, "`", "'")
 	input = strings.ReplaceAll(input, "\n", " ")
 	input = strings.ReplaceAll(input, "\r", " ")
@@ -323,7 +841,6 @@ func (wtn *WindowsToastNotifier) cleanString(input string) string {
 	return strings.TrimSpace(input)
 }
 
-// getSeverityText returns severity text
 func (wtn *WindowsToastNotifier) getSeverityText(severity int) string {
 	switch severity {
 	case 1:
@@ -341,7 +858,6 @@ func (wtn *WindowsToastNotifier) getSeverityText(severity int) string {
 	}
 }
 
-// TestNotification sends a test notification
 func (wtn *WindowsToastNotifier) TestNotification() error {
 	content := &NotificationContent{
 		Title:     "EDR Security Test",
@@ -353,7 +869,6 @@ func (wtn *WindowsToastNotifier) TestNotification() error {
 	return wtn.SendNotification(content)
 }
 
-// TestYARAAlert sends a YARA alert test
 func (wtn *WindowsToastNotifier) TestYARAAlert() error {
 	content := &NotificationContent{
 		Title:     "YARA Threat Detected",
@@ -368,4 +883,15 @@ func (wtn *WindowsToastNotifier) TestYARAAlert() error {
 	}
 
 	return wtn.SendNotification(content)
+}
+
+// GetStats returns notification statistics
+func (wtn *WindowsToastNotifier) GetStats() map[string]interface{} {
+	return map[string]interface{}{
+		"notification_count":    wtn.notificationCount,
+		"failure_count":         wtn.failureCount,
+		"notifications_disabled": wtn.disableNotifications,
+		"last_notification":     wtn.lastNotification,
+		"powershell_available":  wtn.isPowerShellAvailable(),
+	}
 }

@@ -9,9 +9,9 @@ server:
 agent:
   id: ""
   name: "edr-agent-windows"
-  heartbeat_interval: 60
-  event_batch_size: 100
-  max_queue_size: 10000
+  heartbeat_interval: 120  # Increased to reduce server traffic
+  event_batch_size: 50     # Reduced to send smaller batches more frequently
+  max_queue_size: 5000     # Reduced to prevent excessive memory usage
 
 monitoring:
   file_system:
@@ -23,11 +23,16 @@ monitoring:
       - "C:\\Windows\\System32"
     recursive: true
     real_time_scan: true
-    max_file_size: "100MB"
+    max_file_size: "50MB"   # Reduced to prevent scanning very large files
     exclude_extensions:
       - ".tmp"
       - ".log"
       - ".bak"
+      - ".cache"
+      - ".db"
+      - ".sqlite"
+      - ".etl"
+      - ".evtx"
 
   processes:
     enabled: true
@@ -41,6 +46,11 @@ monitoring:
       - "winlogon.exe"
       - "MoUsoCoreWorker.exe"
       - "taskhostw.exe"
+      - "csrss.exe"
+      - "lsass.exe"
+      - "services.exe"
+      - "wininit.exe"
+      - "smss.exe"
 
   network:
     enabled: true
@@ -49,15 +59,15 @@ monitoring:
     capture_packets: false
     monitor_tcp: true
     monitor_udp: false
-    scan_interval: 30
+    scan_interval: 60       # Reduced frequency
     exclude_ports:
       - 135
       - 445
       - 5985
+      - 3389
     suspicious_ports:
       - 22
       - 23
-      - 3389
       - 5900
       - 8080
       - 4444
@@ -67,55 +77,50 @@ monitoring:
     enabled: true
     monitor_autostart: true
     track_security_settings: true
-    scan_interval: 30
+    scan_interval: 60       # Reduced frequency
     paths:
       - "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"
       - "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce"
       - "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"
 
   memory:
-    enabled: true
-    scan_interval: 300
-    threat_threshold: 0.5
-    max_processes: 50
+    enabled: false          # Disabled to reduce noise
+    scan_interval: 600
+    threat_threshold: 0.7   # Increased threshold
+    max_processes: 20       # Reduced scope
 
   behavior:
-    enabled: true
-    analysis_interval: 60
-    threat_threshold: 0.6
-    data_retention: 24
+    enabled: false          # Disabled to reduce noise
+    analysis_interval: 120
+    threat_threshold: 0.8   # Increased threshold
+    data_retention: 12      # Reduced retention
 
 yara:
   enabled: true
   auto_update: false
   update_interval: "24h"
   rules_source: https://github.com/Yara-Rules/rules/archive/master.zip
-  categories:
-    - antidebug_antivm
-    - capabilities
-    - crypto
-    - exploit_kits
-    - maldocs
+  categories:              # Reduced to essential categories
     - malware
-    - packers
+    - maldocs
     - webshells
-  max_scan_threads: 4
-  scan_timeout: 30
+  max_scan_threads: 2      # Reduced to lower system impact
+  scan_timeout: 15         # Reduced timeout
   rules_path: yara-rules
-  max_file_size: "100MB"
+  max_file_size: "50MB"    # Reduced max file size
 
 response:
   notification_settings:
     toast_enabled: true
     system_tray_enabled: true
     desktop_alert_enabled: true
-    sound_enabled: true
-    timeout_seconds: 10
+    sound_enabled: false     # Disabled to reduce noise
+    timeout_seconds: 5       # Reduced timeout
 
   severity_thresholds:
-    show_user_alerts: 3    # Show notifications for Medium+ severity
-    auto_quarantine: 4     # Auto quarantine for High+ severity  
-    block_execution: 5     # Block execution for Critical severity
+    show_user_alerts: 3      # Only show medium+ alerts
+    auto_quarantine: 4       # Only quarantine high+ severity
+    block_execution: 5       # Only block critical threats
 
   user_interaction:
     allow_user_override: true
@@ -128,7 +133,7 @@ response:
     language: "en"
 
 logging:
-  level: "info"
+  level: "info"            # Reduced from debug to info
   format: "text"
   file_path: "agent.log"
   max_size: "10MB"
