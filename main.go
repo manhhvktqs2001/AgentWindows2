@@ -240,7 +240,7 @@ func main() {
 		fmt.Printf("  Stealth Enabled: %v\n", stealthStatus["stealth_enabled"])
 		fmt.Printf("  Process Visible: %v\n", stealthStatus["process_visible"])
 		fmt.Printf("  Task Manager Visible: %v\n", stealthStatus["task_manager_visible"])
-		
+
 		if stealthStatus["stealth_enabled"].(bool) {
 			fmt.Println("✅ Process is HIDDEN from Task Manager (stealth mode)")
 			fmt.Println("🕵️  EDR Agent is running invisibly")
@@ -741,13 +741,35 @@ func testEnhancedNotifications(configPath string) {}
 func testCustomToast(message, configPath string)  {}
 func testAudioPatterns()                          {}
 func testYaraScanning(filePath string, cfg *config.Config, logger *utils.Logger) {
-	// Perform a no-op scan using the scanner to keep compatibility
-	ys := scanner.NewYaraScanner(&cfg.Yara, logger)
-	_ = ys
-}
+	fmt.Printf("🧪 Testing YARA scanning on file: %s\n", filePath)
 
-// Rest of the functions remain the same...
-// [Include all the remaining functions from the original main.go]
+	// Create YARA scanner
+	ys := scanner.NewYaraScanner(&cfg.Yara, logger)
+
+	// Load rules
+	if err := ys.LoadRules(); err != nil {
+		fmt.Printf("❌ Failed to load YARA rules: %v\n", err)
+		return
+	}
+
+	// Perform scan
+	fmt.Printf("🔍 Scanning file with YARA...\n")
+	result, err := ys.ScanFile(filePath)
+	if err != nil {
+		fmt.Printf("❌ YARA scan failed: %v\n", err)
+		return
+	}
+
+	if result != nil {
+		fmt.Printf("🚨 THREAT DETECTED!\n")
+		fmt.Printf("   Rule: %s\n", result.ThreatName)
+		fmt.Printf("   Severity: %d\n", result.Severity)
+		fmt.Printf("   File: %s\n", result.FilePath)
+		fmt.Printf("   Description: %s\n", result.Description)
+	} else {
+		fmt.Printf("✅ No threats detected in file\n")
+	}
+}
 
 // testNotificationSystem tests the notification system
 func testNotificationSystem(configPath string) {
@@ -829,6 +851,3 @@ func testSecurityAlert(configPath string) {
 	time.Sleep(5 * time.Second)
 	fmt.Println("🏁 Security alert test completed")
 }
-
-// Additional functions would continue here...
-// [Include all other functions from original main.go]

@@ -1,47 +1,35 @@
-# Safe EDR Agent Configuration
-# This configuration is designed to prevent system freezes and minimize system impact
+# EDR Agent Configuration for Windows
+# Optimized for performance and security monitoring
 
 server:
   url: "http://192.168.20.85:5000"
   api_key: "f93ac1d1d7b64f07bd32c81e6ab8423e4cb7631f2051c9d8a2d340c5be3a4a9e"
   auth_token: "edr_system_auth_2025"
   timeout: 30
-  retry_count: 2
+  retry_count: 3
   tls_verify: false
+  websocket_enabled: false
 
 agent:
   id: ""
-  name: "edr-agent-windows-safe"
-<<<<<<< HEAD
-  heartbeat_interval: 60     # Send heartbeats more frequently
-  event_batch_size: 100      # Moderate batch size for timely delivery
-  max_queue_size: 1000       # Allow more events before backpressure
+  name: "edr-agent-windows"
+  heartbeat_interval: 60        # Send heartbeats every 60 seconds
+  event_batch_size: 100         # Batch size for events
+  max_queue_size: 2000          # Maximum events in queue
 
 monitoring:
   file_system:
-    enabled: true
-    paths:                    # Use concrete paths that actually exist
+    enabled: true               # Enable file system monitoring
+    paths:                      # Directories to monitor
       - "C:\\Users\\Manh\\Desktop"
       - "C:\\Users\\Manh\\Downloads"
       - "C:\\Users\\Manh\\Documents"
-    recursive: true
-    real_time_scan: true
-    max_file_size: "10MB"     # Reduced file size limit
-    max_workers: 5            # Increased worker limit to handle all directories
-=======
-  heartbeat_interval: 300    # Increased to reduce server traffic
-  event_batch_size: 50       # Reduced batch size
-  max_queue_size: 500        # Reduced queue size to prevent memory issues
-
-monitoring:
-  file_system:
-    enabled: false            # Disabled by default for safety
-    paths: []                 # Empty paths to prevent system monitoring
-    recursive: false
-    real_time_scan: false
-    max_file_size: "10MB"     # Reduced file size limit
->>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
-    exclude_extensions:
+      - "C:\\Users\\Manh\\Pictures"
+    recursive: true             # Monitor subdirectories
+    real_time_scan: true        # Real-time file scanning
+    max_file_size: "50MB"       # Maximum file size to scan
+    max_workers: 8              # Number of worker threads
+    exclude_extensions:         # File extensions to exclude
       - ".tmp"
       - ".log"
       - ".bak"
@@ -53,7 +41,8 @@ monitoring:
       - ".lock"
       - ".crdownload"
       - ".partial"
-    exclude_paths:
+      - ".tmp"
+    exclude_paths:              # Paths to exclude from monitoring
       - "C:\\Windows\\*"
       - "C:\\Program Files\\*"
       - "C:\\Program Files (x86)\\*"
@@ -63,14 +52,15 @@ monitoring:
       - "C:\\System Volume Information\\*"
       - "C:\\Recovery\\*"
       - "*\\quarantine\\*"
+      - "*\\edr-agent\\*"
 
   processes:
-    enabled: false            # Disabled by default for safety
-    scan_executables: false
-    monitor_injections: false
-    track_network_connections: false
-    monitor_cmdline: false
-    exclude_names:
+    enabled: true               # Enable process monitoring
+    scan_executables: true      # Scan executable files
+    monitor_injections: true    # Monitor process injections
+    track_network_connections: true  # Track network connections
+    monitor_cmdline: true       # Monitor command line arguments
+    exclude_names:              # Process names to exclude
       - "System"
       - "Idle"
       - "Registry"
@@ -89,62 +79,66 @@ monitoring:
       - "fontdrvhost.exe"
 
   network:
-<<<<<<< HEAD
-    enabled: true
-    monitor_dns: true
-    block_malicious_ips: true
-    capture_packets: false      # keep off to avoid heavy load
-    monitor_tcp: true
-    monitor_udp: true
-    scan_interval: 120
+    enabled: true               # Enable network monitoring
+    monitor_dns: true           # Monitor DNS queries
+    block_malicious_ips: true   # Block malicious IP addresses
+    capture_packets: false      # Disable packet capture (performance)
+    monitor_tcp: true           # Monitor TCP connections
+    monitor_udp: true           # Monitor UDP connections
+    scan_interval: 120          # Network scan interval (seconds)
+    suspicious_ports:           # Ports to flag as suspicious
+      - 22
+      - 23
+      - 3389
+      - 5900
+      - 8080
+    exclude_ports:              # Ports to exclude
+      - 80
+      - 443
+      - 53
 
   registry:
-    enabled: true
-    monitor_autostart: true
-    track_security_settings: true
-    scan_interval: 300
+    enabled: true               # Enable registry monitoring
+    monitor_autostart: true     # Monitor autostart entries
+    track_security_settings: true  # Track security settings
+    scan_interval: 300          # Registry scan interval (seconds)
+    paths:                      # Registry paths to monitor
+      - "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"
+      - "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce"
+      - "HKEY_CURRENT_USER\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"
+      - "HKEY_CURRENT_USER\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce"
 
   memory:
-    enabled: true
-=======
-    enabled: false            # Disabled to reduce system load
-    monitor_dns: false
-    block_malicious_ips: false
-    capture_packets: false
-    monitor_tcp: false
-    monitor_udp: false
-    scan_interval: 300
-
-  registry:
-    enabled: false            # Disabled to reduce noise
-    monitor_autostart: false
-    track_security_settings: false
-    scan_interval: 600
-
-  memory:
-    enabled: false            # Disabled to prevent system impact
->>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
-    scan_interval: 1800
-    threat_threshold: 0.9
-    max_processes: 5
+    enabled: true               # Enable memory monitoring
+    scan_interval: 1800         # Memory scan interval (seconds)
+    threat_threshold: 0.8       # Threat detection threshold
+    max_processes: 10           # Maximum processes to scan
+    scan_executable: true       # Scan executable memory
+    scan_writable: true         # Scan writable memory
+    scan_private: true          # Scan private memory
 
   behavior:
-<<<<<<< HEAD
-    enabled: true
-    analysis_interval: 300
-=======
-    enabled: false            # Disabled to reduce system impact
-    analysis_interval: 600
->>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
-    threat_threshold: 0.9
-    data_retention: 2
+    enabled: true               # Enable behavior analysis
+    analysis_interval: 300      # Behavior analysis interval (seconds)
+    threat_threshold: 0.8       # Threat detection threshold
+    data_retention: 7           # Days to retain behavior data
+    max_child_processes: 20     # Maximum child processes
+    max_network_connections: 50 # Maximum network connections
+    max_memory_operations: 1000 # Maximum memory operations
+    max_file_operations: 500    # Maximum file operations
+    max_file_access: 1000       # Maximum file access
+    max_registry_access: 500    # Maximum registry access
+    max_bytes_sent: 1048576     # Maximum bytes sent (1MB)
+    max_bytes_received: 1048576 # Maximum bytes received (1MB)
 
 yara:
-<<<<<<< HEAD
-  enabled: true
-  rules_path: "yara-rules"
-  yara_executable: "yara64.exe"  # Specify the YARA executable path
-  categories:
+  enabled: true                 # Enable YARA scanning
+  rules_path: "yara-rules"      # Path to YARA rules
+  yara_executable: "yara64.exe" # YARA executable path
+  auto_update: true             # Auto-update rules
+  update_interval: "24h"        # Update interval
+  rules_source: ""              # Rules source URL
+  categories:                   # YARA rule categories to load
     - "maldocs"
     - "malware"
     - "webshells"
@@ -152,75 +146,50 @@ yara:
     - "backdoor"
     - "trojan"
     - "ransomware"
-  scan_timeout: 30          # seconds
-  max_file_size: "100MB"
-=======
-  enabled: false              # Disabled by default for safety
-  auto_update: false
-  update_interval: "24h"
-  rules_source: ""
-  categories: []
-  max_scan_threads: 1         # Single thread to prevent overload
-  scan_timeout: 10            # Reduced timeout
-  rules_path: "yara-rules"
-  max_file_size: "10MB"       # Reduced file size limit
->>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
+    - "antidebug_antivm"
+    - "local"
+  max_scan_threads: 4           # Maximum scan threads
+  scan_timeout: 30              # Scan timeout (seconds)
+  max_file_size: "100MB"        # Maximum file size to scan
 
 response:
   notification_settings:
-    toast_enabled: true
-<<<<<<< HEAD
-    system_tray_enabled: false
-    desktop_alert_enabled: true
-    sound_enabled: false
-    timeout_seconds: 6
-  severity_thresholds:
-    show_user_alerts: 3     # show alerts for Medium+
-    auto_quarantine: 4      # auto quarantine High/ Critical
-    block_execution: 5      # block only on Critical
-  user_interaction:
-    allow_user_override: false
-    require_admin_for_allow: true
-    timeout_seconds: 20
-=======
-    system_tray_enabled: true
-    desktop_alert_enabled: false  # Disabled to prevent UI freezes
-    sound_enabled: false
-    timeout_seconds: 5
+    toast_enabled: true         # Enable Windows toast notifications
+    system_tray_enabled: true   # Enable system tray notifications
+    desktop_alert_enabled: true # Enable desktop alerts
+    sound_enabled: false        # Disable sound notifications
+    timeout_seconds: 8          # Notification timeout
 
   severity_thresholds:
-    show_user_alerts: 5         # Only show critical alerts
-    auto_quarantine: 6          # Disabled (no auto-quarantine)
-    block_execution: 6          # Disabled (no auto-blocking)
+    show_user_alerts: 3         # Show alerts for Medium+ severity
+    auto_quarantine: 4          # Auto-quarantine High/Critical threats
+    block_execution: 5          # Block execution for Critical threats
 
   user_interaction:
-    allow_user_override: true
-    require_admin_for_allow: false
-    timeout_seconds: 15
+    allow_user_override: true   # Allow user to override actions
+    require_admin_for_allow: true  # Require admin for allow actions
+    timeout_seconds: 30         # User interaction timeout
 
->>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
   customization:
-    company_branding: false
-    custom_messages: false
-    language: "en"
+    company_branding: false     # Disable company branding
+    custom_messages: false      # Disable custom messages
+    language: "en"              # Language
 
 logging:
-  level: "info"
-  format: "text"
-  file_path: "agent.log"
-  max_size: "10MB"
-  max_files: 2
-  compress: true
+  level: "info"                 # Log level
+  format: "text"                # Log format
+  file_path: "agent.log"        # Log file path
+  max_size: "20MB"              # Maximum log file size
+  max_files: 5                  # Maximum log files
+  compress: true                # Compress old logs
 
-# Performance tuning to prevent system overload
 performance:
-  max_memory_usage: "128MB"      # Reduced memory limit
-  cpu_limit_percent: 10         # Reduced CPU usage limit
-  scan_queue_size: 20           # Reduced queue size
-  event_queue_size: 100         # Reduced event queue
-  cleanup_interval: 1800        # Cleanup every 30 minutes
+  max_memory_usage: "256MB"     # Maximum memory usage
+  cpu_limit_percent: 25         # CPU usage limit
+  scan_queue_size: 50           # Scan queue size
+  event_queue_size: 500         # Event queue size
+  cleanup_interval: 1800        # Cleanup interval (30 minutes)
 
-# Enhanced suppression rules to prevent noise
 suppression:
   rules:
     - type: "path_contains"
@@ -257,20 +226,10 @@ suppression:
         - ".lock"
       reason: "temporary_file"
 
-# Safe mode settings
 safe_mode:
-<<<<<<< HEAD
-  enabled: false
-  max_file_monitors: 5
-  max_process_monitors: 3
-  disable_real_time: false
-  reduce_scanning: false
-  minimal_logging: false
-=======
-  enabled: true
-  max_file_monitors: 1
-  max_process_monitors: 1
-  disable_real_time: true
-  reduce_scanning: true
-  minimal_logging: true
->>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
+  enabled: false                # Disable safe mode for full functionality
+  max_file_monitors: 10         # Maximum file monitors
+  max_process_monitors: 5       # Maximum process monitors
+  disable_real_time: false      # Enable real-time monitoring
+  reduce_scanning: false        # Full scanning capability
+  minimal_logging: false        # Full logging capability

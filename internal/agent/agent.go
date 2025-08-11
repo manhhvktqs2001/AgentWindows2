@@ -62,6 +62,12 @@ func NewAgent(cfg *config.Config, logger *utils.Logger) (*Agent, error) {
 
 	// Initialize YARA scanner
 	yaraScanner := scanner.NewYaraScanner(&cfg.Yara, logger)
+	
+	// Load YARA rules once during initialization
+	if err := yaraScanner.LoadRules(); err != nil {
+		logger.Error("Failed to load YARA rules: %v", err)
+		return nil, fmt.Errorf("failed to initialize YARA scanner: %w", err)
+	}
 
 	// Initialize monitors
 	fileMonitor := monitoring.NewFileMonitor(&cfg.Monitoring.FileSystem, logger, yaraScanner)
@@ -135,9 +141,7 @@ func (a *Agent) Start() error {
 	// Also propagate to scanner so alerts include agent_id
 	if a.scanner != nil {
 		a.scanner.SetAgentID(a.config.Agent.ID)
-		if loadErr := a.scanner.LoadRules(); loadErr != nil {
-			a.logger.Warn("Failed to load YARA rules: %v", loadErr)
-		}
+		// LoadRules() was already called in NewAgent, don't call again
 	}
 	a.fileMonitor.SetAgentID(a.config.Agent.ID)
 	a.processMonitor.SetAgentID(a.config.Agent.ID)

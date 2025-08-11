@@ -94,7 +94,7 @@ type FileSystemConfig struct {
 	RealTimeScan      bool     `yaml:"real_time_scan"`     // Real-time scanning
 	Recursive         bool     `yaml:"recursive"`          // Monitor subdirectories
 	MaxFileSize       string   `yaml:"max_file_size"`      // Max file size to scan
-    MaxWorkers        int      `yaml:"max_workers"`        // Max parallel directory watchers
+	MaxWorkers        int      `yaml:"max_workers"`        // Max parallel directory watchers
 }
 
 type ProcessConfig struct {
@@ -161,8 +161,8 @@ type YaraConfig struct {
 	MaxScanThreads int      `yaml:"max_scan_threads"`
 	ScanTimeout    int      `yaml:"scan_timeout"` // seconds
 	RulesPath      string   `yaml:"rules_path"`
-	MaxFileSize    string   `yaml:"max_file_size"` // e.g., "100MB"
-    Executable     string   `yaml:"yara_executable"` // YARA executable name or full path
+	MaxFileSize    string   `yaml:"max_file_size"`   // e.g., "100MB"
+	Executable     string   `yaml:"yara_executable"` // YARA executable name or full path
 }
 
 type LogConfig struct {
@@ -240,7 +240,7 @@ func Load(configPath string) (*Config, error) {
 				RealTimeScan:      viper.GetBool("monitoring.file_system.real_time_scan"),
 				Recursive:         viper.GetBool("monitoring.file_system.recursive"),
 				MaxFileSize:       viper.GetString("monitoring.file_system.max_file_size"),
-                MaxWorkers:        viper.GetInt("monitoring.file_system.max_workers"),
+				MaxWorkers:        viper.GetInt("monitoring.file_system.max_workers"),
 			},
 			Processes: ProcessConfig{
 				Enabled:                 viper.GetBool("monitoring.processes.enabled"),
@@ -303,7 +303,7 @@ func Load(configPath string) (*Config, error) {
 			ScanTimeout:    viper.GetInt("yara.scan_timeout"),
 			RulesPath:      viper.GetString("yara.rules_path"),
 			MaxFileSize:    viper.GetString("yara.max_file_size"),
-            Executable:     viper.GetString("yara.yara_executable"),
+			Executable:     viper.GetString("yara.yara_executable"),
 		},
 		Response: ResponseConfig{
 			NotificationSettings: NotificationSettings{
@@ -372,7 +372,7 @@ func setDefaults() {
 	viper.SetDefault("monitoring.file_system.recursive", true)
 	viper.SetDefault("monitoring.file_system.real_time_scan", true)
 	viper.SetDefault("monitoring.file_system.max_file_size", "100MB")
-    viper.SetDefault("monitoring.file_system.max_workers", 2)
+	viper.SetDefault("monitoring.file_system.max_workers", 2)
 	viper.SetDefault("monitoring.file_system.exclude_extensions", []string{".tmp", ".log", ".bak"})
 
 	viper.SetDefault("monitoring.processes.enabled", true)
@@ -434,7 +434,7 @@ func setDefaults() {
 	viper.SetDefault("yara.scan_timeout", 30)
 	viper.SetDefault("yara.rules_path", "yara-rules")
 	viper.SetDefault("yara.max_file_size", "100MB")
-    viper.SetDefault("yara.yara_executable", "yara64.exe")
+	viper.SetDefault("yara.yara_executable", "yara64.exe")
 
 	// Response defaults
 	viper.SetDefault("response.notification_settings.toast_enabled", true)
@@ -531,6 +531,7 @@ func createDefaultConfig() *Config {
 				Recursive:         false,
 				RealTimeScan:      false,
 				MaxFileSize:       "100MB",
+				MaxWorkers:        2,
 				ExcludeExtensions: []string{},
 				ExcludePaths:      []string{},
 			},
@@ -569,6 +570,7 @@ func createDefaultConfig() *Config {
 			ScanTimeout:    30,
 			RulesPath:      "",
 			MaxFileSize:    "100MB",
+			Executable:     "yara64.exe",
 		},
 		Response: ResponseConfig{
 			NotificationSettings: NotificationSettings{

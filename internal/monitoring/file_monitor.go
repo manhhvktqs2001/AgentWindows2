@@ -131,8 +131,79 @@ func (fm *FileMonitor) Start() error {
 	// Start rate limiter cleanup worker
 	go fm.rateLimiterCleanupWorker()
 
+	// Perform an initial sweep to scan existing files so pre-existing threats are detected
+	go fm.initialSweep(validPaths)
+
 	fm.logger.Info("File system monitor started successfully - watching %d directories", successCount)
 	return nil
+}
+
+// initialSweep scans existing files in configured paths once at startup
+func (fm *FileMonitor) initialSweep(paths []string) {
+	if fm.scanner == nil || len(paths) == 0 {
+		return
+	}
+
+	fm.logger.Info("Starting initial sweep of existing files (one-time scan)")
+
+	// Concurrency limiter
+	maxWorkers := 4
+	if fm.maxWorkers > 0 && fm.maxWorkers < maxWorkers {
+		maxWorkers = fm.maxWorkers
+	}
+	sem := make(chan struct{}, maxWorkers)
+	var wg sync.WaitGroup
+
+	filesScanned := 0
+	maxFiles := 2000 // hard cap to avoid heavy first run
+
+	for _, root := range paths {
+		walkFn := func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if d == nil {
+				return nil
+			}
+			if d.IsDir() {
+				if !fm.config.Recursive && path != root {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+
+			// Skip excluded/large files
+			if fm.shouldExcludeFile(path) {
+				return nil
+			}
+			if fi, statErr := os.Stat(path); statErr == nil {
+				if fi.Size() > fm.maxFileSize {
+					return nil
+				}
+			}
+
+			if filesScanned >= maxFiles {
+				return filepath.SkipDir
+			}
+
+			filesScanned++
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(p string) {
+				defer func() {
+					<-sem
+					wg.Done()
+				}()
+				fm.scanFileAndAlert(p)
+			}(path)
+			return nil
+		}
+
+		_ = filepath.WalkDir(root, walkFn)
+	}
+
+	wg.Wait()
+	fm.logger.Info("Initial sweep completed (scanned %d files)", filesScanned)
 }
 
 func (fm *FileMonitor) validateAndFilterPaths(paths []string) []string {
@@ -347,7 +418,7 @@ func (fm *FileMonitor) monitorDirectoryWithLimits(watcher *DirectoryWatcher) {
 				watcher.handle,
 				&buffer[0],
 				uint32(len(buffer)),
-				false,
+				fm.config != nil && fm.config.Recursive,
 				windows.FILE_NOTIFY_CHANGE_FILE_NAME|windows.FILE_NOTIFY_CHANGE_LAST_WRITE,
 				&bytesReturned,
 				&overlapped,
@@ -503,39 +574,70 @@ func (fm *FileMonitor) processFileEventSafely(filePath string, action uint32) {
 	go func() {
 		defer func() { done <- true }()
 
+		// Get detailed file info
+		var fileSize int64
+		var fileType string
+		var fileHash string
+		var permissions string
+		var userID string
+
+		if fileInfo, err := os.Stat(filePath); err == nil {
+			fileSize = fileInfo.Size()
+
+			// Determine file type from extension
+			ext := strings.ToLower(filepath.Ext(filePath))
+			if ext != "" {
+				fileType = ext[1:] // Remove the dot
+			} else {
+				fileType = "unknown"
+			}
+
+			// Get file permissions (simplified)
+			if fileInfo.Mode().IsRegular() {
+				permissions = "file"
+			} else if fileInfo.Mode().IsDir() {
+				permissions = "directory"
+			} else {
+				permissions = "other"
+			}
+
+			// Get user info (simplified)
+			userID = "current_user"
+		}
+
 		event := models.FileEvent{
 			Event: models.Event{
 				ID:        fm.generateEventID(),
 				AgentID:   fm.agentID,
 				EventType: "file_event",
 				Timestamp: time.Now(),
-				Severity:  "low",
-				Category:  "file",
+				Severity:  fm.determineEventSeverity(action, filePath),
+				Category:  "file_system",
 				Source:    "file_monitor",
 			},
-			FileSize:    0,  // Will be filled if needed
-			FileType:    "", // Will be filled if needed
-			FileHash:    "", // Will be filled if needed
+			FileSize:    fileSize,
+			FileType:    fileType,
+			FileHash:    fileHash,
 			Action:      actionStr,
-			UserID:      "",
-			Permissions: "",
+			UserID:      userID,
+			Permissions: permissions,
 		}
 
-		// Try to get file info if possible
-		if fileInfo, err := os.Stat(filePath); err == nil {
-			event.FileSize = fileInfo.Size()
-		}
+		// Log file event for debugging
+		fm.logger.Info("📁 File event detected: %s %s (size: %d bytes, type: %s)",
+			actionStr, filePath, fileSize, fileType)
 
 		// Send event to channel for agent to receive
 		select {
 		case fm.eventChan <- event:
-			fm.logger.Debug("File event sent to agent: %s %s", actionStr, filePath)
+			fm.logger.Debug("✅ File event sent to agent: %s %s", actionStr, filePath)
 		default:
-			fm.logger.Warn("Event channel full, dropping file event: %s", filePath)
+			fm.logger.Warn("⚠️ Event channel full, dropping file event: %s", filePath)
 		}
 
 		// Run YARA scan for create/modify events
 		if action == 0x00000001 || action == 0x00000003 { // FILE_ACTION_ADDED (0x00000001) or FILE_ACTION_MODIFIED (0x00000003)
+			fm.logger.Debug("🔍 Triggering YARA scan for file: %s", filePath)
 			go fm.scanFileAndAlert(filePath)
 		}
 	}()
@@ -545,7 +647,7 @@ func (fm *FileMonitor) processFileEventSafely(filePath string, action uint32) {
 	case <-done:
 		// Event processed successfully
 	case <-time.After(fm.operationTimeout):
-		fm.logger.Warn("File event processing timeout: %s", filePath)
+		fm.logger.Warn("⏰ File event processing timeout: %s", filePath)
 	}
 }
 
@@ -558,19 +660,68 @@ func (fm *FileMonitor) scanFileAndAlert(filePath string) {
 	}()
 
 	if fm.scanner == nil {
-		fm.logger.Debug("YARA scanner not available")
+		fm.logger.Warn("⚠️ YARA scanner not available for file: %s", filePath)
 		return
 	}
 
+	// Check if file still exists before scanning
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		fm.logger.Debug("📝 File no longer exists, skipping YARA scan: %s", filePath)
+		return
+	}
+
+	fm.logger.Info("🔍 Starting YARA scan for file: %s", filePath)
+
+	// Add rate limiting for YARA scans
+	fm.rateMu.Lock()
+	lastScan, exists := fm.rateLimiter[filePath+"_yara"]
+	now := time.Now()
+	if exists && now.Sub(lastScan) < 2*time.Second {
+		fm.rateMu.Unlock()
+		fm.logger.Debug("⏱️ Rate limiting YARA scan for file: %s", filePath)
+		return
+	}
+	fm.rateLimiter[filePath+"_yara"] = now
+	fm.rateMu.Unlock()
+
 	result, err := fm.scanner.ScanFile(filePath)
 	if err != nil {
-		fm.logger.Debug("YARA scan error: %v", err)
+		fm.logger.Warn("❌ YARA scan error for %s: %v", filePath, err)
 		return
 	}
 
 	if result != nil {
-		fm.logger.Info("🚨 YARA threat detected in %s: %s (severity: %d)",
+		fm.logger.Info("🚨 YARA THREAT DETECTED in %s: %s (severity: %d)",
 			filePath, result.ThreatName, result.Severity)
+
+		// Create high-priority threat event
+		threatEvent := models.FileEvent{
+			Event: models.Event{
+				ID:        fm.generateEventID(),
+				AgentID:   fm.agentID,
+				EventType: "threat_detected",
+				Timestamp: time.Now(),
+				Severity:  "critical",
+				Category:  "security",
+				Source:    "yara_scanner",
+			},
+			FileSize:    0,
+			FileType:    "",
+			FileHash:    "",
+			Action:      "threat_detected",
+			UserID:      "system",
+			Permissions: "read_only",
+		}
+
+		// Send threat event to agent
+		select {
+		case fm.eventChan <- threatEvent:
+			fm.logger.Info("✅ Threat event sent to agent for file: %s", filePath)
+		default:
+			fm.logger.Warn("⚠️ Event channel full, dropping threat event for: %s", filePath)
+		}
+	} else {
+		fm.logger.Debug("✅ YARA scan completed for %s: no threats found", filePath)
 	}
 }
 
@@ -584,12 +735,18 @@ func (fm *FileMonitor) processEventsWithLimits() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
-	fm.logger.Info("File monitor event processor started - events will be sent to agent")
+	fm.logger.Info("📊 File monitor event processor started - events will be sent to agent")
+
+	// Track event statistics
+	var eventCount int
+	var lastEventCount int
+	statsTicker := time.NewTicker(30 * time.Second)
+	defer statsTicker.Stop()
 
 	for {
 		select {
 		case <-fm.stopChan:
-			fm.logger.Info("File monitor event processor stopped")
+			fm.logger.Info("🛑 File monitor event processor stopped")
 			return
 		case <-ticker.C:
 			// Periodic cleanup and health check
@@ -601,7 +758,13 @@ func (fm *FileMonitor) processEventsWithLimits() {
 			fm.mu.RUnlock()
 
 			if watcherCount > 0 {
-				fm.logger.Debug("File monitor health check: %d active watchers", watcherCount)
+				fm.logger.Debug("🏥 File monitor health check: %d active watchers", watcherCount)
+			}
+		case <-statsTicker.C:
+			// Log event statistics every 30 seconds
+			if eventCount > lastEventCount {
+				fm.logger.Info("📈 File monitor statistics: %d events processed in last 30s", eventCount-lastEventCount)
+				lastEventCount = eventCount
 			}
 		}
 	}
@@ -751,6 +914,36 @@ func (fm *FileMonitor) determineAction(action uint32) string {
 
 func (fm *FileMonitor) generateEventID() string {
 	return fmt.Sprintf("file_%d", time.Now().UnixNano())
+}
+
+// determineEventSeverity determines the severity level for file events
+func (fm *FileMonitor) determineEventSeverity(action uint32, filePath string) string {
+	// Check for suspicious file types
+	lowerPath := strings.ToLower(filePath)
+
+	// High severity - executable files
+	if strings.HasSuffix(lowerPath, ".exe") ||
+		strings.HasSuffix(lowerPath, ".dll") ||
+		strings.HasSuffix(lowerPath, ".bat") ||
+		strings.HasSuffix(lowerPath, ".cmd") ||
+		strings.HasSuffix(lowerPath, ".ps1") ||
+		strings.HasSuffix(lowerPath, ".vbs") ||
+		strings.HasSuffix(lowerPath, ".js") {
+		return "high"
+	}
+
+	// Medium severity - document files that could contain macros
+	if strings.HasSuffix(lowerPath, ".doc") ||
+		strings.HasSuffix(lowerPath, ".docx") ||
+		strings.HasSuffix(lowerPath, ".xls") ||
+		strings.HasSuffix(lowerPath, ".xlsx") ||
+		strings.HasSuffix(lowerPath, ".ppt") ||
+		strings.HasSuffix(lowerPath, ".pptx") {
+		return "medium"
+	}
+
+	// Low severity - regular files
+	return "low"
 }
 
 type FILE_NOTIFY_INFORMATION struct {
