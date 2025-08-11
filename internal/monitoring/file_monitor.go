@@ -19,6 +19,12 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// Kernel32 procs used for cancellation of overlapped I/O
+var (
+	kernel32DLL    = windows.NewLazySystemDLL("kernel32.dll")
+	procCancelIoEx = kernel32DLL.NewProc("CancelIoEx")
+)
+
 type FileMonitor struct {
 	config    *config.FileSystemConfig
 	logger    *utils.Logger
@@ -43,12 +49,10 @@ type FileMonitor struct {
 }
 
 type DirectoryWatcher struct {
-	path    string
-	handle  windows.Handle
-	ctx     context.Context
-	cancel  context.CancelFunc
-	stopped bool
-	mu      sync.Mutex
+	path   string
+	handle windows.Handle
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 const (
@@ -209,14 +213,14 @@ func (fm *FileMonitor) watchDirectorySafe(path string) error {
 		return fmt.Errorf("failed to convert path: %w", err)
 	}
 
-	// Open with minimal flags to reduce system impact
+	// Open with OVERLAPPED to allow cancellable, non-blocking I/O
 	handle, err := windows.CreateFile(
 		winPath,
 		windows.FILE_LIST_DIRECTORY,
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
 		nil,
 		windows.OPEN_EXISTING,
-		windows.FILE_FLAG_BACKUP_SEMANTICS, // Remove OVERLAPPED to simplify
+		windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OVERLAPPED,
 		0,
 	)
 	if err != nil {
@@ -251,74 +255,83 @@ func (fm *FileMonitor) monitorDirectoryWithLimits(watcher *DirectoryWatcher) {
 		fm.cleanup(watcher)
 	}()
 
-	buffer := make([]byte, SAFE_BUFFER_SIZE) // Smaller buffer
-	eventCount := 0
-	maxEvents := fm.maxEvents
+	buffer := make([]byte, SAFE_BUFFER_SIZE)
+	var overlapped windows.Overlapped
+	var bytesReturned uint32
+	// Create event for overlapped I/O (auto-reset)
+	hEvent, err := windows.CreateEvent(nil, 0, 0, nil)
+	if err != nil {
+		fm.logger.Error("CreateEvent failed: %v", err)
+		fm.cleanup(watcher)
+		return
+	}
+	defer windows.CloseHandle(hEvent)
+	overlapped.HEvent = hEvent
 
+	pending := false
 	for {
+		// Stop checks
 		select {
 		case <-watcher.ctx.Done():
+			if pending {
+				procCancelIoEx.Call(uintptr(watcher.handle), uintptr(unsafe.Pointer(&overlapped)))
+			}
 			fm.logger.Debug("Watcher context cancelled: %s", watcher.path)
 			return
 		case <-fm.stopChan:
+			if pending {
+				procCancelIoEx.Call(uintptr(watcher.handle), uintptr(unsafe.Pointer(&overlapped)))
+			}
 			fm.logger.Debug("Global stop signal: %s", watcher.path)
 			return
 		default:
-			// Check if shutting down
-			fm.mu.RLock()
-			if fm.isShuttingDown {
-				fm.mu.RUnlock()
-				return
-			}
-			fm.mu.RUnlock()
-
-			// Limit events per cycle
-			if eventCount >= maxEvents {
-				fm.logger.Debug("Event limit reached, sleeping: %s", watcher.path)
-				time.Sleep(1 * time.Second)
-				eventCount = 0
-				continue
-			}
-
-			var bytesReturned uint32
-
-			// Simple synchronous read with timeout
-			done := make(chan error, 1)
-			go func() {
-				err := windows.ReadDirectoryChanges(
-					watcher.handle,
-					&buffer[0],
-					uint32(len(buffer)),
-					false, // Don't watch subtree
-					windows.FILE_NOTIFY_CHANGE_FILE_NAME|windows.FILE_NOTIFY_CHANGE_LAST_WRITE,
-					&bytesReturned,
-					nil, // No overlapped
-					0,
-				)
-				done <- err
-			}()
-
-			select {
-			case err := <-done:
-				if err != nil {
-					fm.logger.Error("ReadDirectoryChanges failed: %v", err)
-					time.Sleep(2 * time.Second)
-					continue
-				}
-
-				if bytesReturned > 0 {
-					fm.processDirectoryChangesSafely(watcher.path, buffer[:bytesReturned])
-					eventCount++
-				}
-
-			case <-time.After(fm.operationTimeout):
-				fm.logger.Debug("Directory monitoring timeout: %s", watcher.path)
-				continue
-
-			case <-watcher.ctx.Done():
-				return
-			}
 		}
+
+		// Issue a new overlapped read only if none pending
+		if !pending {
+			bytesReturned = 0
+			err := windows.ReadDirectoryChanges(
+				watcher.handle,
+				&buffer[0],
+				uint32(len(buffer)),
+				false,
+				windows.FILE_NOTIFY_CHANGE_FILE_NAME|windows.FILE_NOTIFY_CHANGE_LAST_WRITE,
+				&bytesReturned,
+				&overlapped,
+				0,
+			)
+			if err != nil && err != windows.ERROR_IO_PENDING {
+				fm.logger.Error("ReadDirectoryChanges failed: %v", err)
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+			pending = true
+		}
+
+		// Wait for completion with short timeout to remain responsive
+		waitRes, err := windows.WaitForSingleObject(hEvent, 500)
+		if err != nil {
+			fm.logger.Error("WaitForSingleObject failed: %v", err)
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+
+		if waitRes == uint32(windows.WAIT_TIMEOUT) {
+			// No events yet; loop and check stop signals
+			continue
+		}
+
+		// Completed: get result
+		if ge := windows.GetOverlappedResult(watcher.handle, &overlapped, &bytesReturned, false); ge != nil {
+			// If cancelled or error, reset pending and continue
+			pending = false
+			continue
+		}
+
+		if bytesReturned > 0 {
+			fm.processDirectoryChangesSafely(watcher.path, buffer[:bytesReturned])
+		}
+		pending = false
 	}
 }
 

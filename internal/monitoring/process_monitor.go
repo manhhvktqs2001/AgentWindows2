@@ -332,7 +332,7 @@ func (pm *ProcessMonitor) checkNewProcessesSafe() {
 	}
 	pm.mu.RUnlock()
 
-	// Create snapshot with timeout
+	// Create snapshot with timeout (prevents system freeze)
 	snapshotDone := make(chan error, 1)
 	var handle windows.Handle
 
@@ -364,19 +364,40 @@ func (pm *ProcessMonitor) checkNewProcessesSafe() {
 	var pe32 windows.ProcessEntry32
 	pe32.Size = uint32(unsafe.Sizeof(pe32))
 
-	if err := windows.Process32First(handle, &pe32); err != nil {
-		pm.logger.Error("Failed to get first process: %v", err)
+	// Call Process32First with timeout guard
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- windows.Process32First(handle, &pe32)
+	}()
+
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			pm.logger.Error("Failed to get first process: %v", err)
+			return
+		}
+	case <-time.After(2 * time.Second):
+		pm.logger.Warn("Process32First timeout")
+		return
+	case <-pm.ctx.Done():
 		return
 	}
 
 	newProcesses := 0
 	maxNewProcesses := 50 // Limit new processes to check per scan
 
+	// Hard time budget per scan to avoid long blocking loops
+	deadline := time.Now().Add(2 * time.Second)
 	for newProcesses < maxNewProcesses {
 		select {
 		case <-pm.ctx.Done():
 			return
 		default:
+		}
+
+		if time.Now().After(deadline) {
+			pm.logger.Debug("Process scan time budget reached")
+			break
 		}
 
 		processID := pe32.ProcessID
@@ -399,11 +420,22 @@ func (pm *ProcessMonitor) checkNewProcessesSafe() {
 				}
 			}
 		}
-		if err := windows.Process32Next(handle, &pe32); err != nil {
-			if err == windows.ERROR_NO_MORE_FILES {
-				break
+		// Guard Process32Next with timeout to avoid hangs
+		nextDone := make(chan error, 1)
+		go func() { nextDone <- windows.Process32Next(handle, &pe32) }()
+		select {
+		case err := <-nextDone:
+			if err != nil {
+				if err == windows.ERROR_NO_MORE_FILES {
+					break
+				}
+				pm.logger.Error("Failed to get next process: %v", err)
+				return
 			}
-			pm.logger.Error("Failed to get next process: %v", err)
+		case <-time.After(2 * time.Second):
+			pm.logger.Warn("Process32Next timeout, stopping this scan cycle")
+			return
+		case <-pm.ctx.Done():
 			return
 		}
 	}
