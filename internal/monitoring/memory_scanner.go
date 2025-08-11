@@ -79,14 +79,11 @@ const (
 // Memory scanner specific API functions
 var (
 	memKernel32 = windows.NewLazySystemDLL("kernel32.dll")
-	memPsapi    = windows.NewLazySystemDLL("psapi.dll")
 
-	memProcOpenProcess          = memKernel32.NewProc("OpenProcess")
-	memProcVirtualQueryEx       = memKernel32.NewProc("VirtualQueryEx")
-	memProcReadProcessMemory    = memKernel32.NewProc("ReadProcessMemory")
-	memProcCloseHandle          = memKernel32.NewProc("CloseHandle")
-	memProcEnumProcessModules   = memPsapi.NewProc("EnumProcessModules")
-	memProcGetModuleInformation = memPsapi.NewProc("GetModuleInformation")
+	memProcOpenProcess       = memKernel32.NewProc("OpenProcess")
+	memProcVirtualQueryEx    = memKernel32.NewProc("VirtualQueryEx")
+	memProcReadProcessMemory = memKernel32.NewProc("ReadProcessMemory")
+	memProcCloseHandle       = memKernel32.NewProc("CloseHandle")
 )
 
 type MEMORY_BASIC_INFORMATION struct {
@@ -319,7 +316,8 @@ func (m *MemoryScanner) scanProcessMemory(processID uint32) (*MemoryScanResult, 
 
 func (m *MemoryScanner) openProcessHandle(processID uint32) (windows.Handle, error) {
 	handle, _, err := memProcOpenProcess.Call(
-		uintptr(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ|PROCESS_VM_OPERATION),
+		// Use minimal rights to avoid system impact
+		uintptr(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ),
 		0,
 		uintptr(processID),
 	)

@@ -1,30 +1,28 @@
+# Safe EDR Agent Configuration
+# This configuration is designed to prevent system freezes and minimize system impact
+
 server:
   url: "http://192.168.20.85:5000"
   api_key: "f93ac1d1d7b64f07bd32c81e6ab8423e4cb7631f2051c9d8a2d340c5be3a4a9e"
   auth_token: "edr_system_auth_2025"
-  timeout: 45        # Increased timeout to prevent server communication issues
-  retry_count: 2     # Reduced retries to avoid log spam
+  timeout: 30
+  retry_count: 2
   tls_verify: false
 
 agent:
   id: ""
-  name: "edr-agent-windows"
-  heartbeat_interval: 180    # Increased to reduce server traffic
-  event_batch_size: 100      # Increased batch size for efficiency
-  max_queue_size: 2000       # Reduced to prevent memory issues
+  name: "edr-agent-windows-safe"
+  heartbeat_interval: 300    # Increased to reduce server traffic
+  event_batch_size: 50       # Reduced batch size
+  max_queue_size: 500        # Reduced queue size to prevent memory issues
 
 monitoring:
   file_system:
-    enabled: true
-    paths:
-      # Narrow scope to user profile Documents/Downloads and a custom workspace
-      - "C:\\Users\\*\\Documents"
-      - "C:\\Users\\*\\Downloads"
-      - "C:\\Users\\*\\Desktop"
-      - "C:\\Program Files"
-    recursive: true
-    real_time_scan: false   # Disable real-time to reduce overhead; rely on periodic scans
-    max_file_size: "20MB"
+    enabled: false            # Disabled by default for safety
+    paths: []                 # Empty paths to prevent system monitoring
+    recursive: false
+    real_time_scan: false
+    max_file_size: "10MB"     # Reduced file size limit
     exclude_extensions:
       - ".tmp"
       - ".log"
@@ -34,177 +32,136 @@ monitoring:
       - ".sqlite"
       - ".etl"
       - ".evtx"
-      - ".go"           # Exclude Go source files
-      - ".js"
-      - ".ts"
-      - ".json"
-      - ".yaml"
-      - ".yml"
-      - ".md"
-      - ".txt"
+      - ".lock"
+      - ".crdownload"
+      - ".partial"
     exclude_paths:
       - "C:\\Windows\\*"
       - "C:\\Program Files\\*"
       - "C:\\Program Files (x86)\\*"
+      - "C:\\ProgramData\\Microsoft\\Windows Defender\\*"
       - "C:\\Users\\*\\AppData\\Local\\Temp\\*"
-      - "C:\\Users\\*\\AppData\\Local\\Microsoft\\Edge\\User Data\\*"
-      - "*\\node_modules\\*"
-      - "*\\.git\\*"
-      - "*\\.vs\\*"
-      - "*\\.vscode\\*"
-      - "*\\cursor\\user\\workspacestorage\\*"
+      - "C:\\$Recycle.Bin\\*"
+      - "C:\\System Volume Information\\*"
+      - "C:\\Recovery\\*"
+      - "*\\quarantine\\*"
 
   processes:
-    enabled: true
-    scan_executables: true
-    monitor_injections: false    # Disabled to reduce noise
-    track_network_connections: false  # Disabled to reduce noise
-    monitor_cmdline: true
+    enabled: false            # Disabled by default for safety
+    scan_executables: false
+    monitor_injections: false
+    track_network_connections: false
+    monitor_cmdline: false
     exclude_names:
-      - "explorer.exe"
-      - "dwm.exe"
-      - "winlogon.exe"
-      - "MoUsoCoreWorker.exe"
-      - "taskhostw.exe"
-      - "csrss.exe"
-      - "lsass.exe"
-      - "services.exe"
-      - "wininit.exe"
+      - "System"
+      - "Idle"
+      - "Registry"
       - "smss.exe"
-      - "SearchIndexer.exe"
-      - "SearchProtocolHost.exe"
-      - "RuntimeBroker.exe"
-      - "ApplicationFrameHost.exe"
+      - "csrss.exe"
+      - "wininit.exe"
+      - "services.exe"
+      - "lsass.exe"
+      - "winlogon.exe"
+      - "svchost.exe"
+      - "dwm.exe"
+      - "explorer.exe"
+      - "taskmgr.exe"
+      - "audiodg.exe"
+      - "conhost.exe"
+      - "fontdrvhost.exe"
 
   network:
-    enabled: false     # Disabled to reduce system load and noise
+    enabled: false            # Disabled to reduce system load
     monitor_dns: false
     block_malicious_ips: false
     capture_packets: false
     monitor_tcp: false
     monitor_udp: false
-    scan_interval: 120
-    exclude_ports:
-      - 135
-      - 445
-      - 5985
-      - 3389
-      - 80
-      - 443
-      - 53
-    suspicious_ports:
-      - 22
-      - 23
-      - 5900
-      - 8080
-      - 4444
-      - 1337
+    scan_interval: 300
 
   registry:
-    enabled: false     # Disabled to reduce noise
+    enabled: false            # Disabled to reduce noise
     monitor_autostart: false
     track_security_settings: false
-    scan_interval: 300
-    paths:
-      - "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"
-      - "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce"
-      - "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"
+    scan_interval: 600
 
   memory:
-    enabled: false
-    scan_interval: 900
+    enabled: false            # Disabled to prevent system impact
+    scan_interval: 1800
     threat_threshold: 0.9
     max_processes: 5
-    # Tuning knobs to avoid high CPU/RAM when enabled later
-    max_regions_per_process: 500
-    max_scan_millis_per_process: 150
-    max_total_millis_per_cycle: 1200
-    exclude_names:
-      - "chrome.exe"
-      - "msedge.exe"
-      - "code.exe"
-      - "idea64.exe"
 
   behavior:
-    enabled: false     # Disabled to reduce noise and system impact
-    analysis_interval: 300
+    enabled: false            # Disabled to reduce system impact
+    analysis_interval: 600
     threat_threshold: 0.9
-    data_retention: 6
+    data_retention: 2
 
 yara:
-  enabled: true
+  enabled: false              # Disabled by default for safety
   auto_update: false
   update_interval: "24h"
-  rules_source: https://github.com/Yara-Rules/rules/archive/master.zip
-  categories:
-    - malware
-  max_scan_threads: 1
-  scan_timeout: 15
-  rules_path: yara-rules
-  max_file_size: "100MB"   # Increased for better coverage
-  
-  # Enhanced suppression settings
-  suppress_environmental: true      # New: suppress environmental detections
-  suppress_development_paths: true  # New: suppress detections in dev paths
-  escalating_suppression: true      # New: escalating duplicate suppression
+  rules_source: ""
+  categories: []
+  max_scan_threads: 1         # Single thread to prevent overload
+  scan_timeout: 10            # Reduced timeout
+  rules_path: "yara-rules"
+  max_file_size: "10MB"       # Reduced file size limit
 
 response:
   notification_settings:
     toast_enabled: true
     system_tray_enabled: true
-    desktop_alert_enabled: true
-    sound_enabled: false     # Disabled to reduce noise
-    timeout_seconds: 3       # Reduced timeout for faster dismissal
+    desktop_alert_enabled: false  # Disabled to prevent UI freezes
+    sound_enabled: false
+    timeout_seconds: 5
 
   severity_thresholds:
-    show_user_alerts: 4      # Only show high severity alerts
-    auto_quarantine: 5       # Only quarantine critical threats
-    block_execution: 5       # Only block critical threats
+    show_user_alerts: 5         # Only show critical alerts
+    auto_quarantine: 6          # Disabled (no auto-quarantine)
+    block_execution: 6          # Disabled (no auto-blocking)
 
   user_interaction:
     allow_user_override: true
-    require_admin_for_allow: true
-    timeout_seconds: 30
+    require_admin_for_allow: false
+    timeout_seconds: 15
 
   customization:
     company_branding: false
     custom_messages: false
     language: "en"
 
-  # Enhanced notification settings
-  notification_retry_count: 2       # New: retry failed notifications
-  notification_timeout: 8           # New: notification display timeout
-  duplicate_suppression: 120        # New: suppress duplicates for 2 minutes
-  escalating_suppression: true      # New: escalating suppression
-
 logging:
-  level: "info"            # Keep info level for important events
-  format: "text"           # Text format is more readable
+  level: "info"
+  format: "text"
   file_path: "agent.log"
-  max_size: "50MB"         # Increased log size
-  max_files: 3             # New: keep 3 log files
-  compress: true           # New: compress old logs
+  max_size: "10MB"
+  max_files: 2
+  compress: true
 
-# New: Performance tuning section
+# Performance tuning to prevent system overload
 performance:
-  max_memory_usage: "512MB"        # Memory limit
-  cpu_limit_percent: 20            # CPU usage limit
-  scan_queue_size: 100             # Scan queue limit
-  event_queue_size: 1000           # Event queue limit
-  cleanup_interval: 900            # Cleanup every 15 minutes
-  
-# New: Enhanced suppression rules
+  max_memory_usage: "128MB"      # Reduced memory limit
+  cpu_limit_percent: 10         # Reduced CPU usage limit
+  scan_queue_size: 20           # Reduced queue size
+  event_queue_size: 100         # Reduced event queue
+  cleanup_interval: 1800        # Cleanup every 30 minutes
+
+# Enhanced suppression rules to prevent noise
 suppression:
   rules:
     - type: "path_contains"
       values: 
-        - "\\AgentWindows\\"
-        - "\\internal\\"
-        - "\\go\\src\\"
-        - "\\node_modules\\"
-        - "\\.git\\"
-        - "\\cursor\\user\\workspacestorage\\"
-      reason: "development_path"
+        - "\\Windows\\"
+        - "\\Program Files\\"
+        - "\\Program Files (x86)\\"
+        - "\\ProgramData\\Microsoft\\Windows Defender\\"
+        - "\\$Recycle.Bin\\"
+        - "\\System Volume Information\\"
+        - "\\Recovery\\"
+        - "\\quarantine\\"
+        - "\\edr-agent"
+      reason: "system_path"
       
     - type: "rule_name_contains"
       values:
@@ -213,21 +170,25 @@ suppression:
         - "vmdetect"
         - "anti_dbg"
         - "capabilities"
-      paths:
-        - "C:\\Windows\\"
-        - "C:\\Program Files\\"
-        - "*\\AgentWindows\\*"
-      reason: "environmental_system_path"
+        - "environmental"
+      reason: "environmental_detection"
       
     - type: "file_extension"
       values:
-        - ".go"
-        - ".js"
-        - ".ts"
-        - ".json"
-        - ".yaml"
-        - ".yml"
-        - ".md"
-        - ".txt"
+        - ".tmp"
         - ".log"
-      reason: "source_code_file"
+        - ".bak" 
+        - ".cache"
+        - ".db"
+        - ".sqlite"
+        - ".lock"
+      reason: "temporary_file"
+
+# Safe mode settings
+safe_mode:
+  enabled: true
+  max_file_monitors: 1
+  max_process_monitors: 1
+  disable_real_time: true
+  reduce_scanning: true
+  minimal_logging: true

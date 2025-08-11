@@ -1,10 +1,14 @@
+// internal/monitoring/file_monitor.go - Critical fixes to prevent system freeze
+
 package monitoring
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -21,17 +25,29 @@ type FileMonitor struct {
 	logger    *utils.Logger
 	eventChan chan models.FileEvent
 	stopChan  chan bool
-	handles   []windows.Handle
+	// handles kept for compatibility; removed to avoid unused warnings
 	watchers  map[string]*DirectoryWatcher
-	agentID   string               // Add agent ID field
-	scanner   *scanner.YaraScanner // Add YARA scanner
+	agentID   string
+	scanner   *scanner.YaraScanner
 	lastAlert map[string]time.Time
+
+	// Critical: Add safety mechanisms
+	isShuttingDown bool
+	mu             sync.RWMutex
+	workerCount    int
+	maxWorkers     int
+	rateLimiter    map[string]time.Time
+	rateMu         sync.Mutex
 }
 
 type DirectoryWatcher struct {
-	path   string
-	handle windows.Handle
-	events chan models.FileEvent
+	path    string
+	handle  windows.Handle
+	events  chan models.FileEvent
+	ctx     context.Context
+	cancel  context.CancelFunc
+	stopped bool
+	mu      sync.Mutex
 }
 
 const (
@@ -60,89 +76,223 @@ type FILE_NOTIFY_INFORMATION struct {
 
 func NewFileMonitor(cfg *config.FileSystemConfig, logger *utils.Logger, yaraScanner *scanner.YaraScanner) *FileMonitor {
 	return &FileMonitor{
-		config:    cfg,
-		logger:    logger,
-		eventChan: make(chan models.FileEvent, 1000),
-		stopChan:  make(chan bool),
-		watchers:  make(map[string]*DirectoryWatcher),
-		agentID:   "",          // Will be set later
-		scanner:   yaraScanner, // Provided by caller
-		lastAlert: make(map[string]time.Time),
+		config:      cfg,
+		logger:      logger,
+		eventChan:   make(chan models.FileEvent, 1000),
+		stopChan:    make(chan bool, 1),
+		watchers:    make(map[string]*DirectoryWatcher),
+		agentID:     "",
+		scanner:     yaraScanner,
+		lastAlert:   make(map[string]time.Time),
+		maxWorkers:  5, // Limit concurrent workers
+		rateLimiter: make(map[string]time.Time),
 	}
 }
 
-// Start begins file system monitoring
 func (fm *FileMonitor) Start() error {
-	fm.logger.Info("Starting file system monitor...")
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
 
-	// Validate paths
-	if len(fm.config.Paths) == 0 {
-		return fmt.Errorf("no paths configured for monitoring")
+	if fm.isShuttingDown {
+		return fmt.Errorf("file monitor is shutting down")
 	}
 
-	fm.logger.Info("Configured paths for monitoring: %v", fm.config.Paths)
+	fm.logger.Info("Starting file system monitor...")
 
-	// Start watching each configured path
-	for _, path := range fm.config.Paths {
+	if len(fm.config.Paths) == 0 {
+		fm.logger.Warn("No paths configured for monitoring, using safe defaults")
+		// Set safe default paths
+		fm.config.Paths = []string{
+			"C:\\Users\\%USERNAME%\\Downloads",
+			"C:\\Users\\%USERNAME%\\Desktop",
+		}
+	}
+
+	// Validate and filter paths to prevent system locks
+	validPaths := fm.validatePaths(fm.config.Paths)
+	if len(validPaths) == 0 {
+		return fmt.Errorf("no valid paths found for monitoring")
+	}
+
+	fm.logger.Info("Validated paths for monitoring: %v", validPaths)
+
+	// Start watching each validated path with limits
+	successCount := 0
+	for i, path := range validPaths {
+		if i >= 3 { // Limit to 3 paths to prevent overload
+			fm.logger.Warn("Limiting monitoring to first 3 paths to prevent system overload")
+			break
+		}
+
 		fm.logger.Debug("Attempting to watch directory: %s", path)
-		if err := fm.watchDirectory(path); err != nil {
+		if err := fm.watchDirectorySafe(path); err != nil {
 			fm.logger.Warn("Failed to watch directory %s: %v", path, err)
 			continue
 		}
+		successCount++
 		fm.logger.Info("Successfully started watching directory: %s", path)
 	}
 
-	// Start event processing goroutine
-	go fm.processEvents()
+	if successCount == 0 {
+		return fmt.Errorf("failed to start watching any directories")
+	}
 
-	fm.logger.Info("File system monitor started successfully - watching %d directories", len(fm.watchers))
+	// Start event processing with limited workers
+	go fm.processEventsSafe()
+
+	fm.logger.Info("File system monitor started successfully - watching %d directories", successCount)
 	return nil
 }
 
-// Stop stops file system monitoring
-func (fm *FileMonitor) Stop() {
-	fm.logger.Info("Stopping file system monitor...")
+// validatePaths validates and filters potentially dangerous paths
+func (fm *FileMonitor) validatePaths(paths []string) []string {
+	var validPaths []string
 
-	// Signal stop
-	close(fm.stopChan)
-
-	// Close all watchers
-	for _, watcher := range fm.watchers {
-		windows.CloseHandle(watcher.handle)
+	// Dangerous paths that should never be monitored
+	dangerousPaths := []string{
+		"C:\\Windows\\System32",
+		"C:\\Windows\\SysWOW64",
+		"C:\\Windows\\WinSxS",
+		"C:\\Program Files\\Windows Defender",
+		"C:\\ProgramData\\Microsoft\\Windows Defender",
+		"C:\\Windows\\Temp",
+		"C:\\$Recycle.Bin",
+		"C:\\System Volume Information",
+		"C:\\Recovery",
+		"C:\\Boot",
+		"C:\\hiberfil.sys",
+		"C:\\pagefile.sys",
+		"C:\\swapfile.sys",
 	}
 
-	// Close event channel
+	for _, path := range paths {
+		// Expand environment variables
+		expandedPath := os.ExpandEnv(path)
+
+		// Convert to absolute path
+		absPath, err := filepath.Abs(expandedPath)
+		if err != nil {
+			fm.logger.Warn("Invalid path %s: %v", path, err)
+			continue
+		}
+
+		// Check if path exists
+		if _, err := os.Stat(absPath); os.IsNotExist(err) {
+			fm.logger.Warn("Path does not exist: %s", absPath)
+			continue
+		}
+
+		// Check against dangerous paths
+		isDangerous := false
+		lowerPath := strings.ToLower(absPath)
+		for _, dangerous := range dangerousPaths {
+			if strings.HasPrefix(lowerPath, strings.ToLower(dangerous)) {
+				fm.logger.Warn("Skipping dangerous path: %s", absPath)
+				isDangerous = true
+				break
+			}
+		}
+
+		if !isDangerous {
+			validPaths = append(validPaths, absPath)
+		}
+	}
+
+	return validPaths
+}
+
+func (fm *FileMonitor) Stop() {
+	fm.mu.Lock()
+	fm.isShuttingDown = true
+	fm.mu.Unlock()
+
+	fm.logger.Info("Stopping file system monitor...")
+
+	// Signal stop to all workers
+	select {
+	case fm.stopChan <- true:
+	default:
+		// Channel might be full, that's ok
+	}
+
+	// Stop all watchers with timeout
+	done := make(chan bool, 1)
+	go func() {
+		fm.stopAllWatchers()
+		done <- true
+	}()
+
+	select {
+	case <-done:
+		fm.logger.Info("All watchers stopped successfully")
+	case <-time.After(10 * time.Second):
+		fm.logger.Warn("Watcher shutdown timeout, forcing close")
+	}
+
+	// Close event channel safely
+	select {
+	case <-fm.eventChan:
+		// Drain any remaining events
+	default:
+	}
 	close(fm.eventChan)
 
 	fm.logger.Info("File system monitor stopped")
 }
 
-// GetEventChannel returns the channel for file events
+func (fm *FileMonitor) stopAllWatchers() {
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+
+	for path, watcher := range fm.watchers {
+		fm.logger.Debug("Stopping watcher for: %s", path)
+		watcher.Stop()
+		delete(fm.watchers, path)
+	}
+}
+
 func (fm *FileMonitor) GetEventChannel() <-chan models.FileEvent {
 	return fm.eventChan
 }
 
-// SetAgentID sets the agent ID for events
 func (fm *FileMonitor) SetAgentID(agentID string) {
 	fm.agentID = agentID
 }
 
-// SetScanner sets the YARA scanner
 func (fm *FileMonitor) SetScanner(scanner *scanner.YaraScanner) {
 	fm.scanner = scanner
 }
 
-// watchDirectory sets up monitoring for a specific directory
-func (fm *FileMonitor) watchDirectory(path string) error {
-	// Convert to absolute path
+// watchDirectorySafe sets up monitoring with safety checks
+func (fm *FileMonitor) watchDirectorySafe(path string) error {
+	// Check if already watching
+	fm.mu.RLock()
+	if _, exists := fm.watchers[path]; exists {
+		fm.mu.RUnlock()
+		return fmt.Errorf("already watching path: %s", path)
+	}
+	fm.mu.RUnlock()
+
+	// Check worker limit
+	if fm.workerCount >= fm.maxWorkers {
+		return fmt.Errorf("maximum worker limit reached")
+	}
+
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		return fmt.Errorf("failed to get absolute path: %w", err)
 	}
 
-	// Check if directory exists
-	if _, err := os.Stat(absPath); os.IsNotExist(err) {
+	// Check if directory exists and is accessible
+	fileInfo, err := os.Stat(absPath)
+	if os.IsNotExist(err) {
 		return fmt.Errorf("directory does not exist: %s", absPath)
+	}
+	if err != nil {
+		return fmt.Errorf("cannot access directory: %w", err)
+	}
+	if !fileInfo.IsDir() {
+		return fmt.Errorf("path is not a directory: %s", absPath)
 	}
 
 	// Convert path to Windows format
@@ -151,38 +301,75 @@ func (fm *FileMonitor) watchDirectory(path string) error {
 		return fmt.Errorf("failed to convert path: %w", err)
 	}
 
-	// Open directory handle
-	handle, err := windows.CreateFile(
-		winPath,
-		windows.FILE_LIST_DIRECTORY,
-		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
-		nil,
-		windows.OPEN_EXISTING,
-		windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OVERLAPPED,
-		0,
-	)
-	if err != nil {
+	// Open directory handle with timeout
+	handleChan := make(chan windows.Handle, 1)
+	errChan := make(chan error, 1)
+
+	go func() {
+		handle, err := windows.CreateFile(
+			winPath,
+			windows.FILE_LIST_DIRECTORY,
+			windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+			nil,
+			windows.OPEN_EXISTING,
+			windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OVERLAPPED,
+			0,
+		)
+		if err != nil {
+			errChan <- err
+			return
+		}
+		handleChan <- handle
+	}()
+
+	var handle windows.Handle
+	select {
+	case handle = <-handleChan:
+		// Success
+	case err := <-errChan:
 		return fmt.Errorf("failed to open directory: %w", err)
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("timeout opening directory: %s", absPath)
 	}
 
-	// Create watcher
+	// Create watcher with context for cancellation
+	ctx, cancel := context.WithCancel(context.Background())
 	watcher := &DirectoryWatcher{
 		path:   absPath,
 		handle: handle,
 		events: make(chan models.FileEvent, 100),
+		ctx:    ctx,
+		cancel: cancel,
 	}
 
+	// Add to watchers map
+	fm.mu.Lock()
 	fm.watchers[absPath] = watcher
+	fm.workerCount++
+	fm.mu.Unlock()
 
 	// Start monitoring goroutine
-	go fm.monitorDirectory(watcher)
+	go fm.monitorDirectorySafe(watcher)
 
 	fm.logger.Info("Started monitoring directory: %s", absPath)
 	return nil
 }
 
-// monitorDirectory monitors a single directory for changes
-func (fm *FileMonitor) monitorDirectory(watcher *DirectoryWatcher) {
+// monitorDirectorySafe monitors a directory with safety mechanisms
+func (fm *FileMonitor) monitorDirectorySafe(watcher *DirectoryWatcher) {
+	defer func() {
+		if r := recover(); r != nil {
+			fm.logger.Error("File monitor panic recovered: %v", r)
+		}
+
+		// Cleanup
+		fm.mu.Lock()
+		fm.workerCount--
+		fm.mu.Unlock()
+
+		watcher.Stop()
+	}()
+
 	fm.logger.Info("Starting directory monitoring for: %s", watcher.path)
 
 	buffer := make([]byte, 4096)
@@ -199,32 +386,39 @@ func (fm *FileMonitor) monitorDirectory(watcher *DirectoryWatcher) {
 
 	overlapped.HEvent = event
 
+	// Monitoring loop with context cancellation
 	for {
 		select {
-		case <-fm.stopChan:
+		case <-watcher.ctx.Done():
 			fm.logger.Info("Stopping directory monitoring for: %s", watcher.path)
 			return
+		case <-fm.stopChan:
+			fm.logger.Info("Global stop signal received for: %s", watcher.path)
+			return
 		default:
+			// Check if shutting down
+			fm.mu.RLock()
+			if fm.isShuttingDown {
+				fm.mu.RUnlock()
+				return
+			}
+			fm.mu.RUnlock()
+
 			// Reset overlapped structure
 			overlapped.Internal = 0
 			overlapped.InternalHigh = 0
 			overlapped.Offset = 0
 			overlapped.OffsetHigh = 0
 
-			// Read directory changes
+			// Read directory changes with timeout
 			err := windows.ReadDirectoryChanges(
 				watcher.handle,
 				&buffer[0],
 				uint32(len(buffer)),
-				true, // Watch subtree
+				false, // Don't watch subtree to reduce load
 				FILE_NOTIFY_CHANGE_FILE_NAME|
-					FILE_NOTIFY_CHANGE_DIR_NAME|
-					FILE_NOTIFY_CHANGE_ATTRIBUTES|
-					FILE_NOTIFY_CHANGE_SIZE|
 					FILE_NOTIFY_CHANGE_LAST_WRITE|
-					FILE_NOTIFY_CHANGE_LAST_ACCESS|
-					FILE_NOTIFY_CHANGE_CREATION|
-					FILE_NOTIFY_CHANGE_SECURITY,
+					FILE_NOTIFY_CHANGE_CREATION,
 				&bytesReturned,
 				&overlapped,
 				0,
@@ -232,11 +426,16 @@ func (fm *FileMonitor) monitorDirectory(watcher *DirectoryWatcher) {
 
 			if err != nil {
 				if err == windows.ERROR_IO_PENDING {
-					// Wait for completion
-					_, err = windows.WaitForSingleObject(event, 5000) // 5 second timeout
+					// Wait for completion with timeout
+					result, err := windows.WaitForSingleObject(event, 3000) // 3 second timeout
 					if err != nil {
 						fm.logger.Error("Wait for directory changes failed: %v", err)
 						time.Sleep(1 * time.Second)
+						continue
+					}
+
+					if result == uint32(windows.WAIT_TIMEOUT) {
+						// Timeout is normal, continue monitoring
 						continue
 					}
 
@@ -249,47 +448,130 @@ func (fm *FileMonitor) monitorDirectory(watcher *DirectoryWatcher) {
 					}
 				} else {
 					fm.logger.Error("ReadDirectoryChanges failed: %v", err)
-					time.Sleep(1 * time.Second)
+					time.Sleep(2 * time.Second)
 					continue
 				}
 			}
 
 			if bytesReturned > 0 {
 				fm.logger.Debug("Directory change detected for: %s (bytes: %d)", watcher.path, bytesReturned)
-				fm.processDirectoryChanges(watcher.path, buffer[:bytesReturned])
+				fm.processDirectoryChangesSafe(watcher.path, buffer[:bytesReturned])
 			}
 		}
 	}
 }
 
-// processDirectoryChanges processes directory change notifications
-func (fm *FileMonitor) processDirectoryChanges(dirPath string, buffer []byte) {
-	fm.logger.Debug("Processing directory changes for: %s (buffer size: %d)", dirPath, len(buffer))
+// processDirectoryChangesSafe processes directory change notifications safely
+func (fm *FileMonitor) processDirectoryChangesSafe(dirPath string, buffer []byte) {
+	defer func() {
+		if r := recover(); r != nil {
+			fm.logger.Error("Directory changes processing panic: %v", r)
+		}
+	}()
+
+	fm.logger.Debug("Processing directory changes for: %s", dirPath)
 
 	offset := uint32(0)
+	processedCount := 0
+	maxProcessPerBatch := 50 // Limit processing per batch
 
-	for offset < uint32(len(buffer)) {
+	for offset < uint32(len(buffer)) && processedCount < maxProcessPerBatch {
+		if offset+uint32(unsafe.Sizeof(FILE_NOTIFY_INFORMATION{})) > uint32(len(buffer)) {
+			break
+		}
+
 		info := (*FILE_NOTIFY_INFORMATION)(unsafe.Pointer(&buffer[offset]))
 
-		// Extract filename
-		filename := windows.UTF16ToString((*[1 << 20]uint16)(unsafe.Pointer(&info.FileName[0]))[:info.FileNameLength/2])
+		// Validate structure
+		if info.FileNameLength == 0 || info.FileNameLength > 1024 {
+			break
+		}
+
+		// Calculate filename buffer bounds safely
+		filenameOffset := offset + uint32(unsafe.Offsetof(info.FileName))
+		filenameEnd := filenameOffset + info.FileNameLength
+
+		if filenameEnd > uint32(len(buffer)) {
+			break
+		}
+
+		// Extract filename safely
+		filenameBytes := buffer[filenameOffset:filenameEnd]
+		if len(filenameBytes)%2 != 0 {
+			break // Invalid UTF-16 length
+		}
+
+		// Convert UTF-16 to string
+		utf16Slice := make([]uint16, len(filenameBytes)/2)
+		for i := 0; i < len(utf16Slice); i++ {
+			utf16Slice[i] = uint16(filenameBytes[i*2]) | uint16(filenameBytes[i*2+1])<<8
+		}
+		filename := windows.UTF16ToString(utf16Slice)
+
 		fullPath := filepath.Join(dirPath, filename)
 
-		fm.logger.Debug("Directory change detected: %s (action: %d)", fullPath, info.Action)
+		fm.logger.Debug("Directory change: %s (action: %d)", fullPath, info.Action)
 
-		// Process the event
-		fm.processFileEvent(fullPath, info.Action)
+		// Rate limit processing
+		if fm.shouldRateLimit(fullPath) {
+			fm.logger.Debug("Rate limiting file event: %s", fullPath)
+		} else {
+			// Process the event in a separate goroutine to prevent blocking
+			go fm.processFileEventSafe(fullPath, info.Action)
+		}
 
 		// Move to next entry
 		if info.NextEntryOffset == 0 {
 			break
 		}
 		offset += info.NextEntryOffset
+		processedCount++
 	}
 }
 
-// processFileEvent processes a single file event
-func (fm *FileMonitor) processFileEvent(filePath string, action uint32) {
+// shouldRateLimit checks if we should rate limit processing for this file
+func (fm *FileMonitor) shouldRateLimit(filePath string) bool {
+	fm.rateMu.Lock()
+	defer fm.rateMu.Unlock()
+
+	now := time.Now()
+	lastTime, exists := fm.rateLimiter[filePath]
+
+	if exists && now.Sub(lastTime) < 100*time.Millisecond {
+		return true
+	}
+
+	fm.rateLimiter[filePath] = now
+
+	// Cleanup old entries
+	if len(fm.rateLimiter) > 1000 {
+		cutoff := now.Add(-1 * time.Minute)
+		for path, timestamp := range fm.rateLimiter {
+			if timestamp.Before(cutoff) {
+				delete(fm.rateLimiter, path)
+			}
+		}
+	}
+
+	return false
+}
+
+// processFileEventSafe processes a file event with safety checks
+func (fm *FileMonitor) processFileEventSafe(filePath string, action uint32) {
+	defer func() {
+		if r := recover(); r != nil {
+			fm.logger.Error("File event processing panic: %v", r)
+		}
+	}()
+
+	// Check if shutting down
+	fm.mu.RLock()
+	if fm.isShuttingDown {
+		fm.mu.RUnlock()
+		return
+	}
+	fm.mu.RUnlock()
+
 	fm.logger.Debug("Processing file event: %s, action: %d", filePath, action)
 
 	// Skip if file should be excluded
@@ -298,19 +580,32 @@ func (fm *FileMonitor) processFileEvent(filePath string, action uint32) {
 		return
 	}
 
-	// Get file info
-	fileInfo, err := os.Stat(filePath)
-	if err != nil {
-		// File might have been deleted
-		fileInfo = nil
-		fm.logger.Debug("File not found (may be deleted): %s", filePath)
+	// Get file info with timeout
+	var fileInfo os.FileInfo
+	var err error
+
+	done := make(chan bool, 1)
+	go func() {
+		fileInfo, err = os.Stat(filePath)
+		done <- true
+	}()
+
+	select {
+	case <-done:
+		if err != nil && !os.IsNotExist(err) {
+			fm.logger.Debug("Cannot access file %s: %v", filePath, err)
+			return
+		}
+	case <-time.After(2 * time.Second):
+		fm.logger.Debug("File stat timeout: %s", filePath)
+		return
 	}
 
 	// Create file event
 	event := models.FileEvent{
 		Event: models.Event{
 			ID:        fm.generateEventID(),
-			AgentID:   fm.agentID, // Set agent ID
+			AgentID:   fm.agentID,
 			EventType: "file_event",
 			Timestamp: time.Now(),
 			Severity:  fm.determineSeverity(action, filePath),
@@ -325,117 +620,225 @@ func (fm *FileMonitor) processFileEvent(filePath string, action uint32) {
 	if fileInfo != nil {
 		event.FileSize = fileInfo.Size()
 		event.FileType = fm.getFileType(filePath)
-		event.FileHash = fm.calculateFileHash(filePath)
-		event.Permissions = fm.getFilePermissions(fileInfo)
 		event.UserID = fm.getCurrentUser()
 	}
 
-	fm.logger.Debug("Created file event: %s - %s (size: %d)", event.Action, filePath, event.FileSize)
+	fm.logger.Debug("Created file event: %s - %s", event.Action, filePath)
 
-	// Send event
+	// Send event with timeout
 	select {
 	case fm.eventChan <- event:
 		fm.logger.Debug("File event sent to channel: %s - %s", event.Action, filePath)
+	case <-time.After(1 * time.Second):
+		fm.logger.Warn("Event channel timeout, dropping file event: %s", filePath)
 	default:
 		fm.logger.Warn("Event channel full, dropping file event: %s", filePath)
 	}
 
-	// Scan file with YARA if scanner is available and file is created/modified
-	if fm.scanner != nil && (action == FILE_ACTION_ADDED || action == FILE_ACTION_MODIFIED) {
-		if fileInfo != nil {
-			go func() {
-				result, err := fm.scanner.ScanFile(filePath)
-				if err != nil {
-					fm.logger.Error("YARA scan failed for %s: %v", filePath, err)
-					return
-				}
-				if result != nil && result.Matched {
-					// Suppress common anti-debug/vm detections on system/Edge paths
-					lowerPath := strings.ToLower(filePath)
-					lowerRule := strings.ToLower(result.RuleName)
-					if (strings.Contains(lowerRule, "debuggercheck") ||
-						strings.Contains(lowerRule, "vmdetect") ||
-						strings.Contains(lowerRule, "anti_dbg") ||
-						strings.Contains(lowerRule, "threadcontrol") ||
-						strings.Contains(lowerRule, "seh__vectored")) &&
-						(strings.Contains(lowerPath, "\\windows\\") ||
-							strings.Contains(lowerPath, "edgewebview") ||
-							strings.Contains(lowerPath, "microsoft\\edge") ||
-							strings.Contains(lowerPath, "\\windows\\system32\\openssh\\") ||
-							strings.Contains(lowerPath, "\\cursor\\user\\workspacestorage\\") ||
-							strings.Contains(lowerPath, "workspacestorage") ||
-							strings.Contains(lowerPath, "globalstorage") ||
-							strings.Contains(lowerPath, "anysphere.cursor-retrieval")) {
-						fm.logger.Debug("Suppressing YARA detection for known benign system path: %s -> %s", filePath, result.RuleName)
-						return
-					}
-
-					// Increase dedup window to reduce spam
-					key := filePath + "|" + result.RuleName
-					if t, ok := fm.lastAlert[key]; ok && time.Since(t) < 5*time.Minute {
-						return
-					}
-					fm.lastAlert[key] = time.Now()
-					// Print alert directly to terminal - Force flush to ensure immediate display
-					fmt.Fprintf(os.Stdout, "\n🔍 FILE MONITOR: YARA threat detected!\n")
-					fmt.Fprintf(os.Stdout, "File: %s\n", filePath)
-					fmt.Fprintf(os.Stdout, "Action: %s\n", fm.determineAction(action))
-					fmt.Fprintf(os.Stdout, "Rule: %s\n", result.RuleName)
-					fmt.Fprintf(os.Stdout, "Severity: %d\n", result.Severity)
-					fmt.Fprintf(os.Stdout, "🔍 END FILE MONITOR ALERT\n\n")
-
-					// Force flush to ensure immediate display
-					os.Stdout.Sync()
-
-					fm.logger.Warn("YARA threat detected: %s -> %s", filePath, result.RuleName)
-				}
-			}()
-		}
+	// Scan file with YARA if conditions are met
+	if fm.shouldScanFile(action, filePath, fileInfo) {
+		go fm.scanFileSafe(filePath, action)
 	}
 }
 
-// shouldExcludeFile checks if a file should be excluded from monitoring
-func (fm *FileMonitor) shouldExcludeFile(filePath string) bool {
-	// Check file extension
-	ext := strings.ToLower(filepath.Ext(filePath))
-	for _, excludeExt := range fm.config.ExcludeExtensions {
-		if strings.EqualFold(ext, excludeExt) {
+// shouldScanFile determines if a file should be scanned
+func (fm *FileMonitor) shouldScanFile(action uint32, filePath string, fileInfo os.FileInfo) bool {
+	if fm.scanner == nil {
+		return false
+	}
+
+	// Only scan on create or modify
+	if action != FILE_ACTION_ADDED && action != FILE_ACTION_MODIFIED {
+		return false
+	}
+
+	// Skip if file info is nil
+	if fileInfo == nil {
+		return false
+	}
+
+	// Skip large files
+	if fileInfo.Size() > 50*1024*1024 { // 50MB limit
+		return false
+	}
+
+	// Skip directories
+	if fileInfo.IsDir() {
+		return false
+	}
+
+	return true
+}
+
+// scanFileSafe scans a file with YARA safely
+func (fm *FileMonitor) scanFileSafe(filePath string, action uint32) {
+	defer func() {
+		if r := recover(); r != nil {
+			fm.logger.Error("YARA scan panic: %v", r)
+		}
+	}()
+
+	// Add timeout to YARA scan
+	done := make(chan bool, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fm.logger.Error("YARA scan inner panic: %v", r)
+			}
+			done <- true
+		}()
+
+		result, err := fm.scanner.ScanFile(filePath)
+		if err != nil {
+			fm.logger.Debug("YARA scan failed for %s: %v", filePath, err)
+			return
+		}
+
+		if result != nil && result.Matched && !result.Suppressed {
+			// Apply additional suppression for file monitor context
+			if fm.shouldSuppressScan(filePath, result.RuleName) {
+				fm.logger.Debug("File monitor suppressed YARA detection: %s -> %s", filePath, result.RuleName)
+				return
+			}
+
+			// Log detection
+			fm.logger.Warn("🚨 FILE MONITOR: YARA threat detected!")
+			fm.logger.Warn("File: %s", filePath)
+			fm.logger.Warn("Action: %s", fm.determineAction(action))
+			fm.logger.Warn("Rule: %s", result.RuleName)
+			fm.logger.Warn("Severity: %d", result.Severity)
+		}
+	}()
+
+	select {
+	case <-done:
+		// Scan completed
+	case <-time.After(10 * time.Second):
+		fm.logger.Debug("YARA scan timeout for: %s", filePath)
+	}
+}
+
+// shouldSuppressScan additional suppression logic for file monitor
+func (fm *FileMonitor) shouldSuppressScan(filePath, ruleName string) bool {
+	// Check recent alerts
+	key := filePath + "|" + ruleName
+	if lastTime, exists := fm.lastAlert[key]; exists {
+		if time.Since(lastTime) < 2*time.Minute {
 			return true
 		}
 	}
+	fm.lastAlert[key] = time.Now()
 
-	// Exclude noisy/self paths
-	lower := strings.ToLower(filePath)
-	noisy := []string{
-		"\\elastic\\agent\\data\\",
-		"\\gopls\\",
-		"\\yara-rules\\",
-		"\\quarantine\\",
-	}
-	for _, n := range noisy {
-		if strings.Contains(lower, strings.ToLower(n)) {
-			return true
+	// Cleanup old alerts
+	if len(fm.lastAlert) > 100 {
+		cutoff := time.Now().Add(-10 * time.Minute)
+		for k, v := range fm.lastAlert {
+			if v.Before(cutoff) {
+				delete(fm.lastAlert, k)
+			}
 		}
-	}
-
-	// Check file size
-	if fileInfo, err := os.Stat(filePath); err == nil {
-		maxSize := fm.parseFileSize(fm.config.MaxFileSize)
-		if maxSize > 0 && fileInfo.Size() > maxSize {
-			return true
-		}
-	}
-
-	// Skip temporary files
-	if strings.Contains(strings.ToLower(filePath), "temp") ||
-		strings.Contains(strings.ToLower(filePath), "tmp") {
-		return true
 	}
 
 	return false
 }
 
-// determineAction determines the file action from Windows notification
+// Stop method for DirectoryWatcher
+func (dw *DirectoryWatcher) Stop() {
+	dw.mu.Lock()
+	defer dw.mu.Unlock()
+
+	if dw.stopped {
+		return
+	}
+
+	dw.stopped = true
+
+	if dw.cancel != nil {
+		dw.cancel()
+	}
+
+	if dw.handle != 0 {
+		windows.CloseHandle(dw.handle)
+		dw.handle = 0
+	}
+
+	if dw.events != nil {
+		close(dw.events)
+		dw.events = nil
+	}
+}
+
+// processEventsSafe processes events safely
+func (fm *FileMonitor) processEventsSafe() {
+	defer func() {
+		if r := recover(); r != nil {
+			fm.logger.Error("Event processing panic: %v", r)
+		}
+	}()
+
+	for {
+		select {
+		case <-fm.stopChan:
+			return
+		case event, ok := <-fm.eventChan:
+			if !ok {
+				return
+			}
+			fm.logger.Debug("Processing file event: %s", event.FilePath)
+		case <-time.After(5 * time.Second):
+			// Periodic check to prevent hanging
+			continue
+		}
+	}
+}
+
+// Helper methods remain the same but with additional safety checks
+func (fm *FileMonitor) shouldExcludeFile(filePath string) bool {
+	// Enhanced exclusion logic
+	if filePath == "" {
+		return true
+	}
+
+	// Check file extension
+	ext := strings.ToLower(filepath.Ext(filePath))
+	excludeExts := []string{
+		".tmp", ".log", ".bak", ".cache", ".db", ".sqlite",
+		".etl", ".evtx", ".lock", ".crdownload", ".partial",
+	}
+
+	for _, excludeExt := range excludeExts {
+		if ext == excludeExt {
+			return true
+		}
+	}
+
+	// Additional exclusions specific to preventing system issues
+	lower := strings.ToLower(filePath)
+	dangerousPatterns := []string{
+		"\\windows\\system32\\",
+		"\\windows\\syswow64\\",
+		"\\windows\\winsxs\\",
+		"\\programdata\\microsoft\\windows defender\\",
+		"\\$recycle.bin\\",
+		"\\system volume information\\",
+		"\\recovery\\",
+		"\\windows\\temp\\",
+		"\\appdata\\local\\temp\\",
+		"\\quarantine\\",
+		"\\yara-rules\\",
+		"\\edr-agent",
+	}
+
+	for _, pattern := range dangerousPatterns {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// Other helper methods with safety improvements
 func (fm *FileMonitor) determineAction(action uint32) string {
 	switch action {
 	case FILE_ACTION_ADDED:
@@ -453,58 +856,40 @@ func (fm *FileMonitor) determineAction(action uint32) string {
 	}
 }
 
-// determineSeverity determines event severity based on action and file type
 func (fm *FileMonitor) determineSeverity(action uint32, filePath string) string {
-	// High severity for executable files
 	if fm.isExecutable(filePath) {
 		return "high"
 	}
-
-	// Medium severity for system files
 	if fm.isSystemFile(filePath) {
 		return "medium"
 	}
-
-	// Low severity for other files
 	return "low"
 }
 
-// isExecutable checks if a file is executable
 func (fm *FileMonitor) isExecutable(filePath string) bool {
 	ext := strings.ToLower(filepath.Ext(filePath))
 	executableExts := []string{".exe", ".dll", ".sys", ".scr", ".bat", ".cmd", ".com", ".pif"}
-
 	for _, execExt := range executableExts {
 		if ext == execExt {
 			return true
 		}
 	}
-
 	return false
 }
 
-// isSystemFile checks if a file is a system file
 func (fm *FileMonitor) isSystemFile(filePath string) bool {
-	systemPaths := []string{
-		"\\Windows\\",
-		"\\Program Files\\",
-		"\\Program Files (x86)\\",
-	}
-
+	systemPaths := []string{"\\Windows\\", "\\Program Files\\", "\\Program Files (x86)\\"}
 	filePathLower := strings.ToLower(filePath)
 	for _, sysPath := range systemPaths {
 		if strings.Contains(filePathLower, strings.ToLower(sysPath)) {
 			return true
 		}
 	}
-
 	return false
 }
 
-// getFileType determines the file type
 func (fm *FileMonitor) getFileType(filePath string) string {
 	ext := strings.ToLower(filepath.Ext(filePath))
-
 	switch ext {
 	case ".exe", ".dll", ".sys":
 		return "executable"
@@ -521,48 +906,10 @@ func (fm *FileMonitor) getFileType(filePath string) string {
 	}
 }
 
-// calculateFileHash calculates SHA256 hash of file
-func (fm *FileMonitor) calculateFileHash(filePath string) string {
-	// For performance, only calculate hash for small files or executables
-	if fm.isExecutable(filePath) {
-		// Implementation would calculate SHA256 hash
-		return "hash_placeholder"
-	}
-	return ""
-}
-
-// getFilePermissions gets file permissions as string
-func (fm *FileMonitor) getFilePermissions(fileInfo os.FileInfo) string {
-	// Implementation would extract Windows file permissions
-	return "rw-r--r--"
-}
-
-// getCurrentUser gets current user ID
 func (fm *FileMonitor) getCurrentUser() string {
-	// Implementation would get current user
-	return "current_user"
+	return "current_user" // Simplified implementation
 }
 
-// parseFileSize parses file size string to bytes
-func (fm *FileMonitor) parseFileSize(sizeStr string) int64 {
-	// Implementation would parse size strings like "100MB", "1GB"
-	return 100 * 1024 * 1024 // Default 100MB
-}
-
-// generateEventID generates unique event ID
 func (fm *FileMonitor) generateEventID() string {
 	return fmt.Sprintf("file_%d", time.Now().UnixNano())
-}
-
-// processEvents processes events from all watchers
-func (fm *FileMonitor) processEvents() {
-	for {
-		select {
-		case <-fm.stopChan:
-			return
-		case event := <-fm.eventChan:
-			// Process event (e.g., send to scanner, log, etc.)
-			fm.logger.Debug("Processing file event: %s", event.FilePath)
-		}
-	}
 }
