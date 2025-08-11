@@ -303,25 +303,12 @@ func (a *Agent) heartbeatWorker() {
 
 func (a *Agent) eventWorker() {
 	events := make([]Event, 0, a.config.Agent.EventBatchSize)
-<<<<<<< HEAD
 	// Send batches on a short fixed interval for responsiveness
 	sendInterval := 2 * time.Second
 	ticker := time.NewTicker(sendInterval)
 	defer ticker.Stop()
 
 	a.logger.Info("Event worker started - will send events to server every %v or when batch is full", sendInterval)
-=======
-	// Use heartbeat interval as a conservative default send interval if no dedicated config is available
-	// Avoid hardcoded 2s to reduce noisy batches
-	sendInterval := time.Duration(a.config.Agent.HeartbeatInterval) * time.Second
-	if sendInterval <= 0 {
-		sendInterval = 5 * time.Second
-	}
-	ticker := time.NewTicker(sendInterval)
-	defer ticker.Stop()
-
-	a.logger.Info("Event worker started - will send events to server every 2 seconds or when batch is full")
->>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
 
 	for {
 		select {
@@ -399,7 +386,6 @@ func (a *Agent) monitorEventWorker() {
 		case <-a.stopChan:
 			a.logger.Info("Monitor event worker stopped")
 			return
-<<<<<<< HEAD
 		case event, ok := <-fileEvents:
 			if !ok {
 				fileEvents = nil // disable this case
@@ -429,21 +415,6 @@ func (a *Agent) monitorEventWorker() {
 				registryEvents = nil
 				break
 			}
-=======
-		case event := <-fileEvents:
-			// Convert FileEvent to Event interface and register
-			a.logger.Debug("Received file event: %s", event.EventType)
-			a.RegisterEvent(&event)
-		case event := <-processEvents:
-			// Convert ProcessEvent to Event interface and register
-			a.logger.Debug("Received process event: %s", event.EventType)
-			a.RegisterEvent(&event)
-		case event := <-networkEvents:
-			// Convert NetworkEvent to Event interface and register
-			a.logger.Debug("Received network event: %s", event.EventType)
-			a.RegisterEvent(&event)
-		case event := <-registryEvents:
->>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
 			// Convert RegistryEvent to Event interface and register
 			a.logger.Debug("Received registry event: %s", event.EventType)
 			a.RegisterEvent(&event)
