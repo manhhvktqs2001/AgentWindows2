@@ -6,6 +6,7 @@ import (
 	"time"
 	"unsafe"
 
+	"edr-agent-windows/internal/communication"
 	"edr-agent-windows/internal/config"
 	"edr-agent-windows/internal/models"
 	"edr-agent-windows/internal/utils"
@@ -14,12 +15,13 @@ import (
 )
 
 type NetworkMonitor struct {
-	config      *config.NetworkConfig
-	logger      *utils.Logger
-	eventChan   chan models.NetworkEvent
-	stopChan    chan bool
-	agentID     string
-	connections map[string]*NetworkConnectionInfo
+	config       *config.NetworkConfig
+	logger       *utils.Logger
+	eventChan    chan models.NetworkEvent
+	stopChan     chan bool
+	agentID      string
+	connections  map[string]*NetworkConnectionInfo
+	serverClient *communication.ServerClient // Add server client
 }
 
 type NetworkConnectionInfo struct {

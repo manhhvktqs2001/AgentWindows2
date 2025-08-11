@@ -2,6 +2,7 @@ package monitoring
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 	"unsafe"
@@ -22,38 +23,36 @@ type MemoryScanner struct {
 }
 
 type MemoryRegion struct {
-	BaseAddress    uintptr
-	RegionSize     uintptr
-	Protection     uint32
-	State          uint32
-	Type           uint32
-	IsExecutable   bool
-	IsWritable     bool
-	IsReadable     bool
-	IsPrivate      bool
-	IsImage        bool
-	IsMapped       bool
+	BaseAddress  uintptr
+	RegionSize   uintptr
+	Protection   uint32
+	State        uint32
+	Type         uint32
+	IsExecutable bool
+	IsWritable   bool
+	IsReadable   bool
+	IsPrivate    bool
+	IsImage      bool
+	IsMapped     bool
 }
 
 type MemoryScanResult struct {
-	ProcessID     uint32
-	ProcessName   string
-	RegionCount   int
+	ProcessID         uint32
+	ProcessName       string
+	RegionCount       int
 	SuspiciousRegions []SuspiciousRegion
-	ScanTime      time.Duration
-	ThreatScore   float64
+	ScanTime          time.Duration
+	ThreatScore       float64
 }
 
 type SuspiciousRegion struct {
-	BaseAddress    uintptr
-	Size           uintptr
-	Protection     uint32
-	Reason         string
-	ThreatScore    float64
-	Patterns       []string
+	BaseAddress uintptr
+	Size        uintptr
+	Protection  uint32
+	Reason      string
+	ThreatScore float64
+	Patterns    []string
 }
-
-
 
 // Memory scanner specific constants
 const (
@@ -80,14 +79,11 @@ const (
 // Memory scanner specific API functions
 var (
 	memKernel32 = windows.NewLazySystemDLL("kernel32.dll")
-	memPsapi    = windows.NewLazySystemDLL("psapi.dll")
 
-	memProcOpenProcess           = memKernel32.NewProc("OpenProcess")
-	memProcVirtualQueryEx        = memKernel32.NewProc("VirtualQueryEx")
-	memProcReadProcessMemory     = memKernel32.NewProc("ReadProcessMemory")
-	memProcCloseHandle           = memKernel32.NewProc("CloseHandle")
-	memProcEnumProcessModules    = memPsapi.NewProc("EnumProcessModules")
-	memProcGetModuleInformation = memPsapi.NewProc("GetModuleInformation")
+	memProcOpenProcess       = memKernel32.NewProc("OpenProcess")
+	memProcVirtualQueryEx    = memKernel32.NewProc("VirtualQueryEx")
+	memProcReadProcessMemory = memKernel32.NewProc("ReadProcessMemory")
+	memProcCloseHandle       = memKernel32.NewProc("CloseHandle")
 )
 
 type MEMORY_BASIC_INFORMATION struct {
@@ -101,9 +97,9 @@ type MEMORY_BASIC_INFORMATION struct {
 }
 
 type MODULEINFO struct {
-	LPBaseOfDll     uintptr
-	SizeOfImage     uint32
-	EntryPoint      uintptr
+	LPBaseOfDll uintptr
+	SizeOfImage uint32
+	EntryPoint  uintptr
 }
 
 func NewMemoryScanner(cfg *config.MemoryConfig, logger *utils.Logger) *MemoryScanner {
@@ -187,7 +183,7 @@ func (m *MemoryScanner) performMemoryScan() {
 					Category:  "memory_scan",
 					Source:    "memory_scanner",
 					Data: map[string]interface{}{
-						"scan_result": scanResult,
+						"scan_result":  scanResult,
 						"threat_score": scanResult.ThreatScore,
 					},
 				},
@@ -200,7 +196,7 @@ func (m *MemoryScanner) performMemoryScan() {
 
 			select {
 			case m.eventChan <- event:
-				m.logger.Info("Memory scan event sent for process %s (PID: %d, Score: %.2f)", 
+				m.logger.Info("Memory scan event sent for process %s (PID: %d, Score: %.2f)",
 					process.Name, process.ProcessID, scanResult.ThreatScore)
 			default:
 				m.logger.Warn("Memory event channel full, dropping event")
@@ -209,10 +205,56 @@ func (m *MemoryScanner) performMemoryScan() {
 	}
 }
 
-func (m *MemoryScanner) getRunningProcesses() ([]ProcessInfo, error) {
-	// Implementation to get running processes
-	// This would use Windows API to enumerate processes
-	return []ProcessInfo{}, nil
+// ProcessInfo represents process information for memory scanning
+// ProcessInfoMS is a minimal struct local to memory scanner to avoid conflict with process monitor
+type ProcessInfoMS struct {
+	ProcessID uint32 `json:"process_id"`
+	Name      string `json:"name"`
+}
+
+// getRunningProcesses enumerates running processes using PSAPI EnumProcesses
+func (m *MemoryScanner) getRunningProcesses() ([]ProcessInfoMS, error) {
+	var processes []ProcessInfoMS
+
+	// Get all process IDs
+	var processIDs [1024]uint32
+	var bytesReturned uint32
+
+	psapi := windows.NewLazySystemDLL("psapi.dll")
+	enumProcesses := psapi.NewProc("EnumProcesses")
+
+	ret, _, _ := enumProcesses.Call(
+		uintptr(unsafe.Pointer(&processIDs[0])),
+		uintptr(len(processIDs)*4),
+		uintptr(unsafe.Pointer(&bytesReturned)),
+	)
+
+	if ret == 0 {
+		return nil, fmt.Errorf("failed to enumerate processes")
+	}
+
+	// Convert to process count
+	processCount := bytesReturned / 4
+
+	// Get process names
+	for i := uint32(0); i < processCount; i++ {
+		processID := processIDs[i]
+		if processID == 0 {
+			continue
+		}
+
+		processName, err := m.getProcessName(processID)
+		if err != nil {
+			continue // Skip processes we can't access
+		}
+
+		processes = append(processes, ProcessInfoMS{
+			ProcessID: processID,
+			Name:      processName,
+		})
+	}
+
+	return processes, nil
 }
 
 func (m *MemoryScanner) shouldSkipProcess(processName string) bool {
@@ -263,18 +305,19 @@ func (m *MemoryScanner) scanProcessMemory(processID uint32) (*MemoryScanResult, 
 	scanTime := time.Since(startTime)
 
 	return &MemoryScanResult{
-		ProcessID:        processID,
-		ProcessName:      processName,
-		RegionCount:      len(regions),
+		ProcessID:         processID,
+		ProcessName:       processName,
+		RegionCount:       len(regions),
 		SuspiciousRegions: suspiciousRegions,
-		ScanTime:         scanTime,
-		ThreatScore:      threatScore,
+		ScanTime:          scanTime,
+		ThreatScore:       threatScore,
 	}, nil
 }
 
 func (m *MemoryScanner) openProcessHandle(processID uint32) (windows.Handle, error) {
 	handle, _, err := memProcOpenProcess.Call(
-		uintptr(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ|PROCESS_VM_OPERATION),
+		// Use minimal rights to avoid system impact
+		uintptr(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ),
 		0,
 		uintptr(processID),
 	)
@@ -291,8 +334,37 @@ func (m *MemoryScanner) closeHandle(handle windows.Handle) {
 }
 
 func (m *MemoryScanner) getProcessName(processID uint32) (string, error) {
-	// Implementation to get process name
-	return "Unknown", nil
+	// Open process with query information rights
+	handle, err := windows.OpenProcess(
+		windows.PROCESS_QUERY_LIMITED_INFORMATION,
+		false,
+		processID,
+	)
+	if err != nil {
+		return "", err
+	}
+	defer windows.CloseHandle(handle)
+
+	// Get process image file name
+	var imageName [windows.MAX_PATH]uint16
+	imageNameSize := uint32(len(imageName))
+
+	kernel32 := windows.NewLazySystemDLL("kernel32.dll")
+	queryFullProcessImageNameW := kernel32.NewProc("QueryFullProcessImageNameW")
+
+	ret, _, _ := queryFullProcessImageNameW.Call(
+		uintptr(handle),
+		0, // PROCESS_NAME_WIN32
+		uintptr(unsafe.Pointer(&imageName[0])),
+		uintptr(unsafe.Pointer(&imageNameSize)),
+	)
+
+	if ret == 0 {
+		return fmt.Sprintf("process_%d", processID), nil
+	}
+
+	fullPath := windows.UTF16ToString(imageName[:imageNameSize])
+	return filepath.Base(fullPath), nil
 }
 
 func (m *MemoryScanner) scanMemoryRegions(handle windows.Handle) ([]MemoryRegion, error) {
@@ -423,7 +495,7 @@ func (m *MemoryScanner) calculateThreatScore(suspiciousRegions []SuspiciousRegio
 
 	// Normalize score based on number of suspicious regions
 	avgScore := totalScore / float64(len(suspiciousRegions))
-	
+
 	// Boost score if multiple suspicious regions found
 	if len(suspiciousRegions) > 1 {
 		avgScore *= float64(len(suspiciousRegions)) * 0.1
@@ -434,4 +506,4 @@ func (m *MemoryScanner) calculateThreatScore(suspiciousRegions []SuspiciousRegio
 	}
 
 	return avgScore
-} 
+}

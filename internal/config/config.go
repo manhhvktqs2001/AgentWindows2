@@ -90,9 +90,11 @@ type FileSystemConfig struct {
 	Enabled           bool     `yaml:"enabled"`
 	Paths             []string `yaml:"paths"`              // Paths to monitor
 	ExcludeExtensions []string `yaml:"exclude_extensions"` // Exclude extensions
+	ExcludePaths      []string `yaml:"exclude_paths"`      // Exclude specific paths
 	RealTimeScan      bool     `yaml:"real_time_scan"`     // Real-time scanning
 	Recursive         bool     `yaml:"recursive"`          // Monitor subdirectories
 	MaxFileSize       string   `yaml:"max_file_size"`      // Max file size to scan
+    MaxWorkers        int      `yaml:"max_workers"`        // Max parallel directory watchers
 }
 
 type ProcessConfig struct {
@@ -160,15 +162,16 @@ type YaraConfig struct {
 	ScanTimeout    int      `yaml:"scan_timeout"` // seconds
 	RulesPath      string   `yaml:"rules_path"`
 	MaxFileSize    string   `yaml:"max_file_size"` // e.g., "100MB"
+    Executable     string   `yaml:"yara_executable"` // YARA executable name or full path
 }
 
 type LogConfig struct {
-	Level     string `yaml:"level"`       // debug, info, warn, error
-	Format    string `yaml:"format"`      // json, text
-	FilePath  string `yaml:"file_path"`   // Log file path
-	MaxSize   string `yaml:"max_size"`    // Max log file size
-	Compress  bool   `yaml:"compress"`    // Compress log files
-	MaxSizeMB int    `yaml:"max_size_mb"` // Max size in MB
+	Level    string `yaml:"level"`     // debug, info, warn, error
+	Format   string `yaml:"format"`    // json, text
+	FilePath string `yaml:"file_path"` // Log file path
+	MaxSize  string `yaml:"max_size"`  // Max log file size
+	MaxFiles int    `yaml:"max_files"` // Max number of log files to keep
+	Compress bool   `yaml:"compress"`  // Compress log files
 }
 
 // Load configuration from file
@@ -233,9 +236,11 @@ func Load(configPath string) (*Config, error) {
 				Enabled:           viper.GetBool("monitoring.file_system.enabled"),
 				Paths:             viper.GetStringSlice("monitoring.file_system.paths"),
 				ExcludeExtensions: viper.GetStringSlice("monitoring.file_system.exclude_extensions"),
+				ExcludePaths:      viper.GetStringSlice("monitoring.file_system.exclude_paths"),
 				RealTimeScan:      viper.GetBool("monitoring.file_system.real_time_scan"),
 				Recursive:         viper.GetBool("monitoring.file_system.recursive"),
 				MaxFileSize:       viper.GetString("monitoring.file_system.max_file_size"),
+                MaxWorkers:        viper.GetInt("monitoring.file_system.max_workers"),
 			},
 			Processes: ProcessConfig{
 				Enabled:                 viper.GetBool("monitoring.processes.enabled"),
@@ -298,6 +303,7 @@ func Load(configPath string) (*Config, error) {
 			ScanTimeout:    viper.GetInt("yara.scan_timeout"),
 			RulesPath:      viper.GetString("yara.rules_path"),
 			MaxFileSize:    viper.GetString("yara.max_file_size"),
+            Executable:     viper.GetString("yara.yara_executable"),
 		},
 		Response: ResponseConfig{
 			NotificationSettings: NotificationSettings{
@@ -328,20 +334,14 @@ func Load(configPath string) (*Config, error) {
 			Format:   viper.GetString("logging.format"),
 			FilePath: viper.GetString("logging.file_path"),
 			MaxSize:  viper.GetString("logging.max_size"),
+			MaxFiles: viper.GetInt("logging.max_files"),
+			Compress: viper.GetBool("logging.compress"),
 		},
 	}
 
 	// Debug: Print the unmarshaled config
 	fmt.Printf("DEBUG: Unmarshaled config - Agent: %+v\n", config.Agent)
 	fmt.Printf("DEBUG: Unmarshaled config - Server: %+v\n", config.Server)
-
-	// Validate configuration
-	// if err := validateConfig(&config); err != nil {
-	// 	return nil, fmt.Errorf("invalid configuration: %w", err)
-	// }
-
-	// Debug: Print heartbeat interval value
-	fmt.Printf("DEBUG: Heartbeat interval = %d\n", config.Agent.HeartbeatInterval)
 
 	// Set agent name to hostname if not set
 	if config.Agent.Name == "" {
@@ -372,6 +372,7 @@ func setDefaults() {
 	viper.SetDefault("monitoring.file_system.recursive", true)
 	viper.SetDefault("monitoring.file_system.real_time_scan", true)
 	viper.SetDefault("monitoring.file_system.max_file_size", "100MB")
+    viper.SetDefault("monitoring.file_system.max_workers", 2)
 	viper.SetDefault("monitoring.file_system.exclude_extensions", []string{".tmp", ".log", ".bak"})
 
 	viper.SetDefault("monitoring.processes.enabled", true)
@@ -433,6 +434,7 @@ func setDefaults() {
 	viper.SetDefault("yara.scan_timeout", 30)
 	viper.SetDefault("yara.rules_path", "yara-rules")
 	viper.SetDefault("yara.max_file_size", "100MB")
+    viper.SetDefault("yara.yara_executable", "yara64.exe")
 
 	// Response defaults
 	viper.SetDefault("response.notification_settings.toast_enabled", true)
@@ -455,27 +457,8 @@ func setDefaults() {
 	viper.SetDefault("logging.format", "json")
 	viper.SetDefault("logging.file_path", "C:\\Program Files\\EDR-Agent\\logs\\agent.log")
 	viper.SetDefault("logging.max_size", "100MB")
-}
-
-// Validate configuration
-func validateConfig(config *Config) error {
-	if config.Server.URL == "" {
-		return fmt.Errorf("server URL cannot be empty")
-	}
-
-	if config.Agent.HeartbeatInterval < 10 {
-		return fmt.Errorf("heartbeat interval must be at least 10 seconds")
-	}
-
-	if config.Agent.EventBatchSize < 1 {
-		return fmt.Errorf("event batch size must be at least 1")
-	}
-
-	if config.Agent.MaxQueueSize < 100 {
-		return fmt.Errorf("max queue size must be at least 100")
-	}
-
-	return nil
+	viper.SetDefault("logging.max_files", 5)
+	viper.SetDefault("logging.compress", true)
 }
 
 // Save configuration to file
@@ -496,103 +479,6 @@ func Save(config *Config, filePath string) error {
 	}
 
 	return nil
-}
-
-// Create default configuration file
-func CreateDefaultConfig(filePath string) error {
-	config := &Config{
-		Server: ServerConfig{
-			URL:        "http://192.168.20.85:5000",
-			Timeout:    30,
-			RetryCount: 3,
-			TLSVerify:  false,
-		},
-		Agent: AgentDetails{
-			HeartbeatInterval: 30,
-			EventBatchSize:    100,
-			MaxQueueSize:      10000,
-		},
-		Monitoring: MonitoringConfig{
-			FileSystem: FileSystemConfig{
-				Enabled:           true,
-				Paths:             []string{"C:\\Program Files", "C:\\Program Files (x86)", "C:\\Windows\\System32", "C:\\Users"},
-				Recursive:         true,
-				RealTimeScan:      true,
-				MaxFileSize:       "100MB",
-				ExcludeExtensions: []string{".tmp", ".log", ".bak"},
-			},
-			Processes: ProcessConfig{
-				Enabled:                 true,
-				ScanExecutables:         true,
-				MonitorInjections:       true,
-				TrackNetworkConnections: true,
-				MonitorCmdLine:          true,
-				ExcludeNames:            []string{"explorer.exe", "dwm.exe", "winlogon.exe"},
-			},
-			Network: NetworkConfig{
-				Enabled:           true,
-				MonitorDNS:        true,
-				BlockMaliciousIPs: false,
-				CapturePackets:    false,
-				MonitorTCP:        true,
-				MonitorUDP:        false,
-				ExcludePorts:      []int{135, 445, 5985},
-			},
-			Registry: RegistryConfig{
-				Enabled:               true,
-				MonitorAutostart:      true,
-				TrackSecuritySettings: true,
-				ScanInterval:          30,
-				Paths: []string{
-					"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
-					"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
-					"HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
-				},
-			},
-		},
-		Yara: YaraConfig{
-			Enabled:        true,
-			AutoUpdate:     true,
-			UpdateInterval: "24h",
-			RulesSource:    "local",
-			Categories:     []string{"malware", "backdoor", "trojan", "ransomware"},
-			MaxScanThreads: 4,
-			ScanTimeout:    30,
-			RulesPath:      "yara-rules",
-		},
-		Response: ResponseConfig{
-			NotificationSettings: NotificationSettings{
-				ToastEnabled:        true,
-				SystemTrayEnabled:   true,
-				DesktopAlertEnabled: true,
-				SoundEnabled:        true,
-				TimeoutSeconds:      10,
-			},
-			SeverityThresholds: SeverityThresholds{
-				ShowUserAlerts: 1,
-				AutoQuarantine: 2,
-				BlockExecution: 3,
-			},
-			UserInteraction: UserInteraction{
-				AllowUserOverride:    false,
-				RequireAdminForAllow: true,
-				TimeoutSeconds:       30,
-			},
-			Customization: Customization{
-				CompanyBranding: false,
-				CustomMessages:  false,
-				Language:        "en",
-			},
-		},
-		Log: LogConfig{
-			Level:    "info",
-			Format:   "json",
-			FilePath: "C:\\Program Files\\EDR-Agent\\logs\\agent.log",
-			MaxSize:  "100MB",
-		},
-	}
-
-	return Save(config, filePath)
 }
 
 // LoadOrCreate tải cấu hình từ file hoặc tạo file mặc định nếu không tồn tại
@@ -646,6 +532,7 @@ func createDefaultConfig() *Config {
 				RealTimeScan:      false,
 				MaxFileSize:       "100MB",
 				ExcludeExtensions: []string{},
+				ExcludePaths:      []string{},
 			},
 			Processes: ProcessConfig{
 				Enabled:                 false,
@@ -692,9 +579,10 @@ func createDefaultConfig() *Config {
 				TimeoutSeconds:      0,
 			},
 			SeverityThresholds: SeverityThresholds{
-				ShowUserAlerts: 0,
-				AutoQuarantine: 0,
-				BlockExecution: 0,
+				// Conservative defaults: do not auto-execute actions unless configured
+				ShowUserAlerts: 3,
+				AutoQuarantine: 5,
+				BlockExecution: 5,
 			},
 			UserInteraction: UserInteraction{
 				AllowUserOverride:    false,
@@ -712,6 +600,8 @@ func createDefaultConfig() *Config {
 			Format:   "text",
 			FilePath: "agent.log",
 			MaxSize:  "10MB",
+			MaxFiles: 3,
+			Compress: true,
 		},
 	}
 }
@@ -786,5 +676,11 @@ func ValidateAndFix(config *Config) {
 	if config.Agent.Name == "" {
 		config.Agent.Name = getDefaultAgentName()
 		fmt.Printf("⚠️  Fixed agent name to %s\n", config.Agent.Name)
+	}
+
+	// Ensure max_files is set for logging
+	if config.Log.MaxFiles <= 0 {
+		config.Log.MaxFiles = 5
+		fmt.Println("⚠️  Fixed log max_files to 5")
 	}
 }

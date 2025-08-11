@@ -1,33 +1,54 @@
+# Safe EDR Agent Configuration
+# This configuration is designed to prevent system freezes and minimize system impact
+
 server:
   url: "http://192.168.20.85:5000"
   api_key: "f93ac1d1d7b64f07bd32c81e6ab8423e4cb7631f2051c9d8a2d340c5be3a4a9e"
   auth_token: "edr_system_auth_2025"
   timeout: 30
-  retry_count: 3
+  retry_count: 2
   tls_verify: false
 
 agent:
   id: ""
-  name: "edr-agent-windows"
-  heartbeat_interval: 60
-  event_batch_size: 100
-  max_queue_size: 10000
+  name: "edr-agent-windows-safe"
+  heartbeat_interval: 60     # Send heartbeats more frequently
+  event_batch_size: 100      # Moderate batch size for timely delivery
+  max_queue_size: 1000       # Allow more events before backpressure
 
 monitoring:
   file_system:
     enabled: true
-    paths:
-      - "C:\\Users"
-      - "C:\\Program Files"
-      - "C:\\Program Files (x86)"
-      - "C:\\Windows\\System32"
+    paths:                    # Use concrete paths that actually exist
+      - "C:\\Users\\Manh\\Desktop"
+      - "C:\\Users\\Manh\\Downloads"
+      - "C:\\Users\\Manh\\Documents"
     recursive: true
     real_time_scan: true
-    max_file_size: "100MB"
+    max_file_size: "10MB"     # Reduced file size limit
+    max_workers: 5            # Increased worker limit to handle all directories
     exclude_extensions:
       - ".tmp"
       - ".log"
       - ".bak"
+      - ".cache"
+      - ".db"
+      - ".sqlite"
+      - ".etl"
+      - ".evtx"
+      - ".lock"
+      - ".crdownload"
+      - ".partial"
+    exclude_paths:
+      - "C:\\Windows\\*"
+      - "C:\\Program Files\\*"
+      - "C:\\Program Files (x86)\\*"
+      - "C:\\ProgramData\\Microsoft\\Windows Defender\\*"
+      - "C:\\Users\\*\\AppData\\Local\\Temp\\*"
+      - "C:\\$Recycle.Bin\\*"
+      - "C:\\System Volume Information\\*"
+      - "C:\\Recovery\\*"
+      - "*\\quarantine\\*"
 
   processes:
     enabled: true
@@ -36,78 +57,80 @@ monitoring:
     track_network_connections: true
     monitor_cmdline: true
     exclude_names:
-      - "explorer.exe"
-      - "dwm.exe"
+      - "System"
+      - "Idle"
+      - "Registry"
+      - "smss.exe"
+      - "csrss.exe"
+      - "wininit.exe"
+      - "services.exe"
+      - "lsass.exe"
       - "winlogon.exe"
+      - "svchost.exe"
+      - "dwm.exe"
+      - "explorer.exe"
+      - "taskmgr.exe"
+      - "audiodg.exe"
+      - "conhost.exe"
+      - "fontdrvhost.exe"
 
   network:
     enabled: true
     monitor_dns: true
-    block_malicious_ips: false
-    capture_packets: false
+    block_malicious_ips: true
+    capture_packets: false      # keep off to avoid heavy load
     monitor_tcp: true
-    monitor_udp: false
-    scan_interval: 30
+    monitor_udp: true
+    scan_interval: 120
 
   registry:
     enabled: true
     monitor_autostart: true
     track_security_settings: true
-    scan_interval: 30
-    paths:
-      - "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"
-      - "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce"
-      - "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"
+    scan_interval: 300
 
   memory:
     enabled: true
-    scan_interval: 300
-    threat_threshold: 0.5
-    max_processes: 50
+    scan_interval: 1800
+    threat_threshold: 0.9
+    max_processes: 5
 
   behavior:
     enabled: true
-    analysis_interval: 60
-    threat_threshold: 0.6
-    data_retention: 24
+    analysis_interval: 300
+    threat_threshold: 0.9
+    data_retention: 2
 
 yara:
   enabled: true
-  auto_update: false
-  update_interval: 24h
-  rules_source: https://github.com/Yara-Rules/rules/archive/master.zip
+  rules_path: "yara-rules"
+  yara_executable: "yara64.exe"  # Specify the YARA executable path
   categories:
-    - antidebug_antivm
-    - capabilities
-    - crypto
-    - exploit_kits
-    - maldocs
-    - malware
-    - packers
-    - webshells
-  max_scan_threads: 4
-  scan_timeout: 30
-  rules_path: yara-rules
-  max_file_size: 100MB
+    - "maldocs"
+    - "malware"
+    - "webshells"
+    - "exploit_kits"
+    - "backdoor"
+    - "trojan"
+    - "ransomware"
+  scan_timeout: 30          # seconds
+  max_file_size: "100MB"
 
 response:
   notification_settings:
     toast_enabled: true
-    system_tray_enabled: true
+    system_tray_enabled: false
     desktop_alert_enabled: true
-    sound_enabled: true
-    timeout_seconds: 10
-
+    sound_enabled: false
+    timeout_seconds: 6
   severity_thresholds:
-    show_user_alerts: 3    # Show notifications for Medium+ severity
-    auto_quarantine: 4     # Auto quarantine for High+ severity
-    block_execution: 5     # Block execution for Critical severity
-
+    show_user_alerts: 3     # show alerts for Medium+
+    auto_quarantine: 4      # auto quarantine High/ Critical
+    block_execution: 5      # block only on Critical
   user_interaction:
-    allow_user_override: true
+    allow_user_override: false
     require_admin_for_allow: true
-    timeout_seconds: 30
-
+    timeout_seconds: 20
   customization:
     company_branding: false
     custom_messages: false
@@ -118,3 +141,59 @@ logging:
   format: "text"
   file_path: "agent.log"
   max_size: "10MB"
+  max_files: 2
+  compress: true
+
+# Performance tuning to prevent system overload
+performance:
+  max_memory_usage: "128MB"      # Reduced memory limit
+  cpu_limit_percent: 10         # Reduced CPU usage limit
+  scan_queue_size: 20           # Reduced queue size
+  event_queue_size: 100         # Reduced event queue
+  cleanup_interval: 1800        # Cleanup every 30 minutes
+
+# Enhanced suppression rules to prevent noise
+suppression:
+  rules:
+    - type: "path_contains"
+      values: 
+        - "\\Windows\\"
+        - "\\Program Files\\"
+        - "\\Program Files (x86)\\"
+        - "\\ProgramData\\Microsoft\\Windows Defender\\"
+        - "\\$Recycle.Bin\\"
+        - "\\System Volume Information\\"
+        - "\\Recovery\\"
+        - "\\quarantine\\"
+        - "\\edr-agent"
+      reason: "system_path"
+      
+    - type: "rule_name_contains"
+      values:
+        - "powershell"
+        - "debuggercheck"
+        - "vmdetect"
+        - "anti_dbg"
+        - "capabilities"
+        - "environmental"
+      reason: "environmental_detection"
+      
+    - type: "file_extension"
+      values:
+        - ".tmp"
+        - ".log"
+        - ".bak" 
+        - ".cache"
+        - ".db"
+        - ".sqlite"
+        - ".lock"
+      reason: "temporary_file"
+
+# Safe mode settings
+safe_mode:
+  enabled: false
+  max_file_monitors: 5
+  max_process_monitors: 3
+  disable_real_time: false
+  reduce_scanning: false
+  minimal_logging: false

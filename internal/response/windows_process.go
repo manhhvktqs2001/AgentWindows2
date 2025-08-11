@@ -1,12 +1,16 @@
+// internal/response/windows_process.go
 package response
 
 import (
 	"fmt"
-	"syscall"
+	"path/filepath"
+	"strings"
 	"unsafe"
 
 	"edr-agent-windows/internal/config"
 	"edr-agent-windows/internal/utils"
+
+	"golang.org/x/sys/windows"
 )
 
 // Windows Process Control Implementation
@@ -14,28 +18,26 @@ import (
 
 const (
 	// Process access rights
-	PROCESS_TERMINATE = 0x0001
+	PROCESS_TERMINATE         = 0x0001
 	PROCESS_QUERY_INFORMATION = 0x0400
-	PROCESS_SUSPEND_RESUME = 0x0800
-	
+	PROCESS_SUSPEND_RESUME    = 0x0800
+
 	// Process termination
 	PROCESS_TERMINATE_FORCE = 0x0001
-	
+
 	// Exit codes
 	STILL_ACTIVE = 259
 )
 
 var (
 	// Windows API functions
-	kernel32 = syscall.NewLazyDLL("kernel32.dll")
-	user32Process = syscall.NewLazyDLL("user32.dll")
-	
-	procOpenProcess = kernel32.NewProc("OpenProcess")
-	procTerminateProcess = kernel32.NewProc("TerminateProcess")
-	procGetExitCodeProcess = kernel32.NewProc("GetExitCodeProcess")
-	procEnumProcesses = kernel32.NewProc("EnumProcesses")
+	kernel32 = windows.NewLazySystemDLL("kernel32.dll")
+
+	procOpenProcess              = kernel32.NewProc("OpenProcess")
+	procTerminateProcess         = kernel32.NewProc("TerminateProcess")
+	procGetExitCodeProcess       = kernel32.NewProc("GetExitCodeProcess")
+	procEnumProcesses            = kernel32.NewProc("EnumProcesses")
 	procGetProcessImageFileNameW = kernel32.NewProc("GetProcessImageFileNameW")
-	procGetWindowThreadProcessId = user32Process.NewProc("GetWindowThreadProcessId")
 )
 
 // WindowsProcessController implements Windows process control
@@ -56,12 +58,20 @@ func NewWindowsProcessController(cfg *config.ResponseConfig, logger *utils.Logge
 func (wpc *WindowsProcessController) TerminateProcesses(processID int) error {
 	wpc.logger.Info("Terminating process: %d", processID)
 
+	// Safety guard: refuse to terminate critical system processes
+	if info, err := wpc.GetProcessInfo(processID); err == nil {
+		if isCriticalSystemProcess(info.ImageName) {
+			wpc.logger.Warn("Refusing to terminate critical system process (PID: %d, Image: %s)", processID, info.ImageName)
+			return fmt.Errorf("refuse to terminate critical system process")
+		}
+	}
+
 	// Open process handle
 	handle, err := wpc.openProcess(processID, PROCESS_TERMINATE)
 	if err != nil {
 		return fmt.Errorf("failed to open process %d: %w", processID, err)
 	}
-	defer syscall.CloseHandle(handle)
+	defer windows.CloseHandle(handle)
 
 	// Terminate process
 	success, _, _ := procTerminateProcess.Call(
@@ -107,14 +117,14 @@ func (wpc *WindowsProcessController) SuspendProcess(processID int) error {
 	if err != nil {
 		return fmt.Errorf("failed to open process %d: %w", processID, err)
 	}
-	defer syscall.CloseHandle(handle)
+	defer windows.CloseHandle(handle)
 
 	// Suspend process using NtSuspendProcess
-	ntdll := syscall.NewLazyDLL("ntdll.dll")
+	ntdll := windows.NewLazySystemDLL("ntdll.dll")
 	procNtSuspendProcess := ntdll.NewProc("NtSuspendProcess")
-	
+
 	success, _, _ := procNtSuspendProcess.Call(uintptr(handle))
-	
+
 	if success != 0 {
 		return fmt.Errorf("failed to suspend process %d", processID)
 	}
@@ -132,14 +142,14 @@ func (wpc *WindowsProcessController) ResumeProcess(processID int) error {
 	if err != nil {
 		return fmt.Errorf("failed to open process %d: %w", processID, err)
 	}
-	defer syscall.CloseHandle(handle)
+	defer windows.CloseHandle(handle)
 
 	// Resume process using NtResumeProcess
-	ntdll := syscall.NewLazyDLL("ntdll.dll")
+	ntdll := windows.NewLazySystemDLL("ntdll.dll")
 	procNtResumeProcess := ntdll.NewProc("NtResumeProcess")
-	
+
 	success, _, _ := procNtResumeProcess.Call(uintptr(handle))
-	
+
 	if success != 0 {
 		return fmt.Errorf("failed to resume process %d", processID)
 	}
@@ -155,7 +165,7 @@ func (wpc *WindowsProcessController) GetProcessInfo(processID int) (*ProcessInfo
 	if err != nil {
 		return nil, fmt.Errorf("failed to open process %d: %w", processID, err)
 	}
-	defer syscall.CloseHandle(handle)
+	defer windows.CloseHandle(handle)
 
 	// Get process image file name
 	fileName, err := wpc.getProcessImageFileName(handle)
@@ -174,17 +184,17 @@ func (wpc *WindowsProcessController) GetProcessInfo(processID int) (*ProcessInfo
 	isRunning := success != 0 && exitCode == STILL_ACTIVE
 
 	info := &ProcessInfo{
-		ProcessID:  processID,
-		ImageName:  fileName,
-		IsRunning:  isRunning,
-		ExitCode:   int(exitCode),
+		ProcessID: processID,
+		ImageName: fileName,
+		IsRunning: isRunning,
+		ExitCode:  int(exitCode),
 	}
 
 	return info, nil
 }
 
 // openProcess opens a process handle
-func (wpc *WindowsProcessController) openProcess(processID int, desiredAccess uint32) (syscall.Handle, error) {
+func (wpc *WindowsProcessController) openProcess(processID int, desiredAccess uint32) (windows.Handle, error) {
 	handle, _, err := procOpenProcess.Call(
 		uintptr(desiredAccess),
 		0, // bInheritHandle
@@ -195,24 +205,24 @@ func (wpc *WindowsProcessController) openProcess(processID int, desiredAccess ui
 		return 0, fmt.Errorf("failed to open process: %v", err)
 	}
 
-	return syscall.Handle(handle), nil
+	return windows.Handle(handle), nil
 }
 
 // getProcessImageFileName gets the image file name of a process
-func (wpc *WindowsProcessController) getProcessImageFileName(handle syscall.Handle) (string, error) {
-	var fileName [syscall.MAX_PATH]uint16
-	
+func (wpc *WindowsProcessController) getProcessImageFileName(handle windows.Handle) (string, error) {
+	var fileName [windows.MAX_PATH]uint16
+
 	length, _, err := procGetProcessImageFileNameW.Call(
 		uintptr(handle),
 		uintptr(unsafe.Pointer(&fileName[0])),
-		uintptr(syscall.MAX_PATH),
+		uintptr(windows.MAX_PATH),
 	)
 
 	if length == 0 {
 		return "", fmt.Errorf("failed to get process image file name: %v", err)
 	}
 
-	return syscall.UTF16ToString(fileName[:length]), nil
+	return windows.UTF16ToString(fileName[:length]), nil
 }
 
 // getChildProcesses gets child processes of a given process
@@ -220,11 +230,11 @@ func (wpc *WindowsProcessController) getChildProcesses(parentID int) ([]int, err
 	// This is a simplified implementation
 	// In a real system, you would enumerate all processes and check parent-child relationships
 	var children []int
-	
+
 	// For now, return empty list
 	// TODO: Implement proper child process enumeration
 	wpc.logger.Debug("Child process enumeration not implemented")
-	
+
 	return children, nil
 }
 
@@ -245,4 +255,28 @@ func (wpc *WindowsProcessController) Start() error {
 // Stop stops the Windows process controller
 func (wpc *WindowsProcessController) Stop() {
 	wpc.logger.Info("Windows Process Controller stopped")
-} 
+}
+
+// isCriticalSystemProcess checks if a process image represents a critical system process
+func isCriticalSystemProcess(imagePath string) bool {
+	lowerName := strings.ToLower(filepath.Base(imagePath))
+
+	criticalNames := map[string]bool{
+		"system":          true,
+		"idle":            true,
+		"smss.exe":        true,
+		"csrss.exe":       true,
+		"wininit.exe":     true,
+		"services.exe":    true,
+		"lsass.exe":       true,
+		"winlogon.exe":    true,
+		"svchost.exe":     true,
+		"fontdrvhost.exe": true,
+		"dwm.exe":         true,
+		// Common core shell/service hosts that terminating could destabilize user session
+		"explorer.exe": true,
+		"spoolsv.exe":  true,
+	}
+
+	return criticalNames[lowerName]
+}

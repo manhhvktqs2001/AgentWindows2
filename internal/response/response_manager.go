@@ -2,15 +2,17 @@ package response
 
 import (
 	"fmt"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
+	"edr-agent-windows/internal/communication"
 	"edr-agent-windows/internal/config"
 	"edr-agent-windows/internal/models"
 	"edr-agent-windows/internal/utils"
 )
 
-// ResponseManager quản lý toàn bộ hệ thống phản ứng
 type ResponseManager struct {
 	config            *config.ResponseConfig
 	logger            *utils.Logger
@@ -20,53 +22,70 @@ type ResponseManager struct {
 	evidenceCollector *EvidenceCollector
 	serverClient      interface{}
 
-	// State management
-	activeThreats  map[string]*models.ThreatInfo
-	quarantineList map[string]bool
-	whitelist      map[string]bool
-	mu             sync.RWMutex
+	// Enhanced state management
+	activeThreats     map[string]*models.ThreatInfo
+	quarantineList    map[string]bool
+	whitelist         map[string]bool
+	processedThreats  map[string]time.Time // Prevent duplicate processing
+	suppressedThreats map[string]int       // Track suppression counts
+	mu                sync.RWMutex
 
 	// Channels for communication
 	threatChan   chan *models.ThreatInfo
 	responseChan chan *ResponseAction
 	stopChan     chan bool
+
+	// Performance metrics
+	totalThreats      int64
+	processedCount    int64
+	suppressedCount   int64
+	quarantineCount   int64
+	notificationCount int64
 }
 
-// ResponseAction định nghĩa hành động phản ứng
 type ResponseAction struct {
-	ThreatInfo   *models.ThreatInfo
-	ActionType   string // quarantine, block, alert, etc.
-	Severity     int
-	UserNotified bool
-	AutoExecuted bool
-	Timestamp    time.Time
-	Evidence     map[string]interface{}
+	ThreatInfo        *models.ThreatInfo
+	ActionType        string
+	Severity          int
+	UserNotified      bool
+	AutoExecuted      bool
+	Timestamp         time.Time
+	Evidence          map[string]interface{}
+	Suppressed        bool
+	SuppressionReason string
 }
 
-// NewResponseManager tạo Response Manager mới
 func NewResponseManager(cfg *config.ResponseConfig, logger *utils.Logger, serverClient interface{}) *ResponseManager {
 	rm := &ResponseManager{
-		config:         cfg,
-		logger:         logger,
-		serverClient:   serverClient,
-		activeThreats:  make(map[string]*models.ThreatInfo),
-		quarantineList: make(map[string]bool),
-		whitelist:      make(map[string]bool),
-		threatChan:     make(chan *models.ThreatInfo, 100),
-		responseChan:   make(chan *ResponseAction, 100),
-		stopChan:       make(chan bool),
+		config:            cfg,
+		logger:            logger,
+		serverClient:      serverClient,
+		activeThreats:     make(map[string]*models.ThreatInfo),
+		quarantineList:    make(map[string]bool),
+		whitelist:         make(map[string]bool),
+		processedThreats:  make(map[string]time.Time),
+		suppressedThreats: make(map[string]int),
+		threatChan:        make(chan *models.ThreatInfo, 2000), // Increased buffer
+		responseChan:      make(chan *ResponseAction, 2000),    // Increased buffer
+		stopChan:          make(chan bool),
 	}
 
 	// Initialize components
 	rm.severityAssessor = NewSeverityAssessor(cfg, logger)
 	rm.notificationCtrl = NewNotificationController(cfg, logger)
-	rm.actionEngine = NewActionEngine(cfg, logger)
+
+	// Convert serverClient to proper type for ActionEngine
+	var serverClientTyped *communication.ServerClient
+	if sc, ok := serverClient.(*communication.ServerClient); ok {
+		serverClientTyped = sc
+	}
+
+	rm.actionEngine = NewActionEngine(cfg, logger, serverClientTyped)
 	rm.evidenceCollector = NewEvidenceCollector(cfg, logger)
 
 	return rm
 }
 
-// Start khởi động Response Manager
 func (rm *ResponseManager) Start() error {
 	rm.logger.Info("Starting Response Manager...")
 
@@ -79,51 +98,83 @@ func (rm *ResponseManager) Start() error {
 	return nil
 }
 
-// Stop dừng Response Manager
 func (rm *ResponseManager) Stop() {
 	rm.logger.Info("Stopping Response Manager...")
 	close(rm.stopChan)
 	rm.logger.Info("Response Manager stopped")
 }
 
-// HandleThreat xử lý threat được phát hiện
 func (rm *ResponseManager) HandleThreat(threat *models.ThreatInfo) error {
-	rm.logger.Info("Handling threat: %s (Severity: %d)", threat.ThreatName, threat.Severity)
+	rm.totalThreats++
+	rm.logger.Debug("Handling threat: %s (Severity: %d)", threat.ThreatName, threat.Severity)
+
+	// Quick duplicate check
+	threatKey := fmt.Sprintf("%s|%s", threat.FilePath, threat.ThreatName)
+
+	rm.mu.RLock()
+	if lastProcessed, exists := rm.processedThreats[threatKey]; exists {
+		if time.Since(lastProcessed) < 30*time.Second {
+			rm.suppressedCount++
+			rm.mu.RUnlock()
+			rm.logger.Debug("Suppressing duplicate threat: %s", threatKey)
+			return nil
+		}
+	}
+	rm.mu.RUnlock()
 
 	// Add to active threats
 	rm.mu.Lock()
 	rm.activeThreats[threat.FilePath] = threat
+	rm.processedThreats[threatKey] = time.Now()
 	rm.mu.Unlock()
 
-	// Send to threat processor
+	// Send to threat processor with non-blocking send
 	select {
 	case rm.threatChan <- threat:
 		return nil
 	default:
-		return fmt.Errorf("threat channel full")
+		// Channel is full, process immediately in goroutine
+		rm.logger.Warn("Threat channel full, processing threat immediately: %s", threat.ThreatName)
+		go rm.processThreatSafe(threat)
+		return nil
 	}
 }
 
-// threatProcessor xử lý threats trong background
 func (rm *ResponseManager) threatProcessor() {
 	for {
 		select {
 		case <-rm.stopChan:
 			return
 		case threat := <-rm.threatChan:
-			rm.processThreat(threat)
+			rm.processThreatSafe(threat)
 		}
 	}
 }
 
-// processThreat xử lý một threat cụ thể
+func (rm *ResponseManager) processThreatSafe(threat *models.ThreatInfo) {
+	defer func() {
+		if r := recover(); r != nil {
+			rm.logger.Error("Panic in threat processing: %v", r)
+		}
+	}()
+
+	rm.processThreat(threat)
+}
+
 func (rm *ResponseManager) processThreat(threat *models.ThreatInfo) {
 	startTime := time.Now()
-	rm.logger.Info("Processing threat: %s", threat.ThreatName)
+	rm.processedCount++
+	rm.logger.Debug("Processing threat: %s", threat.ThreatName)
 
-	// Step 1: Assess severity
+	// Step 1: Enhanced severity assessment
+	originalSeverity := threat.Severity
 	severity := rm.severityAssessor.AssessSeverity(threat)
 	threat.Severity = severity
+
+	if severity != originalSeverity {
+		rm.logger.Debug("Severity adjusted: %s from %d to %d",
+			threat.ThreatName, originalSeverity, severity)
+	}
 
 	// Step 2: Check whitelist
 	if rm.isWhitelisted(threat.FilePath) {
@@ -131,33 +182,122 @@ func (rm *ResponseManager) processThreat(threat *models.ThreatInfo) {
 		return
 	}
 
-	// Step 3: Determine response based on severity
-	response := rm.determineResponse(threat)
+	// Step 3: Apply intelligent suppression
+	if suppressed, reason := rm.shouldSuppressThreat(threat); suppressed {
+		rm.suppressedCount++
+		rm.logger.Debug("Threat suppressed (%s): %s", reason, threat.ThreatName)
 
-	// Step 4: Execute automated actions
-	if response.AutoExecuted {
-		rm.executeAutomatedActions(threat, response)
+		// Still create a response record but mark as suppressed
+		response := &ResponseAction{
+			ThreatInfo:        threat,
+			ActionType:        "suppressed",
+			Severity:          severity,
+			UserNotified:      false,
+			AutoExecuted:      false,
+			Timestamp:         time.Now(),
+			Suppressed:        true,
+			SuppressionReason: reason,
+		}
+
+		// Send to response processor for logging
+		select {
+		case rm.responseChan <- response:
+		default:
+			rm.logger.Debug("Response channel full, dropping suppressed response")
+		}
+		return
 	}
 
-	// Step 5: Collect evidence
-	evidence := rm.evidenceCollector.CollectEvidence(threat)
+	// Step 4: Determine response based on severity
+	response := rm.determineResponse(threat)
 
-	// Step 6: Send to response processor
+	// Step 5: Execute automated actions for high-severity threats
+	if response.AutoExecuted {
+		rm.executeAutomatedActionsSafe(threat, response)
+	}
+
+	// Step 6: Handle notifications for significant threats
+	if response.UserNotified && severity >= rm.config.SeverityThresholds.ShowUserAlerts {
+		rm.sendNotificationSafe(threat, severity)
+	}
+
+	// Step 7: Collect evidence
+	evidence := rm.evidenceCollector.CollectEvidence(threat)
 	response.Evidence = evidence
+
+	// Step 8: Send to response processor
 	select {
 	case rm.responseChan <- response:
 	default:
 		rm.logger.Warn("Response channel full, dropping response")
 	}
 
-	// Step 7: Send to server
-	rm.sendToServer(threat, response)
+	// Step 9: Send to server
+	rm.sendToServerSafe(threat, response)
 
 	processingTime := time.Since(startTime)
-	rm.logger.Info("Threat processed in %v: %s (Severity: %d)", processingTime, threat.ThreatName, severity)
+	rm.logger.Debug("Threat processed in %v: %s (Severity: %d)",
+		processingTime, threat.ThreatName, severity)
 }
 
-// determineResponse xác định phản ứng dựa trên severity
+func (rm *ResponseManager) shouldSuppressThreat(threat *models.ThreatInfo) (bool, string) {
+	// Environmental detections on system paths
+	if rm.isEnvironmentalDetection(threat) && rm.isSystemPath(threat.FilePath) {
+		return true, "environmental_system_path"
+	}
+
+	// Very low severity threats
+	if threat.Severity <= 1 {
+		return true, "low_severity"
+	}
+
+	// Quarantine directory
+	if strings.Contains(strings.ToLower(threat.FilePath), "quarantine") {
+		return true, "quarantine_directory"
+	}
+
+	// Repeated suppression tracking
+	threatKey := fmt.Sprintf("%s|%s", threat.FilePath, threat.ThreatName)
+	rm.mu.RLock()
+	suppressCount := rm.suppressedThreats[threatKey]
+	rm.mu.RUnlock()
+
+	if suppressCount >= 10 {
+		return true, "repeated_detection"
+	}
+
+	return false, ""
+}
+
+func (rm *ResponseManager) isEnvironmentalDetection(threat *models.ThreatInfo) bool {
+	return rm.severityAssessor.IsEnvironmentalRule(threat.ThreatName)
+}
+
+func (rm *ResponseManager) isSystemPath(filePath string) bool {
+	if filePath == "" {
+		return false
+	}
+
+	lowerPath := strings.ToLower(filePath)
+	systemPaths := []string{
+		"\\windows\\system32\\",
+		"\\windows\\syswow64\\",
+		"\\program files\\",
+		"\\program files (x86)\\",
+		"edgewebview",
+		"microsoft\\edge",
+		"windowspowershell",
+	}
+
+	for _, sysPath := range systemPaths {
+		if strings.Contains(lowerPath, sysPath) {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (rm *ResponseManager) determineResponse(threat *models.ThreatInfo) *ResponseAction {
 	response := &ResponseAction{
 		ThreatInfo: threat,
@@ -166,8 +306,13 @@ func (rm *ResponseManager) determineResponse(threat *models.ThreatInfo) *Respons
 	}
 
 	switch threat.Severity {
-	case 1, 2: // Low
+	case 1: // Low - Environmental/Informational
 		response.ActionType = "log_only"
+		response.UserNotified = false
+		response.AutoExecuted = false
+
+	case 2: // Low-Medium
+		response.ActionType = "log_monitor"
 		response.UserNotified = false
 		response.AutoExecuted = false
 
@@ -190,87 +335,125 @@ func (rm *ResponseManager) determineResponse(threat *models.ThreatInfo) *Respons
 	return response
 }
 
-// executeAutomatedActions thực hiện hành động tự động
+func (rm *ResponseManager) executeAutomatedActionsSafe(threat *models.ThreatInfo, response *ResponseAction) {
+	defer func() {
+		if r := recover(); r != nil {
+			rm.logger.Error("Panic in automated actions: %v", r)
+		}
+	}()
+
+	rm.executeAutomatedActions(threat, response)
+}
+
 func (rm *ResponseManager) executeAutomatedActions(threat *models.ThreatInfo, response *ResponseAction) {
 	rm.logger.Info("Executing automated actions for threat: %s", threat.ThreatName)
 
-	// Quarantine file if needed
-	if response.Severity >= 4 {
-		err := rm.actionEngine.QuarantineFile(threat.FilePath)
-		if err != nil {
+	// Quarantine file if needed (skip environmental detections and system files)
+	if response.Severity >= rm.config.SeverityThresholds.AutoQuarantine &&
+		!rm.isEnvironmentalDetection(threat) &&
+		!rm.isSystemPath(threat.FilePath) {
+
+		if err := rm.actionEngine.QuarantineFile(threat.FilePath); err != nil {
 			rm.logger.Error("Failed to quarantine file: %v", err)
+		} else {
+			rm.quarantineCount++
+			rm.logger.Info("File quarantined: %s", threat.FilePath)
 		}
 	}
 
-	// Terminate processes if critical
-	if response.Severity == 5 {
-		err := rm.actionEngine.TerminateProcesses(threat.ProcessID)
-		if err != nil {
-			rm.logger.Error("Failed to terminate processes: %v", err)
+	// Terminate processes if critical and not system process
+	if response.Severity >= rm.config.SeverityThresholds.BlockExecution &&
+		threat.ProcessID > 0 &&
+		!rm.isSystemProcess(threat.ProcessID) {
+
+		if err := rm.actionEngine.TerminateProcesses(threat.ProcessID); err != nil {
+			rm.logger.Warn("Failed to terminate process %d: %v", threat.ProcessID, err)
 		}
 	}
 
 	// Block network if critical
-	if response.Severity == 5 {
-		err := rm.actionEngine.BlockNetworkConnections(threat.ProcessID)
-		if err != nil {
-			rm.logger.Error("Failed to block network connections: %v", err)
+	if response.Severity >= rm.config.SeverityThresholds.BlockExecution &&
+		threat.ProcessID > 0 {
+
+		if err := rm.actionEngine.BlockNetworkConnections(threat.ProcessID); err != nil {
+			rm.logger.Warn("Failed to block network connections: %v", err)
 		}
 	}
 }
 
-// responseProcessor xử lý responses trong background
+func (rm *ResponseManager) isSystemProcess(processID int) bool {
+	// Basic system PID checks
+	systemProcessIDs := []int{0, 4} // System Idle and System
+
+	for _, sysID := range systemProcessIDs {
+		if processID == sysID {
+			return true
+		}
+	}
+
+	// Best-effort image-name based guard to avoid terminating core services
+	// We avoid importing the process controller here to keep responsibilities separate.
+	// Instead, depend on ActionEngine/WindowsProcessController for the final safety check.
+	return false
+}
+
+func (rm *ResponseManager) sendNotificationSafe(threat *models.ThreatInfo, severity int) {
+	defer func() {
+		if r := recover(); r != nil {
+			rm.logger.Error("Panic in notification sending: %v", r)
+		}
+	}()
+
+	if rm.notificationCtrl != nil {
+		rm.notificationCount++
+		if err := rm.notificationCtrl.SendNotification(threat, severity); err != nil {
+			rm.logger.Warn("Failed to send notification: %v", err)
+		} else {
+			rm.logger.Debug("✅ User notification sent successfully")
+		}
+	}
+}
+
 func (rm *ResponseManager) responseProcessor() {
 	for {
 		select {
 		case <-rm.stopChan:
 			return
 		case response := <-rm.responseChan:
-			rm.processResponse(response)
+			rm.processResponseSafe(response)
 		}
 	}
 }
 
-// processResponse xử lý một response cụ thể
-func (rm *ResponseManager) processResponse(response *ResponseAction) {
-	rm.logger.Info("Processing response: %s for threat: %s", response.ActionType, response.ThreatInfo.ThreatName)
-
-	// Send notification to user if needed
-	if response.UserNotified {
-		err := rm.notificationCtrl.SendNotification(response.ThreatInfo, response.Severity)
-		if err != nil {
-			rm.logger.Error("Failed to send notification: %v", err)
+func (rm *ResponseManager) processResponseSafe(response *ResponseAction) {
+	defer func() {
+		if r := recover(); r != nil {
+			rm.logger.Error("Panic in response processing: %v", r)
 		}
-	}
+	}()
+
+	rm.processResponse(response)
+}
+
+func (rm *ResponseManager) processResponse(response *ResponseAction) {
+	rm.logger.Debug("Processing response: %s for threat: %s",
+		response.ActionType, response.ThreatInfo.ThreatName)
 
 	// Log response action
-	rm.logger.Info("Response completed: %s (Severity: %d)", response.ActionType, response.Severity)
+	rm.logger.Info("Response completed: %s (Severity: %d, Suppressed: %v)",
+		response.ActionType, response.Severity, response.Suppressed)
 }
 
-// isWhitelisted kiểm tra file có trong whitelist không
-func (rm *ResponseManager) isWhitelisted(filePath string) bool {
-	rm.mu.RLock()
-	defer rm.mu.RUnlock()
-	return rm.whitelist[filePath]
+func (rm *ResponseManager) sendToServerSafe(threat *models.ThreatInfo, response *ResponseAction) {
+	defer func() {
+		if r := recover(); r != nil {
+			rm.logger.Error("Panic in server communication: %v", r)
+		}
+	}()
+
+	rm.sendToServer(threat, response)
 }
 
-// AddToWhitelist thêm file vào whitelist
-func (rm *ResponseManager) AddToWhitelist(filePath string) {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-	rm.whitelist[filePath] = true
-	rm.logger.Info("Added to whitelist: %s", filePath)
-}
-
-// RemoveFromWhitelist xóa file khỏi whitelist
-func (rm *ResponseManager) RemoveFromWhitelist(filePath string) {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-	delete(rm.whitelist, filePath)
-	rm.logger.Info("Removed from whitelist: %s", filePath)
-}
-
-// sendToServer gửi thông tin threat về server
 func (rm *ResponseManager) sendToServer(threat *models.ThreatInfo, response *ResponseAction) {
 	if rm.serverClient == nil {
 		return
@@ -278,29 +461,42 @@ func (rm *ResponseManager) sendToServer(threat *models.ThreatInfo, response *Res
 
 	// Create alert data
 	alertData := map[string]interface{}{
-		"threat_name":   threat.ThreatName,
-		"file_path":     threat.FilePath,
-		"severity":      threat.Severity,
-		"action_type":   response.ActionType,
-		"auto_executed": response.AutoExecuted,
-		"timestamp":     response.Timestamp,
-		"evidence":      response.Evidence,
+		"rule_name":          threat.ThreatName,
+		"title":              fmt.Sprintf("EDR Security Alert - %s", threat.ThreatName),
+		"description":        threat.Description,
+		"file_path":          threat.FilePath,
+		"file_name":          filepath.Base(threat.FilePath),
+		"severity":           threat.Severity,
+		"action_type":        response.ActionType,
+		"auto_executed":      response.AutoExecuted,
+		"user_notified":      response.UserNotified,
+		"suppressed":         response.Suppressed,
+		"suppression_reason": response.SuppressionReason,
+		"detection_time":     response.Timestamp.Format(time.RFC3339),
+		"status":             "new",
+		"event_type":         "threat_detection",
+		"timestamp":          response.Timestamp,
+		"evidence":           response.Evidence,
+		"threat_type":        threat.ThreatType,
+		"confidence":         threat.Confidence,
+		"mitre_technique":    threat.MITRETechnique,
+		"yara_rules":         threat.YaraRules,
 	}
 
 	// Send to server
 	if sendAlert, ok := rm.serverClient.(interface {
 		SendAlert(data map[string]interface{}) error
 	}); ok {
-		err := sendAlert.SendAlert(alertData)
-		if err != nil {
-			rm.logger.Error("Failed to send alert to server: %v", err)
+		if err := sendAlert.SendAlert(alertData); err != nil {
+			rm.logger.Debug("Failed to send alert to server: %v", err)
+		} else {
+			rm.logger.Debug("Alert sent to server successfully")
 		}
 	}
 }
 
-// cleanupWorker dọn dẹp dữ liệu cũ
 func (rm *ResponseManager) cleanupWorker() {
-	ticker := time.NewTicker(1 * time.Hour)
+	ticker := time.NewTicker(15 * time.Minute) // More frequent cleanup
 	defer ticker.Stop()
 
 	for {
@@ -313,23 +509,55 @@ func (rm *ResponseManager) cleanupWorker() {
 	}
 }
 
-// cleanup dọn dẹp dữ liệu cũ
 func (rm *ResponseManager) cleanup() {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
-	// Remove old threats (older than 24 hours)
-	cutoff := time.Now().Add(-24 * time.Hour)
+	cutoff := time.Now().Add(-6 * time.Hour) // Reduced retention time
+
+	// Clean up old threats
 	for filePath, threat := range rm.activeThreats {
 		if threat.Timestamp.Before(cutoff) {
 			delete(rm.activeThreats, filePath)
 		}
 	}
 
-	rm.logger.Debug("Cleanup completed")
+	// Clean up processed threats tracking
+	for key, timestamp := range rm.processedThreats {
+		if timestamp.Before(cutoff) {
+			delete(rm.processedThreats, key)
+		}
+	}
+
+	// Reset suppression counts periodically (clear all to prevent growth)
+	if len(rm.suppressedThreats) > 0 {
+		rm.suppressedThreats = make(map[string]int)
+	}
+
+	rm.logger.Debug("Cleanup completed - Active threats: %d, Processed tracking: %d",
+		len(rm.activeThreats), len(rm.processedThreats))
 }
 
-// GetActiveThreats trả về danh sách threats đang hoạt động
+func (rm *ResponseManager) isWhitelisted(filePath string) bool {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+	return rm.whitelist[filePath]
+}
+
+func (rm *ResponseManager) AddToWhitelist(filePath string) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	rm.whitelist[filePath] = true
+	rm.logger.Info("Added to whitelist: %s", filePath)
+}
+
+func (rm *ResponseManager) RemoveFromWhitelist(filePath string) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	delete(rm.whitelist, filePath)
+	rm.logger.Info("Removed from whitelist: %s", filePath)
+}
+
 func (rm *ResponseManager) GetActiveThreats() []*models.ThreatInfo {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
@@ -341,7 +569,6 @@ func (rm *ResponseManager) GetActiveThreats() []*models.ThreatInfo {
 	return threats
 }
 
-// GetQuarantineList trả về danh sách file đã quarantine
 func (rm *ResponseManager) GetQuarantineList() map[string]bool {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
@@ -351,4 +578,22 @@ func (rm *ResponseManager) GetQuarantineList() map[string]bool {
 		result[k] = v
 	}
 	return result
+}
+
+// GetStats returns performance statistics
+func (rm *ResponseManager) GetStats() map[string]interface{} {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+
+	return map[string]interface{}{
+		"total_threats":       rm.totalThreats,
+		"processed_count":     rm.processedCount,
+		"suppressed_count":    rm.suppressedCount,
+		"quarantine_count":    rm.quarantineCount,
+		"notification_count":  rm.notificationCount,
+		"active_threats":      len(rm.activeThreats),
+		"whitelisted_files":   len(rm.whitelist),
+		"threat_queue_size":   len(rm.threatChan),
+		"response_queue_size": len(rm.responseChan),
+	}
 }

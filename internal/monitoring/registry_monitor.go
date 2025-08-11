@@ -10,16 +10,20 @@ import (
 	"edr-agent-windows/internal/models"
 	"edr-agent-windows/internal/utils"
 
+	"sync"
+
 	"golang.org/x/sys/windows"
 )
 
 type RegistryMonitor struct {
-	config    *config.RegistryConfig
-	logger    *utils.Logger
-	eventChan chan models.RegistryEvent
-	stopChan  chan bool
-	agentID   string
-	watchers  map[string]*RegistryWatcher
+	config     *config.RegistryConfig
+	logger     *utils.Logger
+	eventChan  chan models.RegistryEvent
+	stopChan   chan bool
+	agentID    string
+	watchers   map[string]*RegistryWatcher
+	isStopping bool
+	mu         sync.RWMutex
 }
 
 type RegistryWatcher struct {
@@ -97,6 +101,9 @@ func NewRegistryMonitor(cfg *config.RegistryConfig, logger *utils.Logger) *Regis
 
 func (rm *RegistryMonitor) Start() error {
 	rm.logger.Info("Starting registry monitor...")
+	rm.mu.Lock()
+	rm.isStopping = false
+	rm.mu.Unlock()
 
 	// Validate paths
 	if len(rm.config.Paths) == 0 {
@@ -120,6 +127,9 @@ func (rm *RegistryMonitor) Start() error {
 
 func (rm *RegistryMonitor) Stop() {
 	rm.logger.Info("Stopping registry monitor...")
+	rm.mu.Lock()
+	rm.isStopping = true
+	rm.mu.Unlock()
 
 	// Signal stop
 	close(rm.stopChan)
@@ -128,6 +138,7 @@ func (rm *RegistryMonitor) Stop() {
 	for _, watcher := range rm.watchers {
 		if watcher.handle != 0 {
 			procRegCloseKey.Call(uintptr(watcher.handle))
+			watcher.handle = 0
 		}
 		close(watcher.events)
 	}
@@ -199,7 +210,7 @@ func (rm *RegistryMonitor) monitorRegistryKey(watcher *RegistryWatcher) {
 				time.Sleep(time.Second)
 				continue
 			}
-			defer windows.CloseHandle(event)
+			// Ensure we close the event handle each iteration
 
 			// Wait for registry changes
 			ret, _, _ := procRegNotifyChangeKeyValue.Call(
@@ -211,6 +222,7 @@ func (rm *RegistryMonitor) monitorRegistryKey(watcher *RegistryWatcher) {
 			)
 
 			if ret != 0 {
+				windows.CloseHandle(event)
 				rm.logger.Error("RegNotifyChangeKeyValue failed for %s: %d", watcher.keyPath, ret)
 				time.Sleep(time.Second)
 				continue
@@ -218,6 +230,7 @@ func (rm *RegistryMonitor) monitorRegistryKey(watcher *RegistryWatcher) {
 
 			// Wait for the event to be signaled
 			_, err = windows.WaitForSingleObject(event, windows.INFINITE)
+			windows.CloseHandle(event)
 			if err != nil {
 				rm.logger.Error("WaitForSingleObject failed for %s: %v", watcher.keyPath, err)
 				time.Sleep(time.Second)
@@ -225,6 +238,12 @@ func (rm *RegistryMonitor) monitorRegistryKey(watcher *RegistryWatcher) {
 			}
 
 			// Process changes
+			rm.mu.RLock()
+			stopping := rm.isStopping
+			rm.mu.RUnlock()
+			if stopping || watcher.handle == 0 {
+				return
+			}
 			rm.processRegistryChanges(watcher)
 		}
 	}
@@ -234,7 +253,12 @@ func (rm *RegistryMonitor) processRegistryChanges(watcher *RegistryWatcher) {
 	// Enumerate values to detect changes
 	values, err := rm.enumerateRegistryValues(watcher.handle)
 	if err != nil {
-		rm.logger.Error("Failed to enumerate registry values for %s: %v", watcher.keyPath, err)
+		rm.mu.RLock()
+		stopping := rm.isStopping
+		rm.mu.RUnlock()
+		if !stopping {
+			rm.logger.Error("Failed to enumerate registry values for %s: %v", watcher.keyPath, err)
+		}
 		return
 	}
 
