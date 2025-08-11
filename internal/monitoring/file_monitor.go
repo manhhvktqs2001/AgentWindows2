@@ -58,22 +58,37 @@ type DirectoryWatcher struct {
 
 const (
 	// Reduced constants to prevent system overload
+<<<<<<< HEAD
 	SAFE_BUFFER_SIZE  = 512              // Reduced from 1024 for better performance
 	MAX_EVENTS        = 10               // Reduced from 20 for better performance
 	OPERATION_TIMEOUT = 3 * time.Second  // Reduced from 5 seconds
 	MAX_FILE_SIZE     = 25 * 1024 * 1024 // 25MB limit (reduced from 50MB)
+=======
+	SAFE_BUFFER_SIZE  = 1024 // Reduced from 4096
+	MAX_EVENTS        = 20   // Limit events per batch
+	OPERATION_TIMEOUT = 5 * time.Second
+	MAX_FILE_SIZE     = 50 * 1024 * 1024 // 50MB limit
+>>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
 )
 
 func NewFileMonitor(cfg *config.FileSystemConfig, logger *utils.Logger, yaraScanner *scanner.YaraScanner) *FileMonitor {
 	return &FileMonitor{
 		config:           cfg,
 		logger:           logger,
+<<<<<<< HEAD
 		eventChan:        make(chan models.FileEvent, 200), // Reduced from 500 for better performance
+=======
+		eventChan:        make(chan models.FileEvent, 500), // Reduced buffer
+>>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
 		stopChan:         make(chan bool, 1),
 		watchers:         make(map[string]*DirectoryWatcher),
 		agentID:          "",
 		scanner:          yaraScanner,
+<<<<<<< HEAD
         maxWorkers:       chooseMaxWorkers(cfg),
+=======
+		maxWorkers:       3, // Reduced from 5
+>>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
 		rateLimiter:      make(map[string]time.Time),
 		operationTimeout: OPERATION_TIMEOUT,
 		maxFileSize:      MAX_FILE_SIZE,
@@ -81,6 +96,7 @@ func NewFileMonitor(cfg *config.FileSystemConfig, logger *utils.Logger, yaraScan
 	}
 }
 
+<<<<<<< HEAD
 // chooseMaxWorkers picks max workers from config if set (>0), otherwise default to 2
 func chooseMaxWorkers(cfg *config.FileSystemConfig) int {
     if cfg != nil && cfg.MaxWorkers > 0 {
@@ -97,6 +113,24 @@ func (fm *FileMonitor) Start() error {
 		fm.logger.Warn("Agent ID not set, some features may be limited")
 	}
 
+=======
+func (fm *FileMonitor) Start() error {
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+
+	if fm.isShuttingDown {
+		return fmt.Errorf("file monitor is shutting down")
+	}
+
+	fm.logger.Info("Starting file system monitor with safety limits...")
+
+	// CRITICAL: Skip monitoring if no paths or disable by default
+	if len(fm.config.Paths) == 0 || !fm.config.Enabled {
+		fm.logger.Info("File monitoring disabled or no paths configured")
+		return nil
+	}
+
+>>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
 	// Validate and filter paths more strictly
 	validPaths := fm.validateAndFilterPaths(fm.config.Paths)
 	if len(validPaths) == 0 {
@@ -104,10 +138,17 @@ func (fm *FileMonitor) Start() error {
 		return nil
 	}
 
+<<<<<<< HEAD
 	// Limit to maximum 5 paths to prevent overload (increased from 2)
 	if len(validPaths) > 5 {
 		validPaths = validPaths[:5]
 		fm.logger.Info("Limited monitoring to first 5 paths to prevent system overload")
+=======
+	// Limit to maximum 2 paths to prevent overload
+	if len(validPaths) > 2 {
+		validPaths = validPaths[:2]
+		fm.logger.Warn("Limited monitoring to first 2 paths to prevent system overload")
+>>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
 	}
 
 	// Start watching each validated path with strict limits
@@ -128,9 +169,12 @@ func (fm *FileMonitor) Start() error {
 	// Start event processing with strict limits
 	go fm.processEventsWithLimits()
 
+<<<<<<< HEAD
 	// Start rate limiter cleanup worker
 	go fm.rateLimiterCleanupWorker()
 
+=======
+>>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
 	fm.logger.Info("File system monitor started successfully - watching %d directories", successCount)
 	return nil
 }
@@ -158,6 +202,7 @@ func (fm *FileMonitor) validateAndFilterPaths(paths []string) []string {
 	}
 
 	for _, path := range paths {
+<<<<<<< HEAD
 		fm.logger.Debug("Processing path: %s", path)
 
 		expandedPath := expandWindowsEnv(os.ExpandEnv(path))
@@ -170,6 +215,15 @@ func (fm *FileMonitor) validateAndFilterPaths(paths []string) []string {
 		}
 		fm.logger.Debug("Absolute path: %s", absPath)
 
+=======
+		expandedPath := os.ExpandEnv(path)
+		absPath, err := filepath.Abs(expandedPath)
+		if err != nil {
+			fm.logger.Warn("Invalid path %s: %v", path, err)
+			continue
+		}
+
+>>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
 		// Check if path exists
 		if _, err := os.Stat(absPath); os.IsNotExist(err) {
 			fm.logger.Warn("Path does not exist: %s", absPath)
@@ -197,6 +251,7 @@ func (fm *FileMonitor) validateAndFilterPaths(paths []string) []string {
 
 		if !isDangerous {
 			validPaths = append(validPaths, absPath)
+<<<<<<< HEAD
 			fm.logger.Debug("Added valid path: %s", absPath)
 		}
 	}
@@ -253,16 +308,42 @@ func (fm *FileMonitor) watchDirectorySafe(path string) error {
 	// Create context for cancellation
 	ctx, cancel := context.WithCancel(context.Background())
 
+=======
+		}
+	}
+
+	return validPaths
+}
+
+func (fm *FileMonitor) watchDirectorySafe(path string) error {
+	// Check worker limit
+	fm.mu.RLock()
+	if fm.workerCount >= fm.maxWorkers {
+		fm.mu.RUnlock()
+		return fmt.Errorf("maximum worker limit reached")
+	}
+	fm.mu.RUnlock()
+
+	// Create context for cancellation
+	ctx, cancel := context.WithCancel(context.Background())
+
+>>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
 	// Try to open directory with timeout
 	winPath, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		cancel()
+<<<<<<< HEAD
 		fm.logger.Error("Failed to convert path to UTF16: %s, error: %v", path, err)
 		return fmt.Errorf("failed to convert path: %w", err)
 	}
 
 	fm.logger.Debug("Converted path to UTF16: %s", path)
 
+=======
+		return fmt.Errorf("failed to convert path: %w", err)
+	}
+
+>>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
 	// Open with OVERLAPPED to allow cancellable, non-blocking I/O
 	handle, err := windows.CreateFile(
 		winPath,
@@ -275,12 +356,18 @@ func (fm *FileMonitor) watchDirectorySafe(path string) error {
 	)
 	if err != nil {
 		cancel()
+<<<<<<< HEAD
 		fm.logger.Error("Failed to open directory with CreateFile: %s, error: %v", path, err)
 		return fmt.Errorf("failed to open directory: %w", err)
 	}
 
 	fm.logger.Debug("Successfully opened directory handle: %s", path)
 
+=======
+		return fmt.Errorf("failed to open directory: %w", err)
+	}
+
+>>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
 	watcher := &DirectoryWatcher{
 		path:   path,
 		handle: handle,
@@ -456,7 +543,11 @@ func (fm *FileMonitor) shouldProcessFile(filePath string) bool {
 
 	now := time.Now()
 	if lastTime, exists := fm.rateLimiter[filePath]; exists {
+<<<<<<< HEAD
 		if now.Sub(lastTime) < 500*time.Millisecond { // Increased from 200ms for better performance
+=======
+		if now.Sub(lastTime) < 200*time.Millisecond { // Increased rate limit
+>>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
 			return false
 		}
 	}
@@ -491,6 +582,7 @@ func (fm *FileMonitor) processFileEventSafely(filePath string, action uint32) {
 	fm.mu.RLock()
 	if fm.isShuttingDown {
 		fm.mu.RUnlock()
+<<<<<<< HEAD
 		return
 	}
 	fm.mu.RUnlock()
@@ -559,9 +651,13 @@ func (fm *FileMonitor) scanFileAndAlert(filePath string) {
 
 	if fm.scanner == nil {
 		fm.logger.Debug("YARA scanner not available")
+=======
+>>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
 		return
 	}
+	fm.mu.RUnlock()
 
+<<<<<<< HEAD
 	result, err := fm.scanner.ScanFile(filePath)
 	if err != nil {
 		fm.logger.Debug("YARA scan error: %v", err)
@@ -603,19 +699,76 @@ func (fm *FileMonitor) processEventsWithLimits() {
 			if watcherCount > 0 {
 				fm.logger.Debug("File monitor health check: %d active watchers", watcherCount)
 			}
+=======
+	// Create event with timeout
+	done := make(chan bool, 1)
+	go func() {
+		defer func() { done <- true }()
+
+		event := models.FileEvent{
+			Event: models.Event{
+				ID:        fm.generateEventID(),
+				AgentID:   fm.agentID,
+				EventType: "file_event",
+				Timestamp: time.Now(),
+				Severity:  "low", // Default to low
+				Category:  "file_system",
+				Source:    "file_monitor",
+				FilePath:  filePath,
+			},
+			Action: fm.determineAction(action),
 		}
+
+		// Send with timeout
+		select {
+		case fm.eventChan <- event:
+			fm.logger.Debug("File event sent: %s", filePath)
+		case <-time.After(500 * time.Millisecond):
+			fm.logger.Debug("Event send timeout: %s", filePath)
+		}
+	}()
+
+	select {
+	case <-done:
+		// Completed
+	case <-time.After(2 * time.Second):
+		fm.logger.Debug("File processing timeout: %s", filePath)
 	}
 }
 
+func (fm *FileMonitor) processEventsWithLimits() {
+	defer func() {
+		if r := recover(); r != nil {
+			fm.logger.Error("Event processing panic: %v", r)
+>>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
+		}
+	}()
+
+<<<<<<< HEAD
 // Start a lightweight worker to periodically cleanup rate limiter (if needed elsewhere)
 func (fm *FileMonitor) rateLimiterCleanupWorker() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+=======
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+>>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
 	for {
 		select {
 		case <-fm.stopChan:
 			return
+<<<<<<< HEAD
 		case <-ticker.C:
+=======
+		case event, ok := <-fm.eventChan:
+			if !ok {
+				return
+			}
+			fm.logger.Debug("Processing file event: %s", event.FilePath)
+		case <-ticker.C:
+			// Periodic cleanup
+>>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
 			fm.cleanupRateLimiter()
 		}
 	}

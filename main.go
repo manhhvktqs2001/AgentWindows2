@@ -356,12 +356,21 @@ func main() {
 		select {
 		case err := <-startDone:
 			if err != nil {
+<<<<<<< HEAD
 				// Do not terminate the process; log and keep running to allow retries/offline mode
 				logger.Error("Agent start reported error: %v (continuing in degraded mode)", err)
 			}
 		case <-time.After(120 * time.Second): // Increased from 60 to 120 seconds
 			// Keep running; background components might still be operational
 			logger.Warn("Agent start timeout (continuing - this is normal for first startup)")
+=======
+				logger.Error("Failed to start agent: %v", err)
+				log.Fatalf("Failed to start agent: %v", err)
+			}
+		case <-time.After(60 * time.Second):
+			logger.Error("Agent start timeout")
+			log.Fatalf("Agent start timeout")
+>>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
 		}
 
 		logger.Info("✅ EDR Agent started successfully")

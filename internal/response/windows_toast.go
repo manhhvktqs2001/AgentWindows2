@@ -81,7 +81,11 @@ func (wtn *WindowsToastNotifier) Start() error {
 		return nil
 	}
 
+<<<<<<< HEAD
 	// Try to initialize persistent tray icon, but don't fail if it doesn't work
+=======
+	// Initialize persistent tray icon (no balloon yet)
+>>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
 	wtn.nid = NOTIFYICONDATA{}
 	wtn.nid.CbSize = uint32(unsafe.Sizeof(wtn.nid))
 	wtn.nid.UID = 1
@@ -96,6 +100,7 @@ func (wtn *WindowsToastNotifier) Start() error {
 
 	ret, _, _ := procShellNotifyIconW.Call(NIM_ADD, uintptr(unsafe.Pointer(&wtn.nid)))
 	if ret == 0 {
+<<<<<<< HEAD
 		// Don't fail - just log and continue without tray icon
 		wtn.logger.Debug("Tray icon not available, continuing without system tray")
 		wtn.hasIcon = false
@@ -103,6 +108,11 @@ func (wtn *WindowsToastNotifier) Start() error {
 	}
 	wtn.hasIcon = true
 	wtn.logger.Info("✅ Windows Toast Notifier started with tray icon")
+=======
+		return fmt.Errorf("failed to add tray icon")
+	}
+	wtn.hasIcon = true
+>>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
 	return nil
 }
 
@@ -131,10 +141,18 @@ func (wtn *WindowsToastNotifier) showSystemTrayNotification(content *Notificatio
 	wtn.mu.Lock()
 	defer wtn.mu.Unlock()
 
+<<<<<<< HEAD
 	// If no tray icon, fall back to message box
 	if !wtn.hasIcon {
 		wtn.logger.Debug("No tray icon available, using message box fallback")
 		return wtn.showMessageBoxAlert(content)
+=======
+	// Ensure persistent icon exists
+	if !wtn.hasIcon {
+		if err := wtn.Start(); err != nil {
+			return err
+		}
+>>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
 	}
 
 	// Update icon based on severity
@@ -158,8 +176,12 @@ func (wtn *WindowsToastNotifier) showSystemTrayNotification(content *Notificatio
 	// Show balloon by modifying existing icon
 	ret, _, _ := procShellNotifyIconW.Call(NIM_MODIFY, uintptr(unsafe.Pointer(&wtn.nid)))
 	if ret == 0 {
+<<<<<<< HEAD
 		wtn.logger.Debug("System tray notification failed, using message box fallback")
 		return wtn.showMessageBoxAlert(content)
+=======
+		return fmt.Errorf("failed to show system tray notification")
+>>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
 	}
 
 	wtn.logger.Info("✅ System tray notification displayed: %s", title)

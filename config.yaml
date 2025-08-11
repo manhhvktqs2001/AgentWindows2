@@ -12,6 +12,7 @@ server:
 agent:
   id: ""
   name: "edr-agent-windows-safe"
+<<<<<<< HEAD
   heartbeat_interval: 60     # Send heartbeats more frequently
   event_batch_size: 100      # Moderate batch size for timely delivery
   max_queue_size: 1000       # Allow more events before backpressure
@@ -27,6 +28,19 @@ monitoring:
     real_time_scan: true
     max_file_size: "10MB"     # Reduced file size limit
     max_workers: 5            # Increased worker limit to handle all directories
+=======
+  heartbeat_interval: 300    # Increased to reduce server traffic
+  event_batch_size: 50       # Reduced batch size
+  max_queue_size: 500        # Reduced queue size to prevent memory issues
+
+monitoring:
+  file_system:
+    enabled: false            # Disabled by default for safety
+    paths: []                 # Empty paths to prevent system monitoring
+    recursive: false
+    real_time_scan: false
+    max_file_size: "10MB"     # Reduced file size limit
+>>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
     exclude_extensions:
       - ".tmp"
       - ".log"
@@ -51,11 +65,11 @@ monitoring:
       - "*\\quarantine\\*"
 
   processes:
-    enabled: true
-    scan_executables: true
-    monitor_injections: true
-    track_network_connections: true
-    monitor_cmdline: true
+    enabled: false            # Disabled by default for safety
+    scan_executables: false
+    monitor_injections: false
+    track_network_connections: false
+    monitor_cmdline: false
     exclude_names:
       - "System"
       - "Idle"
@@ -75,6 +89,7 @@ monitoring:
       - "fontdrvhost.exe"
 
   network:
+<<<<<<< HEAD
     enabled: true
     monitor_dns: true
     block_malicious_ips: true
@@ -91,17 +106,41 @@ monitoring:
 
   memory:
     enabled: true
+=======
+    enabled: false            # Disabled to reduce system load
+    monitor_dns: false
+    block_malicious_ips: false
+    capture_packets: false
+    monitor_tcp: false
+    monitor_udp: false
+    scan_interval: 300
+
+  registry:
+    enabled: false            # Disabled to reduce noise
+    monitor_autostart: false
+    track_security_settings: false
+    scan_interval: 600
+
+  memory:
+    enabled: false            # Disabled to prevent system impact
+>>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
     scan_interval: 1800
     threat_threshold: 0.9
     max_processes: 5
 
   behavior:
+<<<<<<< HEAD
     enabled: true
     analysis_interval: 300
+=======
+    enabled: false            # Disabled to reduce system impact
+    analysis_interval: 600
+>>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
     threat_threshold: 0.9
     data_retention: 2
 
 yara:
+<<<<<<< HEAD
   enabled: true
   rules_path: "yara-rules"
   yara_executable: "yara64.exe"  # Specify the YARA executable path
@@ -115,10 +154,22 @@ yara:
     - "ransomware"
   scan_timeout: 30          # seconds
   max_file_size: "100MB"
+=======
+  enabled: false              # Disabled by default for safety
+  auto_update: false
+  update_interval: "24h"
+  rules_source: ""
+  categories: []
+  max_scan_threads: 1         # Single thread to prevent overload
+  scan_timeout: 10            # Reduced timeout
+  rules_path: "yara-rules"
+  max_file_size: "10MB"       # Reduced file size limit
+>>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
 
 response:
   notification_settings:
     toast_enabled: true
+<<<<<<< HEAD
     system_tray_enabled: false
     desktop_alert_enabled: true
     sound_enabled: false
@@ -131,6 +182,23 @@ response:
     allow_user_override: false
     require_admin_for_allow: true
     timeout_seconds: 20
+=======
+    system_tray_enabled: true
+    desktop_alert_enabled: false  # Disabled to prevent UI freezes
+    sound_enabled: false
+    timeout_seconds: 5
+
+  severity_thresholds:
+    show_user_alerts: 5         # Only show critical alerts
+    auto_quarantine: 6          # Disabled (no auto-quarantine)
+    block_execution: 6          # Disabled (no auto-blocking)
+
+  user_interaction:
+    allow_user_override: true
+    require_admin_for_allow: false
+    timeout_seconds: 15
+
+>>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
   customization:
     company_branding: false
     custom_messages: false
@@ -191,9 +259,18 @@ suppression:
 
 # Safe mode settings
 safe_mode:
+<<<<<<< HEAD
   enabled: false
   max_file_monitors: 5
   max_process_monitors: 3
   disable_real_time: false
   reduce_scanning: false
   minimal_logging: false
+=======
+  enabled: true
+  max_file_monitors: 1
+  max_process_monitors: 1
+  disable_real_time: true
+  reduce_scanning: true
+  minimal_logging: true
+>>>>>>> 00e9527bf4c697277e34f52d96c010daf1e280ef
