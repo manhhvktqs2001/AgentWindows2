@@ -1,5 +1,0 @@
-#BOT#URLUpdate#http://malware.example.com/update
-#BOT#VisitUrl#http://malware.example.com/visit
-DC_MUTEX-DARKCOMET-12345
-DarkComet RAT Configuration
-remote access trojan keylogger backdoor
