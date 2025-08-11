@@ -19,13 +19,14 @@ import (
 
 // YaraScanner implements YARA-based file scanning using external yara64.exe
 type YaraScanner struct {
-	config          *config.YaraConfig
-	logger          *utils.Logger
-	serverClient    *communication.ServerClient
-	responseManager *response.ResponseManager
-	yaraExePath     string
-	rulesPath       string
-	agentID         string
+	config           *config.YaraConfig
+	logger           *utils.Logger
+	serverClient     *communication.ServerClient
+	responseManager  *response.ResponseManager
+	notificationCtrl *response.NotificationController
+	yaraExePath      string
+	rulesPath        string
+	agentID          string
 }
 
 func NewYaraScanner(cfg *config.YaraConfig, logger *utils.Logger) *YaraScanner {
@@ -44,6 +45,9 @@ func NewYaraScanner(cfg *config.YaraConfig, logger *utils.Logger) *YaraScanner {
 func (ys *YaraScanner) SetServerClient(client *communication.ServerClient) { ys.serverClient = client }
 func (ys *YaraScanner) SetResponseManager(rm *response.ResponseManager)    { ys.responseManager = rm }
 func (ys *YaraScanner) SetAgentID(agentID string)                          { ys.agentID = agentID }
+func (ys *YaraScanner) SetNotificationController(ctrl *response.NotificationController) {
+	ys.notificationCtrl = ctrl
+}
 
 func (ys *YaraScanner) LoadRules() error {
 	if !ys.config.Enabled {
@@ -114,6 +118,16 @@ func (ys *YaraScanner) ScanFile(filePath string) (*models.ThreatInfo, error) {
 	if ys.responseManager != nil {
 		_ = ys.responseManager.HandleThreat(threat)
 	}
+
+	// Show Windows notification if notification controller is available
+	if ys.notificationCtrl != nil {
+		if err := ys.notificationCtrl.SendNotification(threat, threat.Severity); err != nil {
+			ys.logger.Warn("Failed to send notification: %v", err)
+		} else {
+			ys.logger.Info("🚨 THREAT DETECTED - Windows notification sent: %s", threat.ThreatName)
+		}
+	}
+
 	// Send alert to server
 	ys.sendAlert(threat)
 	return threat, nil

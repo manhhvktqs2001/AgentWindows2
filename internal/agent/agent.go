@@ -36,6 +36,10 @@ type Agent struct {
 	// State
 	isRunning bool
 	mu        sync.RWMutex
+
+	// Registration protection
+	registrationMu sync.Mutex
+	isRegistering  bool
 }
 
 type Event interface {
@@ -89,6 +93,14 @@ func NewAgent(cfg *config.Config, logger *utils.Logger) (*Agent, error) {
 	} else {
 		// Pass Response Manager to scanner so detections trigger user notifications and actions
 		yaraScanner.SetResponseManager(responseManager)
+
+		// Pass notification controller to scanner for user notifications
+		if notificationCtrl := responseManager.GetNotificationController(); notificationCtrl != nil {
+			yaraScanner.SetNotificationController(notificationCtrl)
+			logger.Info("✅ YARA Scanner notification controller configured")
+		} else {
+			logger.Warn("⚠️  Notification controller not available for YARA Scanner")
+		}
 	}
 
 	// Propagate AgentID to scanner if already set in config
@@ -165,7 +177,8 @@ func (a *Agent) Start() error {
 	go a.heartbeatWorker()
 	go a.eventWorker()
 	go a.taskWorker()
-	go a.monitorEventWorker() // Start the new monitor event worker
+	go a.monitorEventWorker()    // Start the new monitor event worker
+	go a.connectionRetryWorker() // Start the new connection retry worker
 
 	a.isRunning = true
 	a.logger.Info("EDR Agent started successfully")
@@ -210,6 +223,22 @@ func (a *Agent) RegisterEvent(event Event) {
 
 // Register with server
 func (a *Agent) registerWithServer() error {
+	// Prevent multiple simultaneous registration attempts
+	a.registrationMu.Lock()
+	if a.isRegistering {
+		a.registrationMu.Unlock()
+		return fmt.Errorf("registration already in progress")
+	}
+	a.isRegistering = true
+	a.registrationMu.Unlock()
+
+	// Ensure we unlock when function exits
+	defer func() {
+		a.registrationMu.Lock()
+		a.isRegistering = false
+		a.registrationMu.Unlock()
+	}()
+
 	hostname, err := os.Hostname()
 	if err != nil {
 		return fmt.Errorf("failed to get hostname: %w", err)
@@ -293,10 +322,47 @@ func (a *Agent) heartbeatWorker() {
 		case <-a.stopChan:
 			return
 		case <-ticker.C:
+			// Try to reconnect if we don't have an agent ID
+			if !a.IsOnline() {
+				a.logger.Info("Attempting to reconnect to server...")
+				a.attemptReconnection()
+			}
+
 			err := a.sendHeartbeat()
 			if err != nil {
 				a.logger.Error("Failed to send heartbeat: %v", err)
 			}
+		}
+	}
+}
+
+// connectionRetryWorker continuously tries to connect to the server when offline
+func (a *Agent) connectionRetryWorker() {
+	// Start with a short interval, then increase
+	retryInterval := 5 * time.Second
+	maxRetryInterval := 2 * time.Minute
+
+	for {
+		select {
+		case <-a.stopChan:
+			return
+		default:
+			// Only try to connect if we don't have an agent ID
+			if !a.IsOnline() {
+				a.logger.Info("Attempting to connect to server (retry worker)...")
+				if a.attemptReconnection() {
+					// Reset retry interval after successful connection
+					retryInterval = 5 * time.Second
+				} else {
+					// Increase retry interval gradually, but cap it
+					retryInterval = time.Duration(float64(retryInterval) * 1.5)
+					if retryInterval > maxRetryInterval {
+						retryInterval = maxRetryInterval
+					}
+				}
+			}
+
+			time.Sleep(retryInterval)
 		}
 	}
 }
@@ -337,6 +403,13 @@ func (a *Agent) eventWorker() {
 				for i, event := range events {
 					interfaceEvents[i] = event
 				}
+
+				// Try to reconnect if offline before sending events
+				if !a.IsOnline() {
+					a.logger.Debug("Agent offline, attempting to reconnect before sending events")
+					a.attemptReconnection()
+				}
+
 				a.serverClient.SendEvents(interfaceEvents)
 				events = events[:0] // Reset slice
 			}
@@ -350,6 +423,13 @@ func (a *Agent) eventWorker() {
 				for i, event := range events {
 					interfaceEvents[i] = event
 				}
+
+				// Try to reconnect if offline before sending events
+				if !a.IsOnline() {
+					a.logger.Debug("Agent offline, attempting to reconnect before sending events")
+					a.attemptReconnection()
+				}
+
 				a.serverClient.SendEvents(interfaceEvents)
 				events = events[:0] // Reset slice
 			}
@@ -492,4 +572,36 @@ func (a *Agent) getPrimaryMAC() string {
 		return iface.HardwareAddr.String()
 	}
 	return ""
+}
+
+// IsOnline returns true if the agent has a valid ID and is connected to the server
+func (a *Agent) IsOnline() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.config.Agent.ID != ""
+}
+
+// attemptReconnection safely attempts to reconnect to the server
+func (a *Agent) attemptReconnection() bool {
+	if a.IsOnline() {
+		return true // Already online
+	}
+
+	if err := a.registerWithServer(); err == nil {
+		a.logger.Info("Successfully reconnected to server")
+		// Propagate new AgentID to all components
+		a.serverClient.SetAgentID(a.config.Agent.ID)
+		if a.scanner != nil {
+			a.scanner.SetAgentID(a.config.Agent.ID)
+		}
+		a.fileMonitor.SetAgentID(a.config.Agent.ID)
+		a.processMonitor.SetAgentID(a.config.Agent.ID)
+		a.networkMonitor.SetAgentID(a.config.Agent.ID)
+		a.registryMonitor.SetAgentID(a.config.Agent.ID)
+		return true
+	} else {
+		a.logger.Debug("Reconnection attempt failed: %v", err)
+	}
+
+	return false
 }

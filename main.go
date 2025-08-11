@@ -142,6 +142,7 @@ func main() {
 		start            = flag.Bool("start", false, "Start Windows service")
 		stop             = flag.Bool("stop", false, "Stop Windows service")
 		status           = flag.Bool("status", false, "Check service status")
+		stealth          = flag.Bool("stealth", false, "Check stealth mode status (process visibility)")
 		configPath       = flag.String("config", "config.yaml", "Path to configuration file")
 		version          = flag.Bool("version", false, "Show version information")
 		reset            = flag.Bool("reset", false, "Reset agent registration (force new registration)")
@@ -228,6 +229,25 @@ func main() {
 			log.Fatalf("Failed to get service status: %v", err)
 		}
 		fmt.Printf("Service status: %s\n", status)
+		return
+	}
+
+	if *stealth {
+		stealthStatus := service.GetStealthStatus()
+		fmt.Println("🕵️  Stealth Mode Status:")
+		fmt.Printf("  Admin Privileges: %v\n", stealthStatus["admin_privileges"])
+		fmt.Printf("  Service Running: %v\n", stealthStatus["service_running"])
+		fmt.Printf("  Stealth Enabled: %v\n", stealthStatus["stealth_enabled"])
+		fmt.Printf("  Process Visible: %v\n", stealthStatus["process_visible"])
+		fmt.Printf("  Task Manager Visible: %v\n", stealthStatus["task_manager_visible"])
+		
+		if stealthStatus["stealth_enabled"].(bool) {
+			fmt.Println("✅ Process is HIDDEN from Task Manager (stealth mode)")
+			fmt.Println("🕵️  EDR Agent is running invisibly")
+		} else {
+			fmt.Println("⚠️  Process is VISIBLE in Task Manager")
+			fmt.Println("🔍 Users can see edr-agent.exe in Task Manager")
+		}
 		return
 	}
 
@@ -339,6 +359,17 @@ func main() {
 	if service.IsRunningAsService() && !*console {
 		// Run as Windows service
 		logger.Info("🔧 Running as Windows service")
+
+		// Check stealth mode status
+		stealthStatus := service.GetStealthStatus()
+		if stealthStatus["stealth_enabled"].(bool) {
+			logger.Info("🕵️  Stealth mode enabled - process HIDDEN from Task Manager")
+			logger.Info("📱 Users cannot see edr-agent.exe in Task Manager")
+		} else {
+			logger.Info("⚠️  Stealth mode disabled - process VISIBLE in Task Manager")
+			logger.Info("🔍 Users can see edr-agent.exe in Task Manager")
+		}
+
 		if err := service.Run(agentInstance); err != nil {
 			logger.Error("Service failed: %v", err)
 			os.Exit(1)

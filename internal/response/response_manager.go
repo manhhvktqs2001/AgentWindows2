@@ -86,6 +86,11 @@ func NewResponseManager(cfg *config.ResponseConfig, logger *utils.Logger, server
 	return rm
 }
 
+// GetNotificationController returns the notification controller instance
+func (rm *ResponseManager) GetNotificationController() *NotificationController {
+	return rm.notificationCtrl
+}
+
 func (rm *ResponseManager) Start() error {
 	rm.logger.Info("Starting Response Manager...")
 

@@ -3,112 +3,107 @@ package response
 import (
 	"edr-agent-windows/internal/config"
 	"edr-agent-windows/internal/utils"
+	"fmt"
+	"sync"
+	"time"
+
+	"edr-agent-windows/internal/models"
 )
 
-// ToastNotifier quản lý toast notifications
-type ToastNotifier struct {
-	config   *config.ResponseConfig
-	logger   *utils.Logger
-	notifier *WindowsToastNotifier
-}
-
-// NewToastNotifier tạo Toast Notifier mới
-func NewToastNotifier(cfg *config.ResponseConfig, logger *utils.Logger) *ToastNotifier {
-	return &ToastNotifier{
-		config:   cfg,
-		logger:   logger,
-		notifier: NewWindowsToastNotifier(cfg, logger),
-	}
-}
-
-// Start khởi động Toast Notifier
-func (tn *ToastNotifier) Start() error {
-	tn.logger.Info("Toast Notifier started")
-	return tn.notifier.Start()
-}
-
-// Stop dừng Toast Notifier
-func (tn *ToastNotifier) Stop() {
-	tn.logger.Info("Toast Notifier stopped")
-	tn.notifier.Stop()
-}
-
-// SendNotification gửi toast notification
-func (tn *ToastNotifier) SendNotification(content *NotificationContent) error {
-	tn.logger.Info("Sending toast notification: %s", content.Title)
-	return tn.notifier.SendNotification(content)
-}
-
-// SystemTrayNotifier quản lý system tray notifications
-type SystemTrayNotifier struct {
+// NotificationController manages all notification types with single instances
+type NotificationController struct {
 	config        *config.ResponseConfig
 	logger        *utils.Logger
 	toastNotifier *WindowsToastNotifier
+	mu            sync.RWMutex
+	isStarted     bool
 }
 
-// NewSystemTrayNotifier tạo System Tray Notifier mới
-func NewSystemTrayNotifier(cfg *config.ResponseConfig, logger *utils.Logger) *SystemTrayNotifier {
-	return &SystemTrayNotifier{
-		config:        cfg,
-		logger:        logger,
-		toastNotifier: NewWindowsToastNotifier(cfg, logger),
+// NewNotificationController creates a new notification controller
+func NewNotificationController(cfg *config.ResponseConfig, logger *utils.Logger) *NotificationController {
+	return &NotificationController{
+		config: cfg,
+		logger: logger,
 	}
 }
 
-// Start khởi động System Tray Notifier
-func (stn *SystemTrayNotifier) Start() error {
-	stn.logger.Info("System Tray Notifier started")
-	return stn.toastNotifier.Start()
-}
+// Start initializes all notification systems
+func (nc *NotificationController) Start() error {
+	nc.mu.Lock()
+	defer nc.mu.Unlock()
 
-// Stop dừng System Tray Notifier
-func (stn *SystemTrayNotifier) Stop() {
-	stn.logger.Info("System Tray Notifier stopped")
-	stn.toastNotifier.Stop()
-}
-
-// SendNotification gửi system tray notification
-func (stn *SystemTrayNotifier) SendNotification(content *NotificationContent) error {
-	stn.logger.Info("Sending system tray notification: %s", content.Title)
-
-	// Use the Windows toast notifier to display the notification
-	// This will show a non-blocking message box
-	return stn.toastNotifier.SendNotification(content)
-}
-
-// DesktopAlertNotifier quản lý desktop alert notifications
-type DesktopAlertNotifier struct {
-	config        *config.ResponseConfig
-	logger        *utils.Logger
-	toastNotifier *WindowsToastNotifier
-}
-
-// NewDesktopAlertNotifier tạo Desktop Alert Notifier mới
-func NewDesktopAlertNotifier(cfg *config.ResponseConfig, logger *utils.Logger) *DesktopAlertNotifier {
-	return &DesktopAlertNotifier{
-		config:        cfg,
-		logger:        logger,
-		toastNotifier: NewWindowsToastNotifier(cfg, logger),
+	if nc.isStarted {
+		return nil
 	}
+
+	nc.logger.Info("🚀 Starting Notification Controller...")
+
+	// Initialize Windows Toast Notifier (single instance)
+	nc.toastNotifier = NewWindowsToastNotifier(nc.config, nc.logger)
+	if err := nc.toastNotifier.Start(); err != nil {
+		nc.logger.Warn("Failed to start Windows Toast Notifier: %v", err)
+	}
+
+	nc.isStarted = true
+	nc.logger.Info("✅ Notification Controller started successfully")
+	return nil
 }
 
-// Start khởi động Desktop Alert Notifier
-func (dan *DesktopAlertNotifier) Start() error {
-	dan.logger.Info("Desktop Alert Notifier started")
-	return dan.toastNotifier.Start()
+// Stop shuts down all notification systems
+func (nc *NotificationController) Stop() {
+	nc.mu.Lock()
+	defer nc.mu.Unlock()
+
+	if !nc.isStarted {
+		return
+	}
+
+	nc.logger.Info("🛑 Stopping Notification Controller...")
+
+	if nc.toastNotifier != nil {
+		nc.toastNotifier.Stop()
+	}
+
+	nc.isStarted = false
+	nc.logger.Info("✅ Notification Controller stopped")
 }
 
-// Stop dừng Desktop Alert Notifier
-func (dan *DesktopAlertNotifier) Stop() {
-	dan.logger.Info("Desktop Alert Notifier stopped")
-	dan.toastNotifier.Stop()
+// SendNotification sends a notification through all available channels
+func (nc *NotificationController) SendNotification(threat *models.ThreatInfo, severity int) error {
+	nc.mu.RLock()
+	defer nc.mu.RUnlock()
+
+	if !nc.isStarted {
+		nc.logger.Warn("Notification Controller not started, skipping notification")
+		return fmt.Errorf("notification controller not started")
+	}
+
+	// Create notification content
+	content := &NotificationContent{
+		Title:      fmt.Sprintf("EDR Security Alert - %s", threat.ThreatName),
+		Message:    threat.Description,
+		Severity:   severity,
+		Timestamp:  time.Now(),
+		ThreatInfo: threat,
+	}
+
+	// Send through Windows Toast Notifier (reuse existing instance)
+	if nc.toastNotifier != nil {
+		if err := nc.toastNotifier.SendNotification(content); err != nil {
+			nc.logger.Warn("Windows Toast notification failed: %v", err)
+		} else {
+			nc.logger.Debug("✅ Windows Toast notification sent successfully")
+		}
+	}
+
+	return nil
 }
 
-// SendNotification gửi desktop alert notification
-func (dan *DesktopAlertNotifier) SendNotification(content *NotificationContent) error {
-	dan.logger.Info("Sending desktop alert notification: %s", content.Title)
-
-	// Use the Windows toast notifier to display the alert
-	// This will show a blocking message box that requires user interaction
-	return dan.toastNotifier.SendNotification(content)
+// NotificationContent defines the content of a notification
+type NotificationContent struct {
+	Title      string             `json:"title"`
+	Message    string             `json:"message"`
+	Severity   int                `json:"severity"`
+	Timestamp  time.Time          `json:"timestamp"`
+	ThreatInfo *models.ThreatInfo `json:"threat_info"`
 }
