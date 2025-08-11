@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -33,6 +34,9 @@ type ProcessMonitor struct {
 	scanInterval   time.Duration
 	ctx            context.Context
 	cancel         context.CancelFunc
+
+	// Prevent sends to a closed channel
+	eventClosed int32
 }
 
 type ProcessInfo struct {
@@ -158,7 +162,10 @@ func (pm *ProcessMonitor) Stop() {
 		pm.logger.Warn("Process monitor shutdown timeout")
 	}
 
-	close(pm.eventChan)
+	// Mark closed and close channel safely
+	if atomic.CompareAndSwapInt32(&pm.eventClosed, 0, 1) {
+		close(pm.eventChan)
+	}
 	pm.logger.Info("Process monitor stopped")
 }
 
@@ -502,15 +509,7 @@ func (pm *ProcessMonitor) handleNewProcess(processID, parentProcessID uint32, pr
 		IntegrityLevel:    processInfo.IntegrityLevel,
 	}
 
-	// Send event with timeout
-	select {
-	case pm.eventChan <- event:
-		pm.logger.Debug("Process event: %s (PID: %d)", processName, processID)
-	case <-time.After(1 * time.Second):
-		pm.logger.Debug("Process event timeout: %s (PID: %d)", processName, processID)
-	default:
-		pm.logger.Debug("Process event channel full: %s (PID: %d)", processName, processID)
-	}
+	pm.trySendEvent(event, processName, processID)
 
 	// Update process list
 	pm.mu.Lock()
@@ -622,6 +621,27 @@ func (pm *ProcessMonitor) determineProcessSeverity(processName string, processIn
 		return "medium"
 	}
 	return "low"
+}
+
+// trySendEvent attempts to send without panicking if channel is closed
+func (pm *ProcessMonitor) trySendEvent(event models.ProcessEvent, processName string, processID uint32) {
+	if atomic.LoadInt32(&pm.eventClosed) == 1 || pm.isShuttingDown {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			// Channel might be closed; ignore to avoid crash
+		}
+	}()
+
+	select {
+	case pm.eventChan <- event:
+		pm.logger.Debug("Process event: %s (PID: %d)", processName, processID)
+	case <-time.After(1 * time.Second):
+		pm.logger.Debug("Process event timeout: %s (PID: %d)", processName, processID)
+	default:
+		pm.logger.Debug("Process event channel full: %s (PID: %d)", processName, processID)
+	}
 }
 
 func (pm *ProcessMonitor) isSuspiciousProcess(processName string) bool {
