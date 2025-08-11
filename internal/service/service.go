@@ -64,9 +64,19 @@ func Install() error {
 	}
 	defer windows.CloseServiceHandle(serviceHandle)
 
-	// Set service description
+	// Set service description safely
 	description := windows.StringToUTF16Ptr(Description)
-	windows.ChangeServiceConfig2(serviceHandle, windows.SERVICE_CONFIG_DESCRIPTION, (*byte)(unsafe.Pointer(&windows.SERVICE_DESCRIPTION{Description: description})))
+	serviceDesc := windows.SERVICE_DESCRIPTION{Description: description}
+
+	err = windows.ChangeServiceConfig2(
+		serviceHandle,
+		windows.SERVICE_CONFIG_DESCRIPTION,
+		(*byte)(unsafe.Pointer(&serviceDesc)),
+	)
+	if err != nil {
+		// Log warning but don't fail installation
+		fmt.Printf("Warning: Failed to set service description: %v\n", err)
+	}
 
 	return nil
 }
@@ -230,4 +240,4 @@ func (s *WindowsService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 			}
 		}
 	}
-} 
+}

@@ -189,13 +189,29 @@ func (fm *FileMonitor) monitorDirectory(watcher *DirectoryWatcher) {
 	var overlapped windows.Overlapped
 	var bytesReturned uint32
 
+	// Create event for overlapped I/O
+	event, err := windows.CreateEvent(nil, 0, 0, nil)
+	if err != nil {
+		fm.logger.Error("Failed to create event for directory monitoring: %v", err)
+		return
+	}
+	defer windows.CloseHandle(event)
+
+	overlapped.HEvent = event
+
 	for {
 		select {
 		case <-fm.stopChan:
 			fm.logger.Info("Stopping directory monitoring for: %s", watcher.path)
 			return
 		default:
-			// Read directory changes using Windows API
+			// Reset overlapped structure
+			overlapped.Internal = 0
+			overlapped.InternalHigh = 0
+			overlapped.Offset = 0
+			overlapped.OffsetHigh = 0
+
+			// Read directory changes
 			err := windows.ReadDirectoryChanges(
 				watcher.handle,
 				&buffer[0],
@@ -211,27 +227,37 @@ func (fm *FileMonitor) monitorDirectory(watcher *DirectoryWatcher) {
 					FILE_NOTIFY_CHANGE_SECURITY,
 				&bytesReturned,
 				&overlapped,
-				0, // No completion routine
+				0,
 			)
 
 			if err != nil {
-				fm.logger.Error("Failed to read directory changes: %v", err)
-				time.Sleep(1 * time.Second)
-				continue
+				if err == windows.ERROR_IO_PENDING {
+					// Wait for completion
+					_, err = windows.WaitForSingleObject(event, 5000) // 5 second timeout
+					if err != nil {
+						fm.logger.Error("Wait for directory changes failed: %v", err)
+						time.Sleep(1 * time.Second)
+						continue
+					}
+
+					// Get overlapped result
+					err = windows.GetOverlappedResult(watcher.handle, &overlapped, &bytesReturned, false)
+					if err != nil {
+						fm.logger.Error("Failed to get overlapped result: %v", err)
+						time.Sleep(1 * time.Second)
+						continue
+					}
+				} else {
+					fm.logger.Error("ReadDirectoryChanges failed: %v", err)
+					time.Sleep(1 * time.Second)
+					continue
+				}
 			}
 
-			// Wait for completion
-			err = windows.GetOverlappedResult(watcher.handle, &overlapped, &bytesReturned, true)
-			if err != nil {
-				fm.logger.Error("Failed to get overlapped result: %v", err)
-				time.Sleep(1 * time.Second)
-				continue
+			if bytesReturned > 0 {
+				fm.logger.Debug("Directory change detected for: %s (bytes: %d)", watcher.path, bytesReturned)
+				fm.processDirectoryChanges(watcher.path, buffer[:bytesReturned])
 			}
-
-			fm.logger.Debug("Directory change detected for: %s (bytes: %d)", watcher.path, bytesReturned)
-
-			// Process the changes
-			fm.processDirectoryChanges(watcher.path, buffer[:bytesReturned])
 		}
 	}
 }

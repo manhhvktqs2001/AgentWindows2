@@ -419,6 +419,109 @@ func testSecurityAlert(configPath string) {
 	fmt.Println("🏁 Security alert test completed")
 }
 
+// testEnhancedNotifications tests enhanced notification features
+func testEnhancedNotifications(configPath string) {
+	fmt.Println("🎨 Testing Enhanced Notification System...")
+
+	cfg, err := config.LoadOrCreate(configPath)
+	if err != nil {
+		fmt.Printf("❌ Failed to load config: %v\n", err)
+		return
+	}
+
+	logger := utils.NewLogger(&cfg.Log)
+	defer logger.Close()
+
+	// Test different notification types
+	response.TestAllNotificationTypes(&cfg.Response, logger)
+
+	fmt.Println("🏁 Enhanced notification test completed")
+}
+
+// testCustomToast tests custom toast message
+func testCustomToast(message, configPath string) {
+	fmt.Printf("🍞 Testing Custom Toast: %s\n", message)
+
+	cfg, err := config.LoadOrCreate(configPath)
+	if err != nil {
+		fmt.Printf("❌ Failed to load config: %v\n", err)
+		return
+	}
+
+	logger := utils.NewLogger(&cfg.Log)
+	defer logger.Close()
+
+	content := &response.NotificationContent{
+		Title:     "Custom Toast Test",
+		Message:   message,
+		Severity:  3,
+		Timestamp: time.Now(),
+	}
+
+	toastNotifier := response.NewWindowsToastNotifier(&cfg.Response, logger)
+	if err := toastNotifier.Start(); err != nil {
+		fmt.Printf("❌ Failed to start toast notifier: %v\n", err)
+		return
+	}
+
+	if err := toastNotifier.SendNotification(content); err != nil {
+		fmt.Printf("❌ Custom toast failed: %v\n", err)
+	} else {
+		fmt.Printf("✅ Custom toast sent successfully\n")
+	}
+}
+
+// testAudioPatterns tests audio alert patterns
+func testAudioPatterns() {
+	fmt.Println("🔊 Testing Audio Alert Patterns...")
+
+	patterns := []struct {
+		name     string
+		severity int
+	}{
+		{"Low severity", 2},
+		{"Medium severity", 3},
+		{"High severity", 4},
+		{"Critical severity", 5},
+	}
+
+	for _, pattern := range patterns {
+		fmt.Printf("🎵 Playing %s pattern...\n", pattern.name)
+
+		// Create a mock notification content
+		content := &response.NotificationContent{
+			Title:     fmt.Sprintf("Audio Test - %s", pattern.name),
+			Message:   "Testing audio pattern",
+			Severity:  pattern.severity,
+			Timestamp: time.Now(),
+		}
+
+		// Create basic config for audio test
+		cfg := &config.ResponseConfig{
+			NotificationSettings: config.NotificationSettings{
+				SoundEnabled: true,
+			},
+		}
+
+		logger := utils.NewLogger(&config.LogConfig{
+			Level:    "info",
+			Format:   "text",
+			FilePath: "test.log",
+		})
+
+		toastNotifier := response.NewWindowsToastNotifier(cfg, logger)
+		toastNotifier.Start()
+
+		// This will trigger the audio pattern in showConsoleAlert
+		toastNotifier.SendNotification(content)
+
+		time.Sleep(2 * time.Second)
+		logger.Close()
+	}
+
+	fmt.Println("🏁 Audio pattern test completed")
+}
+
 // testYaraScanning tests YARA scanning functionality
 func testYaraScanning(filePath string, cfg *config.Config, logger *utils.Logger) {
 	fmt.Printf("🔍 Testing YARA scanning on: %s\n", filePath)

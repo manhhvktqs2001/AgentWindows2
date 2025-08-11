@@ -3,6 +3,8 @@ package response
 
 import (
 	"fmt"
+	"path/filepath"
+	"strings"
 	"unsafe"
 
 	"edr-agent-windows/internal/config"
@@ -29,15 +31,13 @@ const (
 
 var (
 	// Windows API functions
-	kernel32      = windows.NewLazySystemDLL("kernel32.dll")
-	user32Process = windows.NewLazySystemDLL("user32.dll")
+	kernel32 = windows.NewLazySystemDLL("kernel32.dll")
 
 	procOpenProcess              = kernel32.NewProc("OpenProcess")
 	procTerminateProcess         = kernel32.NewProc("TerminateProcess")
 	procGetExitCodeProcess       = kernel32.NewProc("GetExitCodeProcess")
 	procEnumProcesses            = kernel32.NewProc("EnumProcesses")
 	procGetProcessImageFileNameW = kernel32.NewProc("GetProcessImageFileNameW")
-	procGetWindowThreadProcessId = user32Process.NewProc("GetWindowThreadProcessId")
 )
 
 // WindowsProcessController implements Windows process control
@@ -57,6 +57,14 @@ func NewWindowsProcessController(cfg *config.ResponseConfig, logger *utils.Logge
 // TerminateProcesses terminates processes by ID
 func (wpc *WindowsProcessController) TerminateProcesses(processID int) error {
 	wpc.logger.Info("Terminating process: %d", processID)
+
+	// Safety guard: refuse to terminate critical system processes
+	if info, err := wpc.GetProcessInfo(processID); err == nil {
+		if isCriticalSystemProcess(info.ImageName) {
+			wpc.logger.Warn("Refusing to terminate critical system process (PID: %d, Image: %s)", processID, info.ImageName)
+			return fmt.Errorf("refuse to terminate critical system process")
+		}
+	}
 
 	// Open process handle
 	handle, err := wpc.openProcess(processID, PROCESS_TERMINATE)
@@ -247,4 +255,28 @@ func (wpc *WindowsProcessController) Start() error {
 // Stop stops the Windows process controller
 func (wpc *WindowsProcessController) Stop() {
 	wpc.logger.Info("Windows Process Controller stopped")
+}
+
+// isCriticalSystemProcess checks if a process image represents a critical system process
+func isCriticalSystemProcess(imagePath string) bool {
+	lowerName := strings.ToLower(filepath.Base(imagePath))
+
+	criticalNames := map[string]bool{
+		"system":          true,
+		"idle":            true,
+		"smss.exe":        true,
+		"csrss.exe":       true,
+		"wininit.exe":     true,
+		"services.exe":    true,
+		"lsass.exe":       true,
+		"winlogon.exe":    true,
+		"svchost.exe":     true,
+		"fontdrvhost.exe": true,
+		"dwm.exe":         true,
+		// Common core shell/service hosts that terminating could destabilize user session
+		"explorer.exe": true,
+		"spoolsv.exe":  true,
+	}
+
+	return criticalNames[lowerName]
 }

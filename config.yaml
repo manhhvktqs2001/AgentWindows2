@@ -17,13 +17,14 @@ monitoring:
   file_system:
     enabled: true
     paths:
-      - "C:\\Users"
+      # Narrow scope to user profile Documents/Downloads and a custom workspace
+      - "C:\\Users\\*\\Documents"
+      - "C:\\Users\\*\\Downloads"
+      - "C:\\Users\\*\\Desktop"
       - "C:\\Program Files"
-      - "C:\\Program Files (x86)"
-      - "C:\\Windows\\System32"
     recursive: true
-    real_time_scan: true
-    max_file_size: "50MB"
+    real_time_scan: false   # Disable real-time to reduce overhead; rely on periodic scans
+    max_file_size: "20MB"
     exclude_extensions:
       - ".tmp"
       - ".log"
@@ -41,15 +42,17 @@ monitoring:
       - ".yml"
       - ".md"
       - ".txt"
-    exclude_paths:      # New: exclude specific paths
-      - "C:\\Users\\Manh\\Desktop\\AgentWindows"
-      - "C:\\Users\\*\\AppData\\Local\\Temp\\go-build"
-      - "C:\\Windows\\Temp"
-      - "*\\node_modules"
-      - "*\\.git"
-      - "*\\.vs"
-      - "*\\.vscode"
-      - "*\\cursor\\user\\workspacestorage"
+    exclude_paths:
+      - "C:\\Windows\\*"
+      - "C:\\Program Files\\*"
+      - "C:\\Program Files (x86)\\*"
+      - "C:\\Users\\*\\AppData\\Local\\Temp\\*"
+      - "C:\\Users\\*\\AppData\\Local\\Microsoft\\Edge\\User Data\\*"
+      - "*\\node_modules\\*"
+      - "*\\.git\\*"
+      - "*\\.vs\\*"
+      - "*\\.vscode\\*"
+      - "*\\cursor\\user\\workspacestorage\\*"
 
   processes:
     enabled: true
@@ -108,10 +111,19 @@ monitoring:
       - "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"
 
   memory:
-    enabled: false     # Disabled to reduce system impact
+    enabled: false
     scan_interval: 900
-    threat_threshold: 0.8
-    max_processes: 10
+    threat_threshold: 0.9
+    max_processes: 5
+    # Tuning knobs to avoid high CPU/RAM when enabled later
+    max_regions_per_process: 500
+    max_scan_millis_per_process: 150
+    max_total_millis_per_cycle: 1200
+    exclude_names:
+      - "chrome.exe"
+      - "msedge.exe"
+      - "code.exe"
+      - "idea64.exe"
 
   behavior:
     enabled: false     # Disabled to reduce noise and system impact
@@ -124,12 +136,10 @@ yara:
   auto_update: false
   update_interval: "24h"
   rules_source: https://github.com/Yara-Rules/rules/archive/master.zip
-  categories:              # Focused on essential categories only
+  categories:
     - malware
-    - maldocs
-    - webshells
-  max_scan_threads: 1      # Reduced to minimize system impact
-  scan_timeout: 20         # Increased timeout for complex rules
+  max_scan_threads: 1
+  scan_timeout: 15
   rules_path: yara-rules
   max_file_size: "100MB"   # Increased for better coverage
   

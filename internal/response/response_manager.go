@@ -382,9 +382,8 @@ func (rm *ResponseManager) executeAutomatedActions(threat *models.ThreatInfo, re
 }
 
 func (rm *ResponseManager) isSystemProcess(processID int) bool {
-	// Basic system process ID checks
-	// In production, you'd use proper APIs to check process information
-	systemProcessIDs := []int{0, 4, 8} // System, System Idle Process, etc.
+	// Basic system PID checks
+	systemProcessIDs := []int{0, 4} // System Idle and System
 
 	for _, sysID := range systemProcessIDs {
 		if processID == sysID {
@@ -392,6 +391,9 @@ func (rm *ResponseManager) isSystemProcess(processID int) bool {
 		}
 	}
 
+	// Best-effort image-name based guard to avoid terminating core services
+	// We avoid importing the process controller here to keep responsibilities separate.
+	// Instead, depend on ActionEngine/WindowsProcessController for the final safety check.
 	return false
 }
 
